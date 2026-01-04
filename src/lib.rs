@@ -43,6 +43,10 @@ pub mod core;
 pub mod error;
 pub mod queue;
 
+// Stream API (feature-gated)
+#[cfg(feature = "stream")]
+pub mod stream;
+
 // 其他模块将在后续添加
 // pub mod reliability;
 // pub mod congestion;
@@ -53,6 +57,10 @@ pub use crate::config::KcpConfig;
 pub use crate::core::{Kcp, KcpCmd};
 pub use crate::error::{KcpError, KcpResult};
 pub use crate::queue::{KcpDeque, Segment};
+
+// 导出Stream API (当stream feature启用时)
+#[cfg(feature = "stream")]
+pub use crate::stream::{KcpListener, KcpStream, StreamConfig};
 
 // 预导入模块
 // pub mod prelude {

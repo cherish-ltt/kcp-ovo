@@ -50,6 +50,35 @@ pub enum KcpError {
     IoError(String),
 }
 
+impl KcpError {
+    /// 获取错误类型（类似io::Error::kind）
+    pub fn kind(&self) -> KcpErrorKind {
+        match self {
+            KcpError::InvalidCommand(_) => KcpErrorKind::InvalidCommand,
+            KcpError::BufferTooSmall => KcpErrorKind::BufferTooSmall,
+            KcpError::QueueEmpty => KcpErrorKind::QueueEmpty,
+            KcpError::IncompleteData => KcpErrorKind::IncompleteData,
+            KcpError::InvalidSequence => KcpErrorKind::InvalidSequence,
+            KcpError::InvalidConfig(_) => KcpErrorKind::InvalidConfig,
+            KcpError::OutputNotSet => KcpErrorKind::OutputNotSet,
+            KcpError::IoError(_) => KcpErrorKind::IoError,
+        }
+    }
+}
+
+/// KCP错误类型分类
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KcpErrorKind {
+    InvalidCommand,
+    BufferTooSmall,
+    QueueEmpty,
+    IncompleteData,
+    InvalidSequence,
+    InvalidConfig,
+    OutputNotSet,
+    IoError,
+}
+
 impl fmt::Display for KcpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -66,6 +95,13 @@ impl fmt::Display for KcpError {
 }
 
 impl std::error::Error for KcpError {}
+
+/// 从std::io::Error转换
+impl From<std::io::Error> for KcpError {
+    fn from(err: std::io::Error) -> Self {
+        KcpError::IoError(err.to_string())
+    }
+}
 
 /// KCP Result类型别名
 ///
