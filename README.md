@@ -1,10 +1,14 @@
-# kcp-ovo
-
+<div align="center">
+<h1>kcp-ovo</h1>
 KCP协议的纯Rust实现，完整复刻原版C代码功能。
+
+[![Rust](https://img.shields.io/badge/rust-1.92.0+-orange.svg)](https://www.rust-lang.org)[![Crates.io](https://img.shields.io/crates/v/kcp-ovo)](https://crates.io/crates/kcp-ovo)  [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/cherish-ltt/kcp-ovo/blob/main/LICENSE) [![doc](https://docs.rs/kcp-ovo/badge.svg)](https://docs.rs/kcp-ovo/latest/kcp-ovo/) [![Downloads](https://img.shields.io/crates/d/kcp-ovo.svg)](https://crates.io/crates/kcp-ovo)
+
+</div>
 
 ## 简介
 
-[kcp-ovo](https://github.com/yourusername/kcp-ovo) 是一个快速可靠的ARQ（Automatic Repeat-reQuest）协议的纯Rust实现。KCP是一个低延迟、高可靠性的传输层协议，相比传统TCP可以降低30%-40%的延迟，最大RTT减少三倍。
+[kcp-ovo](https://github.com/cherish-ltt/kcp-ovo) 是一个快速可靠的ARQ（Automatic Repeat-reQuest）协议的纯Rust实现。KCP是一个低延迟、高可靠性的传输层协议，相比传统TCP可以降低30%-40%的延迟，最大RTT减少三倍。
 
 本项目完整复刻了[skywind3000](https://github.com/skywind3000/kcp)的原版C代码，使用纯Rust重写，充分利用Rust的类型安全和内存安全特性。
 

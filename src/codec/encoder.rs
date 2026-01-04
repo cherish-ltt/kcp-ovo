@@ -216,27 +216,13 @@ mod tests {
 
     #[test]
     fn test_encode_decode_roundtrip_u32() {
-        let test_values: Vec<u32> = vec![
-            0,
-            1,
-            255,
-            256,
-            65535,
-            65536,
-            0xFFFFFFFF,
-            0x12345678,
-        ];
+        let test_values: Vec<u32> = vec![0, 1, 255, 256, 65535, 65536, 0xFFFFFFFF, 0x12345678];
 
         for value in test_values {
             let mut buf = [0u8; 4];
             Encoder::encode_u32(&mut buf, 0, value);
             let (decoded, _) = Encoder::decode_u32(&buf, 0).unwrap();
-            assert_eq!(
-                value,
-                decoded,
-                "Roundtrip failed for 0x{:08X}",
-                value
-            );
+            assert_eq!(value, decoded, "Roundtrip failed for 0x{:08X}", value);
         }
     }
 

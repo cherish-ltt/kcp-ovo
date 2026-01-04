@@ -2,8 +2,8 @@
 //!
 //! 本模块提供了基于Rust标准库VecDeque的KCP双向队列封装
 
-use std::collections::VecDeque;
 use super::segment::Segment;
+use std::collections::VecDeque;
 
 /// KCP双向队列
 ///
@@ -157,6 +157,19 @@ impl KcpDeque {
     /// 获取可变迭代器
     pub fn iter_mut(&mut self) -> std::collections::vec_deque::IterMut<'_, Segment> {
         self.inner.iter_mut()
+    }
+
+    /// 获取指定索引的可变引用
+    ///
+    /// # 参数
+    ///
+    /// - `index`: 元素索引
+    ///
+    /// # 返回
+    ///
+    /// 如果索引有效，返回元素的可变引用；否则返回None
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Segment> {
+        self.inner.get_mut(index)
     }
 }
 

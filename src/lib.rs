@@ -37,11 +37,11 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 // 模块声明
-pub mod error;
-pub mod queue;
 pub mod codec;
 pub mod config;
 pub mod core;
+pub mod error;
+pub mod queue;
 
 // 其他模块将在后续添加
 // pub mod reliability;
@@ -49,10 +49,10 @@ pub mod core;
 // pub mod helper;
 
 // 导出公共API
-pub use crate::error::{KcpResult, KcpError};
 pub use crate::config::KcpConfig;
-pub use crate::queue::{Segment, KcpDeque};
 pub use crate::core::{Kcp, KcpCmd};
+pub use crate::error::{KcpError, KcpResult};
+pub use crate::queue::{KcpDeque, Segment};
 
 // 预导入模块
 // pub mod prelude {
