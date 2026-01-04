@@ -358,36 +358,16 @@ impl Kcp {
 
     // ========== 辅助函数 ==========
 
-    /// 辅助函数：计算最小值
+    /// 计算时间差
     ///
-    /// 对应C代码的 _imin_ 函数
-    #[inline]
-    fn _imin_(&self, a: u32, b: u32) -> u32 {
-        a.min(b)
-    }
-
-    /// 辅助函数：计算最大值
-    ///
-    /// 对应C代码的 _imax_ 函数
-    #[inline]
-    fn _imax_(&self, a: u32, b: u32) -> u32 {
-        a.max(b)
-    }
-
-    /// 辅助函数：边界限制
-    ///
-    /// 对应C代码的 _ibound_ 函数
-    #[inline]
-    fn _ibound_(&self, lower: u32, middle: u32, upper: u32) -> u32 {
-        middle.clamp(lower, upper)
-    }
-
-    /// 辅助函数：计算时间差
-    ///
-    /// 对应C代码的 _itimediff 函数
     /// 使用wrapping_sub处理32位时间戳回绕
+    ///
+    /// # 参数
+    ///
+    /// - `later`: 较晚的时间戳
+    /// - `earlier`: 较早的时间戳
     #[inline]
-    fn _itimediff(&self, later: u32, earlier: u32) -> i32 {
+    fn timediff(&self, later: u32, earlier: u32) -> i32 {
         (later as i32).wrapping_sub(earlier as i32)
     }
 
@@ -690,7 +670,7 @@ impl Kcp {
         self.rmt_wnd = wnd;
 
         // 处理una（确认所有sn < una的段）
-        if self._itimediff(sn, self.snd_una) > 0 || self._itimediff(una, self.snd_una) > 0 {
+        if self.timediff(sn, self.snd_una) > 0 || self.timediff(una, self.snd_una) > 0 {
             self.parse_una(una);
             self.parse_ack(sn);
         }
@@ -707,8 +687,8 @@ impl Kcp {
             IKCP_CMD_PUSH => {
                 // PUSH命令：数据包
                 // 检查序列号是否有效
-                if self._itimediff(sn, self.rcv_nxt + self.rcv_wnd) >= 0
-                    || self._itimediff(sn, self.rcv_nxt) < 0
+                if self.timediff(sn, self.rcv_nxt + self.rcv_wnd) >= 0
+                    || self.timediff(sn, self.rcv_nxt) < 0
                 {
                     // 超出窗口或已接收，丢弃
                     return Ok(());
@@ -776,9 +756,7 @@ impl Kcp {
         }
 
         // 更新时间戳
-        if self._itimediff(self.current, ts) >= 10000
-            || self._itimediff(ts, self.ts_recent) >= 10000
-        {
+        if self.timediff(self.current, ts) >= 10000 || self.timediff(ts, self.ts_recent) >= 10000 {
             self.ts_recent = ts;
         }
 
@@ -791,7 +769,7 @@ impl Kcp {
     fn parse_una(&mut self, una: u32) {
         while !self.snd_buf.is_empty() {
             let front_sn = self.snd_buf.front().unwrap().sn;
-            if self._itimediff(una, front_sn) > 0 {
+            if self.timediff(una, front_sn) > 0 {
                 self.snd_buf.pop_front();
                 self.nsnd_buf -= 1;
             } else {
@@ -816,9 +794,9 @@ impl Kcp {
         // 第一次遍历：计算RTT
         for seg in self.snd_buf.iter() {
             let seg_sn = seg.sn;
-            if self._itimediff(sn, seg_sn) >= 0 {
+            if self.timediff(sn, seg_sn) >= 0 {
                 // 计算RTT
-                let rtt = self._itimediff(current, seg.ts);
+                let rtt = self.timediff(current, seg.ts);
 
                 if rtt >= 0 {
                     if rx_srtt == 0 {
@@ -835,9 +813,8 @@ impl Kcp {
                     }
 
                     // 计算RTO
-                    let rto_numerator =
-                        rx_srtt + self._imax_(interval, (4 * rx_rttval) as u32) as i32;
-                    let rto = self._ibound_(rx_minrto, rto_numerator as u32, IKCP_RTO_MAX);
+                    let rto_numerator = rx_srtt + interval.max((4 * rx_rttval) as u32) as i32;
+                    let rto = rx_minrto.clamp(rto_numerator as u32, IKCP_RTO_MAX);
 
                     rtt_update = Some((rx_srtt, rx_rttval, rto));
                 }
@@ -883,7 +860,7 @@ impl Kcp {
                 return;
             }
 
-            if self._itimediff(newseg.sn, seg.sn) > 0 {
+            if self.timediff(newseg.sn, seg.sn) > 0 {
                 insert_pos = i;
                 break;
             }
@@ -922,13 +899,13 @@ impl Kcp {
     /// 6. 发送窗口探测
     fn flush(&mut self) -> KcpResult<()> {
         // 计算可以发送的窗口大小
-        let window = self._imin_(self.snd_wnd, self.rmt_wnd);
+        let window = self.snd_wnd.min(self.rmt_wnd);
         let mut can_send = window as usize;
         let mut lost = false; // 是否有数据包丢失
 
         // 检查拥塞窗口
         if !self.nocwnd {
-            can_send = self._imin_(window, self.cwnd) as usize;
+            can_send = window.min(self.cwnd) as usize;
         }
 
         // 从snd_queue移动数据到snd_buf
@@ -1070,10 +1047,10 @@ impl Kcp {
         // 更新拥塞窗口
         if lost {
             // 丢包，减小拥塞窗口
-            self.ssthresh = self._imax_(self.cwnd / 2, IKCP_THRESH_MIN);
+            self.ssthresh = (self.cwnd / 2).max(IKCP_THRESH_MIN);
             self.cwnd = 1;
             self.incr = 0;
-        } else if self._itimediff(current, self.ts_lastack) >= 0 {
+        } else if self.timediff(current, self.ts_lastack) >= 0 {
             // 正常，增加拥塞窗口
             if self.cwnd < self.ssthresh {
                 // 慢启动
@@ -1211,7 +1188,7 @@ impl Kcp {
         }
 
         // 检查是否需要flush
-        let slap = self._itimediff(self.current, self.ts_flush);
+        let slap = self.timediff(self.current, self.ts_flush);
 
         if slap >= 0 {
             // 需要flush
@@ -1250,11 +1227,11 @@ impl Kcp {
         if !self.snd_queue.is_empty() || !self.snd_buf.is_empty() {
             // 计算最早的重传时间
             for seg in self.snd_buf.iter() {
-                let diff = self._itimediff(seg.resendts, current);
+                let diff = self.timediff(seg.resendts, current);
                 if diff < 0 {
                     // 已经超时，立即需要更新
                     return current;
-                } else if diff < self._itimediff(ts_flush, current) {
+                } else if diff < self.timediff(ts_flush, current) {
                     ts_flush = seg.resendts;
                 }
             }
@@ -1266,7 +1243,7 @@ impl Kcp {
         }
 
         // 返回下次更新时间
-        if self._itimediff(ts_flush, current) > 0 {
+        if self.timediff(ts_flush, current) > 0 {
             ts_flush
         } else {
             current

@@ -41,6 +41,7 @@ pub mod codec;
 pub mod config;
 pub mod core;
 pub mod error;
+pub mod helper;
 pub mod queue;
 
 // Stream API (feature-gated)
@@ -50,7 +51,6 @@ pub mod stream;
 // 其他模块将在后续添加
 // pub mod reliability;
 // pub mod congestion;
-// pub mod helper;
 
 // 导出公共API
 pub use crate::config::KcpConfig;

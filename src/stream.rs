@@ -26,6 +26,7 @@
 //! println!("Received: {:?}", &buffer[..len]);
 //! ```
 
+use crate::helper::{current_millis, generate_conv};
 use crate::{Kcp, KcpConfig, KcpResult};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -65,7 +66,8 @@ pub struct KcpStream {
     socket: UdpSocket,
     /// 远程地址
     remote: SocketAddr,
-    /// 接收缓冲区
+    /// 接收缓冲区 (预分配用于接收数据)
+    #[allow(dead_code)]
     recv_buffer: Vec<u8>,
     /// 上次更新时间
     last_update: Instant,
@@ -105,10 +107,7 @@ impl KcpStream {
     /// # 返回
     ///
     /// 返回连接成功的KcpStream实例
-    pub fn connect_with_config<A: ToSocketAddrs>(
-        addr: A,
-        config: StreamConfig,
-    ) -> KcpResult<Self> {
+    pub fn connect_with_config<A: ToSocketAddrs>(addr: A, config: StreamConfig) -> KcpResult<Self> {
         // 解析地址
         let addrs: Vec<SocketAddr> = addr.to_socket_addrs()?.collect();
         if addrs.is_empty() {
@@ -121,7 +120,7 @@ impl KcpStream {
         socket.connect(remote)?;
 
         // 生成唯一的conv（在实际应用中应该通过握手协商）
-        let conv = Self::generate_conv();
+        let conv = generate_conv();
 
         // 创建KCP实例
         let mut kcp = Kcp::new(conv, KcpConfig::fast_mode())?;
@@ -142,18 +141,6 @@ impl KcpStream {
             config,
             connected: true,
         })
-    }
-
-    /// 生成唯一的conv ID
-    ///
-    /// 在实际应用中，这个值应该通过握手协商
-    fn generate_conv() -> u32 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        (timestamp & 0xFFFFFFFF) as u32
     }
 
     /// 发送数据
@@ -262,21 +249,12 @@ impl KcpStream {
 
         if elapsed >= self.config.update_interval {
             // 使用系统时间作为current
-            let current = Self::get_current_ms();
+            let current = current_millis();
             self.kcp.update(current);
             self.last_update = now;
         }
 
         Ok(())
-    }
-
-    /// 获取当前时间戳（毫秒）
-    fn get_current_ms() -> u32 {
-        use std::time::SystemTime;
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u32
     }
 
     /// 刷新发送缓冲区
@@ -307,22 +285,19 @@ impl KcpStream {
     }
 }
 
-// 使用UNIX_EPOCH作为常量需要处理
-use std::time::UNIX_EPOCH;
-
 impl Read for KcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.recv(buf).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        self.recv(buf).map_err(io::Error::other)
     }
 }
 
 impl Write for KcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.send(buf).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        self.send(buf).map_err(io::Error::other)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        KcpStream::flush(self).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        KcpStream::flush(self).map_err(io::Error::other)
     }
 }
 
@@ -366,10 +341,7 @@ impl KcpListener {
     /// # 返回
     ///
     /// 返回KcpListener实例
-    pub fn bind_with_config<A: ToSocketAddrs>(
-        addr: A,
-        config: StreamConfig,
-    ) -> KcpResult<Self> {
+    pub fn bind_with_config<A: ToSocketAddrs>(addr: A, config: StreamConfig) -> KcpResult<Self> {
         let socket = UdpSocket::bind(addr)?;
 
         Ok(Self { socket, config })
@@ -398,7 +370,7 @@ impl KcpListener {
         client_socket.connect(remote)?;
 
         // 生成conv（实际应用中应该从接收到的数据包中提取）
-        let conv = KcpStream::generate_conv();
+        let conv = generate_conv();
 
         // 创建KCP实例
         let mut kcp = Kcp::new(conv, KcpConfig::fast_mode())?;

@@ -66,7 +66,11 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
             Ok(n) => {
-                println!("接收到 {} 字节: {:?}", n, String::from_utf8_lossy(&buffer[..n]));
+                println!(
+                    "接收到 {} 字节: {:?}",
+                    n,
+                    String::from_utf8_lossy(&buffer[..n])
+                );
 
                 // Echo回客户端
                 stream.write_all(&buffer[..n])?;
