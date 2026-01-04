@@ -127,11 +127,19 @@ fn example3_send_recv() -> Result<(), Box<dyn std::error::Error>> {
     // 发送数据
     let data1 = b"Hello, KCP!";
     let sent1 = kcp.send(data1)?;
-    println!("✓ 发送数据: \"{}\" ({} 字节)", String::from_utf8_lossy(data1), sent1);
+    println!(
+        "✓ 发送数据: \"{}\" ({} 字节)",
+        String::from_utf8_lossy(data1),
+        sent1
+    );
 
     let data2 = b"Second message";
     let sent2 = kcp.send(data2)?;
-    println!("✓ 发送数据: \"{}\" ({} 字节)", String::from_utf8_lossy(data2), sent2);
+    println!(
+        "✓ 发送数据: \"{}\" ({} 字节)",
+        String::from_utf8_lossy(data2),
+        sent2
+    );
 
     println!();
 
@@ -145,8 +153,11 @@ fn example3_send_recv() -> Result<(), Box<dyn std::error::Error>> {
     // 尝试接收（会失败，因为队列为空）
     match kcp.recv(&mut recv_buffer) {
         Ok(n) => {
-            println!("✓ 接收到数据: \"{}\" ({} 字节)",
-                String::from_utf8_lossy(&recv_buffer[..n]), n);
+            println!(
+                "✓ 接收到数据: \"{}\" ({} 字节)",
+                String::from_utf8_lossy(&recv_buffer[..n]),
+                n
+            );
         }
         Err(e) => {
             println!("  接收失败: {} (队列为空，正常情况)", e);

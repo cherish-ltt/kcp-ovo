@@ -35,7 +35,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match args[1].as_str() {
         "recv" => {
-            let output_file = if args.len() > 2 { &args[2] } else { "received.dat" };
+            let output_file = if args.len() > 2 {
+                &args[2]
+            } else {
+                "received.dat"
+            };
             recv_file(output_file)?;
         }
         "send" => {
@@ -80,7 +84,8 @@ fn recv_file(output_path: &str) -> io::Result<()> {
     stream.read_exact(&mut metadata_buf)?;
     let file_size = u64::from_be_bytes(metadata_buf);
 
-    println!("文件大小: {} bytes ({} MB)",
+    println!(
+        "文件大小: {} bytes ({} MB)",
         file_size,
         file_size / 1024 / 1024
     );
@@ -106,7 +111,8 @@ fn recv_file(output_path: &str) -> io::Result<()> {
                     let progress = (total_received as f64 / file_size as f64) * 100.0;
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let throughput = (total_received as f64 / elapsed) / 1024.0 / 1024.0;
-                    print!("\r进度: {:.1}% | 已接收: {} MB | 速度: {:.2} MB/s",
+                    print!(
+                        "\r进度: {:.1}% | 已接收: {} MB | 速度: {:.2} MB/s",
                         progress,
                         total_received / 1024 / 1024,
                         throughput
@@ -152,7 +158,7 @@ fn send_file(input_path: &str) -> io::Result<()> {
     if !Path::new(input_path).exists() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("文件不存在: {}", input_path)
+            format!("文件不存在: {}", input_path),
         ));
     }
 
@@ -160,7 +166,8 @@ fn send_file(input_path: &str) -> io::Result<()> {
     let mut input = File::open(input_path)?;
     let file_size = input.metadata()?.len();
 
-    println!("文件大小: {} bytes ({} MB)",
+    println!(
+        "文件大小: {} bytes ({} MB)",
         file_size,
         file_size / 1024 / 1024
     );
@@ -197,7 +204,8 @@ fn send_file(input_path: &str) -> io::Result<()> {
                     let progress = (total_sent as f64 / file_size as f64) * 100.0;
                     let elapsed = start_time.elapsed().as_secs_f64();
                     let throughput = (total_sent as f64 / elapsed) / 1024.0 / 1024.0;
-                    print!("\r进度: {:.1}% | 已发送: {} MB | 速度: {:.2} MB/s",
+                    print!(
+                        "\r进度: {:.1}% | 已发送: {} MB | 速度: {:.2} MB/s",
                         progress,
                         total_sent / 1024 / 1024,
                         throughput

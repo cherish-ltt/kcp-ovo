@@ -135,10 +135,10 @@ mod tests {
         let config = KcpConfig::default();
         assert_eq!(config.mtu, 1400);
         assert_eq!(config.interval, 100);
-        assert_eq!(config.nodelay, false);
+        assert!(!config.nodelay);
         assert_eq!(config.fastresend, 0);
-        assert_eq!(config.nocwnd, false);
-        assert_eq!(config.stream, false);
+        assert!(!config.nocwnd);
+        assert!(!config.stream);
         assert_eq!(config.snd_wnd, 32);
         assert_eq!(config.rcv_wnd, 128);
     }
@@ -148,17 +148,17 @@ mod tests {
         let config = KcpConfig::fast_mode();
         assert_eq!(config.mtu, 1400);
         assert_eq!(config.interval, 20);
-        assert_eq!(config.nodelay, true);
+        assert!(config.nodelay);
         assert_eq!(config.fastresend, 2);
-        assert_eq!(config.nocwnd, true);
-        assert_eq!(config.stream, false);
+        assert!(config.nocwnd);
+        assert!(!config.stream);
     }
 
     #[test]
     fn test_normal_mode() {
         let config = KcpConfig::normal_mode();
         assert_eq!(config.interval, 100);
-        assert_eq!(config.nodelay, false);
+        assert!(!config.nodelay);
     }
 
     #[test]
