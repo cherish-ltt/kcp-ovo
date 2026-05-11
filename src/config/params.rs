@@ -17,7 +17,7 @@ pub struct KcpConfig {
     ///
     /// KCP内部的定时更新间隔
     /// 默认值：100ms
-    pub interval: u32,
+    pub interval: u64,
 
     /// 是否启用无延迟模式
     ///
@@ -41,24 +41,17 @@ pub struct KcpConfig {
     /// 默认值：false
     pub nocwnd: bool,
 
-    /// 是否流式模式
-    ///
-    /// true: 流式模式，不分消息边界
-    /// false: 消息模式，保留消息边界
-    /// 默认值：false
-    pub stream: bool,
-
     /// 发送窗口大小
     ///
     /// 发送窗口的最大段数
     /// 默认值：32
-    pub snd_wnd: u32,
+    pub snd_wnd: u16,
 
     /// 接收窗口大小
     ///
     /// 接收窗口的最大段数
     /// 默认值：128
-    pub rcv_wnd: u32,
+    pub rcv_wnd: u16,
 }
 
 impl Default for KcpConfig {
@@ -69,7 +62,6 @@ impl Default for KcpConfig {
             nodelay: false,
             fastresend: 0,
             nocwnd: false,
-            stream: false,
             snd_wnd: 32,
             rcv_wnd: 128,
         }
@@ -101,7 +93,6 @@ impl KcpConfig {
             nodelay: true,
             fastresend: 2,
             nocwnd: true,
-            stream: false,
             snd_wnd: 32,
             rcv_wnd: 128,
         }
@@ -138,7 +129,6 @@ mod tests {
         assert!(!config.nodelay);
         assert_eq!(config.fastresend, 0);
         assert!(!config.nocwnd);
-        assert!(!config.stream);
         assert_eq!(config.snd_wnd, 32);
         assert_eq!(config.rcv_wnd, 128);
     }
@@ -151,7 +141,6 @@ mod tests {
         assert!(config.nodelay);
         assert_eq!(config.fastresend, 2);
         assert!(config.nocwnd);
-        assert!(!config.stream);
     }
 
     #[test]

@@ -6,7 +6,6 @@
 //! 1. 接收端：cargo run --example file-transfer -- recv [output_file]
 //! 2. 发送端：cargo run --example file-transfer -- send [input_file]
 
-use kcp_ovo::{KcpListener, KcpStream};
 use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -14,10 +13,14 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use bytes::Buf;
+use kcp_ovo::stream::{KcpListener, KcpStream};
+
 const BUFFER_SIZE: usize = 1400; // KCP的MSS
 const PROGRESS_INTERVAL: usize = 100 * 1024; // 每100KB显示进度
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
@@ -40,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 "received.dat"
             };
-            recv_file(output_file)?;
+            recv_file(output_file).await?;
         }
         "send" => {
             if args.len() < 3 {
@@ -48,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             let input_file = &args[2];
-            send_file(input_file)?;
+            send_file(input_file).await?;
         }
         _ => {
             println!("未知命令: {}", args[1]);
@@ -60,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// 接收文件
-fn recv_file(output_path: &str) -> io::Result<()> {
+async fn recv_file(output_path: &str) -> io::Result<()> {
     println!("KCP文件接收器");
     println!("================");
     println!("监听地址: 0.0.0.0:9999");
@@ -68,11 +71,11 @@ fn recv_file(output_path: &str) -> io::Result<()> {
     println!();
 
     // 创建监听器
-    let mut listener = KcpListener::bind("0.0.0.0:9999")?;
+    let mut listener = KcpListener::bind("0.0.0.0:9999").await.unwrap();
     println!("等待发送端连接...");
 
     // 接受连接
-    let (mut stream, addr) = listener.accept()?;
+    let (mut stream, addr) = listener.accept().await.unwrap();
     println!("已连接到: {}", addr);
     println!();
 
@@ -80,9 +83,8 @@ fn recv_file(output_path: &str) -> io::Result<()> {
     let mut output = File::create(output_path)?;
 
     // 接收文件元数据
-    let mut metadata_buf = [0u8; 8];
-    stream.read_exact(&mut metadata_buf)?;
-    let file_size = u64::from_be_bytes(metadata_buf);
+    let mut bytes = stream.recv().await.unwrap();
+    let file_size = bytes.get_u64();
 
     println!(
         "文件大小: {} bytes ({} MB)",
@@ -97,14 +99,10 @@ fn recv_file(output_path: &str) -> io::Result<()> {
     let mut start_time = Instant::now();
 
     loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => {
-                println!("发送端关闭连接");
-                break;
-            }
-            Ok(n) => {
-                output.write_all(&buffer[..n])?;
-                total_received += n as u64;
+        match stream.recv().await {
+            Ok(buf) => {
+                output.write_all(&buf)?;
+                total_received += buf.len() as u64;
 
                 // 显示进度
                 if total_received % PROGRESS_INTERVAL as u64 == 0 {
@@ -122,7 +120,7 @@ fn recv_file(output_path: &str) -> io::Result<()> {
             }
             Err(e) => {
                 eprintln!("\n接收错误: {}", e);
-                return Err(e);
+                return Ok(());
             }
         }
 
@@ -147,7 +145,7 @@ fn recv_file(output_path: &str) -> io::Result<()> {
 }
 
 /// 发送文件
-fn send_file(input_path: &str) -> io::Result<()> {
+async fn send_file(input_path: &str) -> io::Result<()> {
     println!("KCP文件发送器");
     println!("================");
     println!("目标地址: 127.0.0.1:9999");
@@ -174,18 +172,19 @@ fn send_file(input_path: &str) -> io::Result<()> {
     println!();
 
     // 等待一下让接收端准备就绪
-    println!("等待2秒后开始连接...");
-    thread::sleep(Duration::from_secs(2));
+    println!("等待1秒后开始连接...");
+    thread::sleep(Duration::from_secs(1));
 
     // 连接到接收端
     println!("连接到接收端...");
-    let mut stream = KcpStream::connect("127.0.0.1:9999")?;
+    let mut stream = KcpStream::connect("127.0.0.1:9999").await.unwrap();
+    
     println!("已连接");
     println!();
 
     // 发送文件元数据
     let metadata = file_size.to_be_bytes();
-    stream.write_all(&metadata)?;
+    stream.send(&metadata).await.unwrap();
 
     // 发送文件内容
     let mut buffer = vec![0u8; BUFFER_SIZE];
@@ -196,7 +195,7 @@ fn send_file(input_path: &str) -> io::Result<()> {
         match input.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => {
-                stream.write_all(&buffer[..n])?;
+                stream.send(&buffer[..n]).await.unwrap();
                 total_sent += n as u64;
 
                 // 显示进度

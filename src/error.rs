@@ -2,7 +2,7 @@
 //!
 //! 本模块定义了KCP协议实现中使用的所有错误类型。
 
-use std::fmt;
+use std::fmt::{self, Display};
 
 /// KCP错误类型
 ///
@@ -27,7 +27,7 @@ pub enum KcpError {
     /// 数据不完整
     ///
     /// 当接收到的数据不完整或被截断时返回此错误
-    IncompleteData,
+    IncompleteData(IncompleteDataType),
 
     /// 序列号错误
     ///
@@ -48,6 +48,9 @@ pub enum KcpError {
     ///
     /// 当发生IO相关错误时返回此错误
     IoError(String),
+
+    /// addr错误
+    NoAddress,
 }
 
 impl KcpError {
@@ -57,11 +60,12 @@ impl KcpError {
             KcpError::InvalidCommand(_) => KcpErrorKind::InvalidCommand,
             KcpError::BufferTooSmall => KcpErrorKind::BufferTooSmall,
             KcpError::QueueEmpty => KcpErrorKind::QueueEmpty,
-            KcpError::IncompleteData => KcpErrorKind::IncompleteData,
+            KcpError::IncompleteData(_) => KcpErrorKind::IncompleteData,
             KcpError::InvalidSequence => KcpErrorKind::InvalidSequence,
             KcpError::InvalidConfig(_) => KcpErrorKind::InvalidConfig,
             KcpError::OutputNotSet => KcpErrorKind::OutputNotSet,
             KcpError::IoError(_) => KcpErrorKind::IoError,
+            KcpError::NoAddress => KcpErrorKind::NoAddress,
         }
     }
 }
@@ -77,6 +81,7 @@ pub enum KcpErrorKind {
     InvalidConfig,
     OutputNotSet,
     IoError,
+    NoAddress,
 }
 
 impl fmt::Display for KcpError {
@@ -85,11 +90,12 @@ impl fmt::Display for KcpError {
             KcpError::InvalidCommand(cmd) => write!(f, "无效的命令类型: {}", cmd),
             KcpError::BufferTooSmall => write!(f, "缓冲区太小"),
             KcpError::QueueEmpty => write!(f, "队列为空"),
-            KcpError::IncompleteData => write!(f, "数据不完整"),
+            KcpError::IncompleteData(msg) => write!(f, "{}", msg),
             KcpError::InvalidSequence => write!(f, "序列号错误"),
             KcpError::InvalidConfig(msg) => write!(f, "无效的配置参数: {}", msg),
             KcpError::OutputNotSet => write!(f, "输出回调未设置"),
             KcpError::IoError(msg) => write!(f, "IO错误: {}", msg),
+            KcpError::NoAddress => write!(f, "addr错误"),
         }
     }
 }
@@ -100,6 +106,29 @@ impl std::error::Error for KcpError {}
 impl From<std::io::Error> for KcpError {
     fn from(err: std::io::Error) -> Self {
         KcpError::IoError(err.to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncompleteDataType {
+    /// 报文头不完整
+    Header,
+    /// 载体数据不完整
+    Payload,
+    /// 载体数据不完整,等待完整分片
+    PayloadWaitForFrg,
+    /// 载体数据损坏
+    PayloadErr,
+}
+
+impl Display for IncompleteDataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IncompleteDataType::Header => write!(f, "报文头不完整"),
+            IncompleteDataType::Payload => write!(f, "载体数据不完整"),
+            IncompleteDataType::PayloadWaitForFrg => write!(f, "载体数据不完整,等待完整分片"),
+            IncompleteDataType::PayloadErr => write!(f, "载体数据损坏"),
+        }
     }
 }
 

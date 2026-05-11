@@ -5,4 +5,4 @@
 pub mod kcp;
 
 // 导出常用类型
-pub use kcp::{Kcp, KcpCmd};
+// pub use kcp::Kcp;

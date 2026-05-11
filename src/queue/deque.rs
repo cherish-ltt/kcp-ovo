@@ -191,7 +191,8 @@ impl IntoIterator for KcpDeque {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::segment::Segment;
+    use crate::{helper::KcpPacket, queue::segment::Segment};
+    use bytes::Bytes;
 
     #[test]
     fn test_deque_new() {
@@ -203,8 +204,18 @@ mod tests {
     #[test]
     fn test_push_back_pop_front() {
         let mut deque = KcpDeque::new();
-        let seg1 = Segment::new(vec![1, 2, 3]);
-        let seg2 = Segment::new(vec![4, 5, 6]);
+        let data: Vec<u8> = vec![
+            0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1,
+            2, 3,
+        ];
+        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let seg1 = Segment::new(kcp_packet);
+        let data: Vec<u8> = vec![
+            0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 4,
+            5, 6,
+        ];
+        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let seg2 = Segment::new(kcp_packet);
 
         deque.push_back(seg1);
         deque.push_back(seg2);
@@ -213,46 +224,73 @@ mod tests {
 
         let removed = deque.pop_front();
         assert!(removed.is_some());
-        assert_eq!(removed.unwrap().data, vec![1, 2, 3]);
+        assert_eq!(removed.unwrap().get_data().to_vec(), vec![1, 2, 3]);
         assert_eq!(deque.len(), 1);
     }
 
     #[test]
     fn test_push_front_pop_back() {
         let mut deque = KcpDeque::new();
-        let seg = Segment::new(vec![1, 2, 3]);
+        let data: Vec<u8> = vec![
+            0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1,
+            2, 3,
+        ];
+        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let seg = Segment::new(kcp_packet);
 
         deque.push_front(seg.clone());
         let removed = deque.pop_back();
 
         assert!(removed.is_some());
-        assert_eq!(removed.unwrap().data, vec![1, 2, 3]);
+        assert_eq!(removed.unwrap().get_data(), vec![1, 2, 3]);
     }
 
     #[test]
     fn test_front_back() {
         let mut deque = KcpDeque::new();
-        let seg1 = Segment::new(vec![1, 2, 3]);
-        let seg2 = Segment::new(vec![4, 5, 6]);
+        let data: Vec<u8> = vec![
+            0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1,
+            2, 3,
+        ];
+        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let seg1 = Segment::new(kcp_packet);
+        let data: Vec<u8> = vec![
+            0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 4,
+            5, 6,
+        ];
+        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let seg2 = Segment::new(kcp_packet);
 
         deque.push_back(seg1);
         deque.push_back(seg2);
 
         let front = deque.front();
         assert!(front.is_some());
-        assert_eq!(front.unwrap().data, vec![1, 2, 3]);
+        assert_eq!(front.unwrap().get_data(), vec![1, 2, 3]);
 
         let back = deque.back();
         assert!(back.is_some());
-        assert_eq!(back.unwrap().data, vec![4, 5, 6]);
+        assert_eq!(back.unwrap().get_data(), vec![4, 5, 6]);
     }
 
     #[test]
     fn test_clear() {
         let mut deque = KcpDeque::new();
-        deque.push_back(Segment::new(vec![1, 2, 3]));
-        deque.push_back(Segment::new(vec![4, 5, 6]));
+        let data: Vec<u8> = vec![
+            0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1,
+            2, 3,
+        ];
+        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let seg1 = Segment::new(kcp_packet);
+        let data: Vec<u8> = vec![
+            0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 4,
+            5, 6,
+        ];
+        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let seg2 = Segment::new(kcp_packet);
 
+        deque.push_back(seg1);
+        deque.push_back(seg2);
         assert_eq!(deque.len(), 2);
         deque.clear();
         assert!(deque.is_empty());
@@ -261,13 +299,20 @@ mod tests {
     #[test]
     fn test_iter() {
         let mut deque = KcpDeque::new();
-        deque.push_back(Segment::new(vec![1]));
-        deque.push_back(Segment::new(vec![2]));
-        deque.push_back(Segment::new(vec![3]));
+        let data: Vec<u8> = vec![
+            0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1,
+            2, 3,
+        ];
+        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let seg = Segment::new(kcp_packet);
+
+        deque.push_back(seg.clone());
+        deque.push_back(seg.clone());
+        deque.push_back(seg);
 
         let mut count = 0;
         for seg in deque.iter() {
-            assert_eq!(seg.data.len(), 1);
+            assert_eq!(seg.get_data().len(), 3);
             count += 1;
         }
         assert_eq!(count, 3);

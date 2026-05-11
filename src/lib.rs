@@ -37,7 +37,6 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 // 模块声明
-pub mod codec;
 pub mod config;
 pub mod core;
 pub mod error;
@@ -54,15 +53,13 @@ pub mod stream;
 
 // 导出公共API
 pub use crate::config::KcpConfig;
-pub use crate::core::{Kcp, KcpCmd};
+// pub use crate::core::Kcp;
 pub use crate::error::{KcpError, KcpResult};
+pub use crate::helper::KcpCmd;
 pub use crate::queue::{KcpDeque, Segment};
+pub use bytes;
+pub use tokio;
 
 // 导出Stream API (当stream feature启用时)
-#[cfg(feature = "stream")]
-pub use crate::stream::{KcpListener, KcpStream, StreamConfig};
-
-// 预导入模块
-// pub mod prelude {
-//     pub use crate::{Kcp, KcpConfig, KcpResult, KcpError, KcpCmd};
-// }
+// #[cfg(feature = "stream")]
+// pub use crate::stream::{KcpListener, KcpStream, StreamConfig};
