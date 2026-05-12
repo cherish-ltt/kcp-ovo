@@ -127,7 +127,7 @@ impl KcpStream {
         // 设置output回调
         let socket = Arc::new(socket);
         let socket_clone = socket.clone();
-        let timeout_duration = config.connect_timeout.clone();
+        let timeout_duration = config.connect_timeout;
         kcp.set_output(move |data| {
             let socket_clone = socket_clone.clone();
             async move {
@@ -178,7 +178,6 @@ impl KcpStream {
 
                             }
                             None => {
-                                println!("break");
                                 break;
                             },
                         }
@@ -237,7 +236,7 @@ impl KcpStream {
 
         // 接收数据
         match self.data_receiver.recv().await {
-            Some(data) => return Ok(data),
+            Some(data) => Ok(data),
             None => Ok(Vec::new()),
         }
     }
@@ -246,14 +245,14 @@ impl KcpStream {
     pub fn try_send(&mut self, data: &[u8]) -> KcpResult<()> {
         self.data_sender
             .try_send(data.into())
-            .map_err(|e| KcpError::IoError(format!("stream try send err:{}", e.to_string())))
+            .map_err(|e| KcpError::IoError(format!("stream try send err:{}", e)))
     }
 
     /// 尝试接收数据（非阻塞）
     pub fn try_recv(&mut self) -> KcpResult<Vec<u8>> {
         self.data_receiver
             .try_recv()
-            .map_err(|e| KcpError::IoError(format!("stream try recv err:{}", e.to_string())))
+            .map_err(|e| KcpError::IoError(format!("stream try recv err:{}", e)))
     }
 
     /// 检查连接状态
@@ -356,7 +355,7 @@ impl KcpListener {
                         match result {
                             Some((data, addr)) => {
                                 if let Err(e) = timeout(timeout_druation, socket.send_to(&data, addr)).await {
-                                    error!("socket.send_to err: {}", e.to_string());
+                                    error!("socket.send_to err: {}", e);
                                 }
                             }
                             None => warn!("udp_rx.recv none"),
@@ -386,7 +385,7 @@ impl KcpListener {
                                             let udp_tx_clone = udp_tx_clone.clone();
                                             async move {
                                                 let len = data.len();
-                                                let _ = udp_tx_clone.send((data.to_vec(),addr))
+                                                udp_tx_clone.send((data.to_vec(),addr))
                                                     .await
                                                     .map_err(|_e| KcpError::IoError("send data fail".to_string()))?;
                                                 Ok(len)
@@ -480,11 +479,13 @@ impl KcpListener {
     pub async fn send_to(&mut self, data: &[u8], addr: SocketAddr) -> KcpResult<()> {
         match self.clients.get(&addr) {
             Some(client) => {
-                client.send_tx.send(data.to_vec()).await.map_err(|e| {
-                    KcpError::IoError(format!("listener send_to err: {}", e.to_string()))
-                })?;
+                client
+                    .send_tx
+                    .send(data.to_vec())
+                    .await
+                    .map_err(|e| KcpError::IoError(format!("listener send_to err: {}", e)))?;
             }
-            None => return Err(KcpError::IoError(format!("listener send_to err: None"))),
+            None => return Err(KcpError::IoError("listener send_to err: None".to_string())),
         }
         Ok(())
     }
@@ -492,10 +493,8 @@ impl KcpListener {
     /// recv
     pub async fn recv(&mut self) -> KcpResult<(Vec<u8>, SocketAddr)> {
         match self.recv_rx.recv().await {
-            Some(result) => {
-                return Ok(result);
-            }
-            None => return Err(KcpError::IoError(format!("listener send_to err: None"))),
+            Some(result) => Ok(result),
+            None => Err(KcpError::IoError("listener send_to err: None".to_string())),
         }
     }
 }

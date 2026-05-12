@@ -256,8 +256,6 @@ async fn send_file(input_path: &str) -> io::Result<()> {
     println!("总大小: {} bytes", total_sent);
     println!("总耗时: {:?}", elapsed);
     println!("平均速度: {:.2} MB/s", avg_throughput);
-    // let result = stream.recv().await.unwrap();
-    // let result = stream.recv().await.unwrap();
     let _ = timeout(Duration::from_secs(3), stream.recv()).await;
 
     Ok(())

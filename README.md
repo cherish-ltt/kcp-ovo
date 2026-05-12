@@ -26,7 +26,7 @@
 
 [kcp-ovo](https://github.com/cherish-ltt/kcp-ovo) 是一个快速可靠的ARQ（Automatic Repeat-reQuest）协议的纯Rust实现。KCP是一个低延迟、高可靠性的传输层协议，相比传统TCP可以降低**30%-40%的延迟**，最大RTT减少**三倍**。
 
-本项目完整复刻了[skywind3000/kcp](https://github.com/skywind3000/kcp)的原版C代码，使用纯Rust重写，充分利用Rust的类型安全和内存安全特性，同时提供类似TCP的Stream API简化使用。
+本项目参考了[skywind3000/kcp](https://github.com/skywind3000/kcp)的原版C代码，使用纯Rust语言，充分利用Rust的类型安全和内存安全特性，同时提供类似TCP的Stream API简化使用。
 
 ## ✨ 特性
 
@@ -56,7 +56,7 @@
 
 ```toml
 [dependencies]
-kcp-ovo = "0.1"
+kcp-ovo = "0.2"
 ```
 
 ### Stream API（推荐）
@@ -68,25 +68,9 @@ use kcp_ovo::KcpListener;
 use std::io::{Read, Write};
 
 fn main() -> std::io::Result<()> {
-    let mut listener = KcpListener::bind("0.0.0.0:8888")?;
+    let mut listener = KcpListener::bind("0.0.0.0:8888").await?;
     println!("服务器启动在 0.0.0.0:8888");
-
-    let (mut stream, addr) = listener.accept()?;
-    println!("客户端 {} 已连接", addr);
-
-    let mut buffer = [0u8; 1024];
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                stream.write_all(&buffer[..n])?;
-            }
-            Err(e) => {
-                eprintln!("错误: {}", e);
-                break;
-            }
-        }
-    }
+    
     Ok(())
 }
 ```
@@ -98,12 +82,11 @@ use kcp_ovo::KcpStream;
 use std::io::{Read, Write};
 
 fn main() -> std::io::Result<()> {
-    let mut stream = KcpStream::connect("127.0.0.1:8888")?;
-    stream.write_all(b"Hello, KCP!")?;
+    let mut stream = KcpStream::connect("127.0.0.1:8888").await?;
+    stream.send(b"Hello, KCP!").await?;
 
-    let mut buffer = [0u8; 1024];
-    let n = stream.read(&mut buffer)?;
-    println!("收到: {}", String::from_utf8_lossy(&buffer[..n]));
+    let bytes = stream.recv().await?;
+    println!("收到: {}", String::from_utf8_lossy(&bytes));
     Ok(())
 }
 ```
@@ -118,10 +101,12 @@ fn main() -> kcp_ovo::KcpResult<()> {
     let mut kcp = Kcp::new(0x11223344, KcpConfig::default())?;
 
     // 设置输出回调
-    kcp.set_output(|data, _kcp| {
-        // 通过UDP socket发送
-        udp_socket.send_to(data, &remote_addr)?;
-        Ok(data.len())
+    kcp.set_output(|data| {
+        async move {
+            // 通过UDP socket发送
+            udp_socket.send_to(data, &remote_addr)?;
+            Ok(data.len())
+        }
     });
 
     // 发送数据
@@ -136,9 +121,8 @@ fn main() -> kcp_ovo::KcpResult<()> {
     kcp.update(current_timestamp_ms);
 
     // 接收数据
-    let mut recv_buf = [0u8; 4096];
-    let recv_len = kcp.recv(&mut recv_buf)?;
-    println!("收到: {}", String::from_utf8_lossy(&recv_buf[..recv_len]));
+    let bytes = kcp.recv()?;
+    println!("收到: {}", String::from_utf8_lossy(&bytes));
 
     Ok(())
 }
@@ -221,7 +205,7 @@ cargo doc --open
 
 | 示例 | 说明 | 运行方式 |
 |------|------|---------|
-| `stream-api` | Echo服务器/客户端 | `cargo run --example stream-api -- [server\|client]` |
+| `stream-easy-api` | Echo服务器/客户端 | `cargo run --example stream-easy-api` |
 | `low-level-api` | 底层API演示 | `cargo run --example low-level-api` |
 | `file-transfer` | 文件传输示例 | `cargo run --example file-transfer -- [send\|recv] <file>` |
 
@@ -261,16 +245,6 @@ src/
 - 实现标准IO trait
 - 自动处理socket读写
 
-**示例**:
-```rust
-use kcp_ovo::KcpStream;
-use std::io::{Read, Write};
-
-let mut stream = KcpStream::connect("127.0.0.1:8888")?;
-stream.write_all(b"Hello")?;
-let mut buffer = [0u8; 1024];
-stream.read(&mut buffer)?;
-```
 
 ### 底层API（推荐高级用户）
 
@@ -286,15 +260,6 @@ stream.read(&mut buffer)?;
 - 可以自定义输出逻辑
 - 更灵活，无额外抽象层
 
-**示例**:
-```rust
-use kcp_ovo::{Kcp, KcpConfig};
-
-let mut kcp = Kcp::new(0x11223344, KcpConfig::fast_mode())?;
-kcp.set_output(|data, _| udp_socket.send(data))?;
-kcp.send(b"Hello")?;
-kcp.flush();
-```
 
 ## 📦 Feature Flags
 
@@ -306,13 +271,13 @@ kcp.flush();
 
 ```toml
 # 默认配置（包含Stream API）
-kcp-ovo = "0.1"
+kcp-ovo = "0.2"
 
 # 仅使用底层API
-kcp-ovo = { version = "0.1", default-features = false }
+kcp-ovo = { version = "0.2", default-features = false }
 
 # 显式启用Stream API
-kcp-ovo = { version = "0.1", features = ["stream"] }
+kcp-ovo = { version = "0.2", features = ["stream"] }
 ```
 
 ## 🧪 测试
@@ -339,16 +304,15 @@ cargo test test_kcp_new
 
 ### 已完成 ✅
 
-- [x] Phase 1-9: 项目初始化和基础结构
-- [x] Phase 10-16: 核心KCP协议实现
-- [x] Phase 17: 测试基础设施
+- [x] Phase 1: 项目初始化和基础结构
+- [x] Phase 2: 核心KCP协议实现
+- [x] Phase 3: 测试基础设施
   - [x] 单元测试（24个核心测试）
   - [x] 测试依赖配置
-- [x] Phase 18: Stream API实现
+- [x] Phase 4: Stream API实现
   - [x] KcpStream客户端封装
   - [x] KcpListener服务端封装
-  - [x] Read/Write trait实现
-- [x] Phase 19: 文档和示例
+- [x] Phase 5: 文档和示例
   - [x] 入门教程
   - [x] API指南
   - [x] 性能优化指南
@@ -357,8 +321,8 @@ cargo test test_kcp_new
 
 ### 计划中 📋
 
-- [ ] Phase 20: 集成测试和边界测试
-- [ ] Phase 21: 性能基准测试
+- [ ] Phase 6: 集成测试和边界测试
+- [ ] Phase 7: 性能基准测试
   - [ ] 性能基准测试
 - [ ] 更多......
 
@@ -374,6 +338,10 @@ MIT License
 
 - [skywind3000/kcp](https://github.com/skywind3000/kcp) - 原版KCP协议实现
 - [mimalloc-rust](https://github.com/purpleprotocol/mimalloc_rust) - Rust内存分配器
+- [dashmap](https://github.com/xacrimon/dashmap) - Blazingly fast concurrent map in Rust.
+- [bytes](https://github.com/tokio-rs/bytes) - 一个用于处理字节的工具库
+- [tokio](https://github.com/tokio-rs/tokio) - tokio一个运行时，用于用 Rust 编程语言编写可靠的、异步且精简的应用程序
+- 全部用到的rust-crates......
 
 ## 🤝 贡献
 

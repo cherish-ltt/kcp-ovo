@@ -6,10 +6,8 @@
 //! - Stream API: 自动处理update、socket读写，类似TCP
 //! - 底层API: 需要手动管理所有细节，但更灵活
 
-use kcp_ovo::{Kcp, KcpConfig};
+use kcp_ovo::{KcpConfig, core::kcp::Kcp};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("KCP底层API示例");
@@ -66,7 +64,6 @@ fn example2_configure_kcp() -> Result<(), Box<dyn std::error::Error>> {
         interval: 50,
         nodelay: true,
         fastresend: 2,
-        stream: false,
         nocwnd: false,
         rcv_wnd: 512,
         ..Default::default()
@@ -85,10 +82,13 @@ fn example2_configure_kcp() -> Result<(), Box<dyn std::error::Error>> {
     let sent_data = Arc::new(Mutex::new(Vec::new()));
     let sent_clone = sent_data.clone();
 
-    kcp.set_output(move |data, _kcp| {
-        println!("  [output] 发送 {} 字节", data.len());
-        sent_clone.lock().unwrap().push(data.to_vec());
-        Ok(data.len())
+    kcp.set_output(move |data| {
+        let sent_clone = sent_clone.clone();
+        async move {
+            println!("  [output] 发送 {} 字节", data.len());
+            sent_clone.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
     });
 
     println!("✓ 设置输出回调成功");
@@ -117,9 +117,13 @@ fn example3_send_recv() -> Result<(), Box<dyn std::error::Error>> {
     let sent_packets = Arc::new(Mutex::new(Vec::new()));
     let sent_clone = sent_packets.clone();
 
-    kcp.set_output(move |data, _kcp| {
-        sent_clone.lock().unwrap().push(data.to_vec());
-        Ok(data.len())
+    kcp.set_output(move |data| {
+        let sent_clone = sent_clone.clone();
+        async move {
+            println!("  [output] 发送 {} 字节", data.len());
+            sent_clone.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
     });
 
     println!("✓ KCP实例创建完成");
@@ -147,16 +151,13 @@ fn example3_send_recv() -> Result<(), Box<dyn std::error::Error>> {
     println!("模拟接收到的数据包...");
     println!("注意: 实际应用中需要通过UDP socket接收真实的数据包");
 
-    // 创建模拟的接收缓冲区
-    let mut recv_buffer = [0u8; 1024];
-
     // 尝试接收（会失败，因为队列为空）
-    match kcp.recv(&mut recv_buffer) {
+    match kcp.recv() {
         Ok(n) => {
             println!(
-                "✓ 接收到数据: \"{}\" ({} 字节)",
-                String::from_utf8_lossy(&recv_buffer[..n]),
-                n
+                "✓ 接收到数据: \"{:?}\" ({:?} 字节)",
+                String::from_utf8_lossy(&n),
+                n.len()
             );
         }
         Err(e) => {
