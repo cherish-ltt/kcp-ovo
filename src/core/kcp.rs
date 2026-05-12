@@ -599,7 +599,7 @@ impl Kcp {
                     // 超出窗口或已接收，丢弃
                     return Ok(());
                 }
-
+                
                 // 检查是否重复
                 for seg in self.rcv_buf.iter() {
                     if seg.kcp_packet.header.sn == header.sn {
@@ -749,7 +749,7 @@ impl Kcp {
                 return;
             }
 
-            if self.timediff_u32(newseg.kcp_packet.header.sn, seg.kcp_packet.header.sn) > 0 {
+            if self.timediff_u32(newseg.kcp_packet.header.sn, seg.kcp_packet.header.sn) < 0 {
                 insert_pos = i;
                 break;
             }
@@ -814,8 +814,8 @@ impl Kcp {
             seg.fastack = 0;
             seg.xmit = 0;
 
-            self.snd_nxt = self.snd_nxt.wrapping_add(1);
             self.snd_buf.push_back(seg);
+
             self.nsnd_buf += 1;
 
             can_send -= 1;

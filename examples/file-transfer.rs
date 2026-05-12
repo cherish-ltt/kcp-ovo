@@ -10,11 +10,12 @@ use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::thread;
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use bytes::Buf;
 use kcp_ovo::stream::{KcpListener, KcpStream};
+use tokio::time::timeout;
 
 const BUFFER_SIZE: usize = 1400; // KCP的MSS
 const PROGRESS_INTERVAL: usize = 100 * 1024; // 每100KB显示进度
@@ -66,25 +67,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn recv_file(output_path: &str) -> io::Result<()> {
     println!("KCP文件接收器");
     println!("================");
-    println!("监听地址: 0.0.0.0:9999");
+    println!("监听地址: 0.0.0.0:19999");
     println!("输出文件: {}", output_path);
     println!();
 
     // 创建监听器
-    let mut listener = KcpListener::bind("0.0.0.0:9999").await.unwrap();
+    let mut listener = KcpListener::bind("0.0.0.0:19999").await.unwrap();
     println!("等待发送端连接...");
 
-    // 接受连接
-    let (mut stream, addr) = listener.accept().await.unwrap();
-    println!("已连接到: {}", addr);
+    // 接收第一个数据包，从中获取发送方地址和至少8字节的元数据
+    let (first_data, sender_addr) = listener.recv().await.unwrap();
+    println!("已连接到: {}", sender_addr);
     println!();
 
     // 创建输出文件
     let mut output = File::create(output_path)?;
 
-    // 接收文件元数据
-    let mut bytes = stream.recv().await.unwrap();
-    let file_size = bytes.get_u64();
+    // 解析文件大小（前8字节为大端序 u64）
+    // 考虑可能粘包：若第一个数据包超过8字节，剩余部分属于文件内容
+    let mut buf = &first_data[..];
+    let file_size = buf.get_u64();
+
+    let mut total_received: u64 = 0;
+    let mut start_time = Instant::now();
 
     println!(
         "文件大小: {} bytes ({} MB)",
@@ -93,22 +98,34 @@ async fn recv_file(output_path: &str) -> io::Result<()> {
     );
     println!();
 
-    // 接收文件内容
-    let mut buffer = vec![0u8; BUFFER_SIZE];
-    let mut total_received = 0u64;
-    let mut start_time = Instant::now();
+    // 如果第一个包中还有剩余数据，先写入文件
+    if !buf.is_empty() {
+        output.write_all(buf)?;
+        total_received += buf.len() as u64;
+    }
 
-    loop {
-        match stream.recv().await {
-            Ok(buf) => {
-                output.write_all(&buf)?;
-                total_received += buf.len() as u64;
+    // 持续接收文件数据
+    while total_received < file_size {
+        match listener.recv().await {
+            Ok((data, addr)) => {
+                // 只处理来自同一发送方的数据
+                if addr != sender_addr {
+                    eprintln!("\n收到来自未知地址 {} 的数据，已忽略", addr);
+                    continue;
+                }
+
+                output.write_all(&data)?;
+                total_received += data.len() as u64;
 
                 // 显示进度
-                if total_received % PROGRESS_INTERVAL as u64 == 0 {
+                if total_received % PROGRESS_INTERVAL as u64 == 0 || total_received >= file_size {
                     let progress = (total_received as f64 / file_size as f64) * 100.0;
                     let elapsed = start_time.elapsed().as_secs_f64();
-                    let throughput = (total_received as f64 / elapsed) / 1024.0 / 1024.0;
+                    let throughput = if elapsed > 0.0 {
+                        (total_received as f64 / elapsed) / 1024.0 / 1024.0
+                    } else {
+                        0.0
+                    };
                     print!(
                         "\r进度: {:.1}% | 已接收: {} MB | 速度: {:.2} MB/s",
                         progress,
@@ -123,16 +140,14 @@ async fn recv_file(output_path: &str) -> io::Result<()> {
                 return Ok(());
             }
         }
-
-        // 检查是否接收完成
-        if total_received >= file_size {
-            println!();
-            break;
-        }
     }
 
     let elapsed = start_time.elapsed();
-    let avg_throughput = (total_received as f64 / elapsed.as_secs_f64()) / 1024.0 / 1024.0;
+    let avg_throughput = if elapsed.as_secs_f64() > 0.0 {
+        (total_received as f64 / elapsed.as_secs_f64()) / 1024.0 / 1024.0
+    } else {
+        0.0
+    };
 
     println!();
     println!("文件接收完成!");
@@ -148,7 +163,7 @@ async fn recv_file(output_path: &str) -> io::Result<()> {
 async fn send_file(input_path: &str) -> io::Result<()> {
     println!("KCP文件发送器");
     println!("================");
-    println!("目标地址: 127.0.0.1:9999");
+    println!("目标地址: 127.0.0.1:19999");
     println!("输入文件: {}", input_path);
     println!();
 
@@ -177,17 +192,18 @@ async fn send_file(input_path: &str) -> io::Result<()> {
 
     // 连接到接收端
     println!("连接到接收端...");
-    let mut stream = KcpStream::connect("127.0.0.1:9999").await.unwrap();
-    
+    let data = [0_u8, 1, 2, 3, 4, 5];
+    let mut stream = KcpStream::connect("127.0.0.1:19999").await.unwrap();
+
     println!("已连接");
     println!();
 
-    // 发送文件元数据
+    // 发送文件元数据（大端序 u64）
     let metadata = file_size.to_be_bytes();
     stream.send(&metadata).await.unwrap();
 
     // 发送文件内容
-    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut buffer = vec![0u8; file_size as usize];
     let mut total_sent = 0u64;
     let mut start_time = Instant::now();
 
@@ -195,14 +211,20 @@ async fn send_file(input_path: &str) -> io::Result<()> {
         match input.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => {
+                println!("dd{}", n);
                 stream.send(&buffer[..n]).await.unwrap();
+                let result = stream.recv().await.unwrap();
                 total_sent += n as u64;
 
                 // 显示进度
-                if total_sent % PROGRESS_INTERVAL as u64 == 0 {
+                if total_sent % PROGRESS_INTERVAL as u64 == 0 || total_sent >= file_size {
                     let progress = (total_sent as f64 / file_size as f64) * 100.0;
                     let elapsed = start_time.elapsed().as_secs_f64();
-                    let throughput = (total_sent as f64 / elapsed) / 1024.0 / 1024.0;
+                    let throughput = if elapsed > 0.0 {
+                        (total_sent as f64 / elapsed) / 1024.0 / 1024.0
+                    } else {
+                        0.0
+                    };
                     print!(
                         "\r进度: {:.1}% | 已发送: {} MB | 速度: {:.2} MB/s",
                         progress,
@@ -223,18 +245,25 @@ async fn send_file(input_path: &str) -> io::Result<()> {
     }
 
     let elapsed = start_time.elapsed();
-    let avg_throughput = (total_sent as f64 / elapsed.as_secs_f64()) / 1024.0 / 1024.0;
+    let avg_throughput = if elapsed.as_secs_f64() > 0.0 {
+        (total_sent as f64 / elapsed.as_secs_f64()) / 1024.0 / 1024.0
+    } else {
+        0.0
+    };
 
     println!();
     println!("文件发送完成!");
     println!("总大小: {} bytes", total_sent);
     println!("总耗时: {:?}", elapsed);
     println!("平均速度: {:.2} MB/s", avg_throughput);
+    // let result = stream.recv().await.unwrap();
+    // let result = stream.recv().await.unwrap();
+    let _ = timeout(Duration::from_secs(3), stream.recv()).await;
 
     Ok(())
 }
 
-/// 计算校验和
+/// 计算校验和（示例保留，未使用）
 fn calculate_checksum(data: &[u8]) -> u32 {
     let mut checksum: u32 = 0;
     for (i, &byte) in data.iter().enumerate() {

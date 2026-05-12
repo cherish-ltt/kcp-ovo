@@ -172,11 +172,15 @@ impl KcpStream {
                         match result {
                             Some(data) => {
                                 match kcp.send(&data) {
-                                    Ok(size) => debug!("send data(size-{}) success", size),
+                                    Ok(size) => {debug!("send data(size-{}) success", size)},
                                     Err(e) => error!("send data err:{}", e),
                                 }
+
                             }
-                            None => break,
+                            None => {
+                                println!("break");
+                                break;
+                            },
                         }
                     }
                 }
@@ -430,6 +434,13 @@ impl KcpListener {
                                                 }
                                             }
                                         });
+
+                                        let data = Bytes::copy_from_slice(&buf[..size]).to_vec();
+                                        let sender = data_tx.clone();
+                                        tokio::spawn(async move {
+                                            let _ = sender.send(data).await;
+                                        });
+
                                         clients_clone.insert(
                                             addr,
                                             Clinet {
@@ -497,15 +508,24 @@ mod test {
 
     #[tokio::test(start_paused = false)]
     async fn test_stream() {
-        let data = [0_u8, 1, 2, 3, 4, 5];
+        let data1 = [0_u8, 1, 2, 3, 4, 5];
+        let data2 = [5_u8, 6, 7, 8, 9, 10];
 
         let handle = tokio::spawn(async move {
             let mut listener = KcpListener::bind("0.0.0.0:19999").await.unwrap();
             match listener.recv().await {
                 Ok(result) => {
-                    assert_eq!(result.0, data);
-                    let data = [5, 4, 3, 2, 1, 0_u8];
-                    let _ = listener.send_to(&data, result.1).await;
+                    assert_eq!(result.0, data1);
+                    let data1 = [5, 4, 3, 2, 1, 0_u8];
+                    let _ = listener.send_to(&data1, result.1).await;
+                }
+                Err(_) => {}
+            }
+            match listener.recv().await {
+                Ok(result) => {
+                    assert_eq!(result.0, data2);
+                    let data2 = [10, 9, 8, 7, 6, 5_u8];
+                    let _ = listener.send_to(&data2, result.1).await;
                 }
                 Err(_) => {}
             }
@@ -513,9 +533,12 @@ mod test {
 
         sleep(Duration::from_secs(1)).await;
         let mut stream = KcpStream::connect("127.0.0.1:19999").await.unwrap();
-        let _ = stream.send(&data).await;
+        let _ = stream.send(&data1).await;
+        let _ = stream.send(&data2).await;
         let result = stream.recv().await.unwrap();
         assert_eq!(result, vec![5, 4, 3, 2, 1, 0]);
+        let result = stream.recv().await.unwrap();
+        assert_eq!(result, vec![10, 9, 8, 7, 6, 5]);
         let _ = handle.await;
     }
 }

@@ -24,5 +24,4 @@ async fn main() {
     let _ = stream.send(&data).await;
     let result = stream.recv().await.unwrap();
     assert_eq!(result, vec![5, 4, 3, 2, 1, 0]);
-    let _ = handle.await;
 }
