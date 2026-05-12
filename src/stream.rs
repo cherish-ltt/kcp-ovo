@@ -26,7 +26,12 @@
 //! ```
 
 use bytes::Bytes;
+use dashmap::DashMap;
+use log::{debug, error, warn};
 use tokio::net::{ToSocketAddrs, UdpSocket, lookup_host};
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, timeout};
 
 use crate::core::kcp::Kcp;
 use crate::helper::{current_millis, generate_conv};
@@ -36,13 +41,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub const CHANNEL_SIZE: usize = 64;
+pub const BUFFER_SIZE: usize = u16::MAX as usize;
+
 /// Stream配置
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
     /// 自动更新间隔
     pub update_interval: Duration,
-    /// 是否自动调用update
-    pub auto_update: bool,
     /// 连接超时时间
     pub connect_timeout: Duration,
 }
@@ -51,7 +57,6 @@ impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             update_interval: Duration::from_millis(10),
-            auto_update: true,
             connect_timeout: Duration::from_secs(5),
         }
     }
@@ -61,10 +66,12 @@ impl Default for StreamConfig {
 ///
 /// 提供类似TCP的连接和数据传输接口
 pub struct KcpStream {
-    /// KCP实例
-    kcp: Kcp,
-    /// UDP socket
-    socket: Arc<UdpSocket>,
+    /// 主线程
+    main_handle: JoinHandle<()>,
+    /// 发送数据channel-sender
+    data_sender: Sender<Vec<u8>>,
+    /// 接收数据channel-receiver
+    data_receiver: Receiver<Vec<u8>>,
     /// 远程地址
     remote: SocketAddr,
     /// 是否已连接
@@ -103,7 +110,7 @@ impl KcpStream {
     /// 返回连接成功的KcpStream实例
     pub async fn connect_with_config<A: ToSocketAddrs>(
         addr: A,
-        _config: StreamConfig,
+        config: StreamConfig,
     ) -> KcpResult<Self> {
         // 解析地址
         let remote = lookup_host(addr).await?.next().ok_or(KcpError::NoAddress)?;
@@ -120,61 +127,97 @@ impl KcpStream {
         // 设置output回调
         let socket = Arc::new(socket);
         let socket_clone = socket.clone();
+        let timeout_duration = config.connect_timeout.clone();
         kcp.set_output(move |data| {
             let socket_clone = socket_clone.clone();
             async move {
-                socket_clone.send(&data).await?; // socket 必须实现了 async send
+                let _ = timeout(timeout_duration, socket_clone.send(&data))
+                    .await
+                    .map_err(|_e| KcpError::IoError("send data fail".to_string()))?;
                 Ok(data.len())
             }
         });
 
-        tokio::spawn(async move{
-            
+        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+        let (recv_tx, recv_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+        let main_handle = tokio::spawn(async move {
+            let mut interval = interval(config.update_interval);
+            let mut buf = vec![0; BUFFER_SIZE];
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(e) = kcp.update(current_millis()).await {
+                            error!("kcp update err:{}", e);
+                        }
+                    }
+                    result = socket.recv(&mut buf) => {
+                        match result {
+                            Ok(size) => {
+                                if let Err(e) = kcp.input(&buf[..size]) {
+                                    error!("kcp input err:{}", e);
+                                }
+                                match kcp.recv() {
+                                    Ok(bytes) => {
+                                        if let Err(e) = recv_tx.send(bytes.to_vec()).await {
+                                            error!("recv_tx send err:{}", e);
+                                        }
+                                    }
+                                    Err(e) => error!("kcp recv err:{}", e),
+                                }
+                            }
+                            Err(e) => error!("socket err:{}", e),
+                        }
+                    }
+                    result = data_rx.recv() => {
+                        match result {
+                            Some(data) => {
+                                match kcp.send(&data) {
+                                    Ok(size) => debug!("send data(size-{}) success", size),
+                                    Err(e) => error!("send data err:{}", e),
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
         });
 
         Ok(Self {
-            kcp,
-            socket,
+            main_handle,
+            data_sender: data_tx,
+            data_receiver: recv_rx,
             remote,
             connected: true,
         })
     }
 
-    /// 发送数据
+    /// 发送数据(阻塞)
     ///
     /// # 参数
     ///
     /// - `data`: 要发送的数据
-    ///
-    /// # 返回
-    ///
-    /// 返回发送的字节数
     ///
     /// # 示例
     ///
     /// ```ignore
     /// stream.send(b"Hello")?;
     /// ```
-    pub async fn send(&mut self, data: &[u8]) -> KcpResult<usize> {
+    pub async fn send(&mut self, data: &[u8]) -> KcpResult<()> {
         if !self.connected {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
 
-        // 处理接收到的数据
-        // self.handle_input().await?;
-
         // 发送数据（放入队列）
-        let sent = self.kcp.send(data)?;
+        if let Err(e) = self.data_sender.send(data.into()).await {
+            error!("stream send err: {}", e);
+            return Err(KcpError::IoError(format!("stream send err: {}", e)));
+        }
 
-        // 立即刷新：重置 ts_flush 使 update() 无条件 flush
-        // 确保数据在 send() 返回前通过 output callback 发出
-        // self.kcp.ts_flush = 0;
-        // self.kcp.update(current_millis()).await?;
-
-        Ok(sent)
+        Ok(())
     }
 
-    /// 接收数据
+    /// 接收数据(阻塞)
     ///
     /// # 参数
     ///
@@ -182,61 +225,31 @@ impl KcpStream {
     ///
     /// # 返回
     ///
-    /// 返回接收到的字节数
-    ///
-    /// # 示例
-    ///
-    /// ```ignore
-    /// let mut buffer = [0u8; 1024];
-    /// let len = stream.recv(&mut buffer)?;
-    /// ```
-    pub async fn recv(&mut self) -> KcpResult<Bytes> {
+    /// 返回接收到的Vec<u8>
+    pub async fn recv(&mut self) -> KcpResult<Vec<u8>> {
         if !self.connected {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
 
-        // 处理接收到的数据
-        self.handle_input().await?;
-
-        // 每次 recv 都刷新：确保 send() 入队的数据及时发出，
-        // 同时处理重传、ACK 等定时任务。调用频率由 kcp_io_loop 自然控制。
-        // self.kcp.update(current_millis())?;
-
         // 接收数据
-        let buf = self.kcp.recv()?;
-
-        Ok(buf)
+        match self.data_receiver.recv().await {
+            Some(data) => return Ok(data),
+            None => Ok(Vec::new()),
+        }
     }
 
-    /// 尝试发送数据（阻塞）
-    pub async fn try_send(&mut self, data: &[u8]) -> KcpResult<usize> {
-        self.send(data).await
+    /// 尝试发送数据（非阻塞）
+    pub fn try_send(&mut self, data: &[u8]) -> KcpResult<()> {
+        self.data_sender
+            .try_send(data.into())
+            .map_err(|e| KcpError::IoError(format!("stream try send err:{}", e.to_string())))
     }
 
     /// 尝试接收数据（非阻塞）
-    pub async fn try_recv(&mut self) -> KcpResult<Bytes> {
-        self.recv().await
-    }
-
-    /// 处理接收到的UDP数据包
-    async fn handle_input(&mut self) -> KcpResult<()> {
-        let mut buffer = [0u8; u16::MAX as usize];
-
-        loop {
-            match self.socket.recv_from(&mut buffer).await {
-                Ok((len, _src)) => {
-                    self.kcp.input(&buffer[..len])?;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    break;
-                }
-                Err(e) => {
-                    return Err(e.into());
-                }
-            }
-        }
-
-        Ok(())
+    pub fn try_recv(&mut self) -> KcpResult<Vec<u8>> {
+        self.data_receiver
+            .try_recv()
+            .map_err(|e| KcpError::IoError(format!("stream try recv err:{}", e.to_string())))
     }
 
     /// 检查连接状态
@@ -249,11 +262,6 @@ impl KcpStream {
         self.remote
     }
 
-    /// 获取本地地址
-    pub fn local_addr(&self) -> KcpResult<SocketAddr> {
-        Ok(self.socket.local_addr()?)
-    }
-
     /// 关闭连接
     pub fn close(&mut self) -> KcpResult<()> {
         self.connected = false;
@@ -261,14 +269,29 @@ impl KcpStream {
     }
 }
 
+pub struct Clinet {
+    /// SocketAddr
+    addr: SocketAddr,
+    /// 主线程
+    main_handle: JoinHandle<()>,
+    /// listener-msg
+    data_tx: Sender<Vec<u8>>,
+    /// send-msg
+    send_tx: Sender<Vec<u8>>,
+}
+
 /// KCP服务端监听器
 ///
 /// 用于接受KCP客户端连接
 pub struct KcpListener {
-    /// UDP socket
-    socket: Arc<UdpSocket>,
+    /// clients
+    clients: Arc<DashMap<SocketAddr, Clinet>>,
+    /// 主线程
+    main_handle: JoinHandle<()>,
     /// 配置
     config: StreamConfig,
+    /// recv-msg
+    recv_rx: UnboundedReceiver<(Vec<u8>, SocketAddr)>,
 }
 
 impl KcpListener {
@@ -308,87 +331,191 @@ impl KcpListener {
         let socket = UdpSocket::bind(addr)
             .await
             .map_err(|e| KcpError::IoError(e.to_string()))?;
-        Ok(Self {
-            socket: Arc::new(socket),
-            config,
-        })
-    }
 
-    /// 接受新的连接
-    ///
-    /// # 返回
-    ///
-    /// 返回(KcpStream, 远程地址)
-    ///
-    /// # 示例
-    ///
-    /// ```ignore
-    /// let (mut stream, addr) = listener.accept()?;
-    /// println!("Connection from: {}", addr);
-    /// ```
-    pub async fn accept(&mut self) -> KcpResult<(KcpStream, SocketAddr)> {
-        let mut buffer = [0u8; u16::MAX as usize];
-
-        // 接收数据包
-        let (len, remote) = self.socket.recv_from(&mut buffer).await?;
-
-        // 创建KCP实例
-        let mut kcp = Kcp::new(0, KcpConfig::fast_mode())?;
-
+        let clients: Arc<DashMap<SocketAddr, Clinet>> = Arc::new(DashMap::new());
+        let clients_clone = clients.clone();
         // 设置output回调
-        let socket_clone = self.socket.clone();
-        kcp.set_output(move |data| {
-            let socket_clone = socket_clone.clone();
-            async move {
-                socket_clone.send(&data).await?;
-                Ok(data.len())
+        let socket = Arc::new(socket);
+        let (udp_tx, mut udp_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_SIZE);
+        let (recv_tx, recv_rx) = mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
+        let timeout_druation = Duration::from_millis(100);
+        let main_handle: JoinHandle<()> = tokio::spawn(async move {
+            let mut buf = vec![0; BUFFER_SIZE];
+            let clients_clone = clients_clone.clone();
+            let udp_tx_clone = udp_tx.clone();
+            let recv_tx_clone = recv_tx.clone();
+            loop {
+                let udp_tx_clone = udp_tx_clone.clone();
+                let recv_tx_clone = recv_tx_clone.clone();
+                tokio::select! {
+                    result = udp_rx.recv() => {
+                        match result {
+                            Some((data, addr)) => {
+                                if let Err(e) = timeout(timeout_druation, socket.send_to(&data, addr)).await {
+                                    error!("socket.send_to err: {}", e.to_string());
+                                }
+                            }
+                            None => warn!("udp_rx.recv none"),
+                        }
+                    }
+                    result = socket.recv_from(&mut buf) => {
+                        match result {
+                            Ok((size, addr)) => {
+                                match clients_clone.get(&addr) {
+                                    Some(client) => {
+                                        let data = Bytes::copy_from_slice(&buf[..size]).to_vec();
+                                        let sender = client.data_tx.clone();
+                                        tokio::spawn(async move {
+                                            let _ = sender.send(data).await;
+                                        });
+                                    }
+                                    None => {
+                                        // 新链接进入
+                                        let Ok(mut kcp) = Kcp::new(0, KcpConfig::fast_mode()) else {
+                                            error!("Kcp create failed");
+                                            continue;
+                                        };
+                                        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+                                        let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+
+                                        kcp.set_output(move |data| {
+                                            let udp_tx_clone = udp_tx_clone.clone();
+                                            async move {
+                                                let len = data.len();
+                                                let _ = udp_tx_clone.send((data.to_vec(),addr))
+                                                    .await
+                                                    .map_err(|_e| KcpError::IoError("send data fail".to_string()))?;
+                                                Ok(len)
+                                            }
+                                        });
+                                        let main_handle = tokio::spawn(async move {
+                                            let mut interval = interval(config.update_interval);
+                                            loop{
+                                                tokio::select! {
+                                                    _ = interval.tick() => {
+                                                        if let Err(e) = kcp.update(current_millis()).await {
+                                                            error!("kcp update err:{}", e);
+                                                        }
+                                                    }
+                                                    result = data_rx.recv() => {
+                                                        match result {
+                                                            Some(data) => {
+                                                                match kcp.input(&data) {
+                                                                    Ok(_) => debug!("listener kcp input data success"),
+                                                                    Err(e) => error!("listener kcp input data err:{}", e),
+                                                                }
+                                                                match kcp.recv() {
+                                                                    Ok(bytes) => {
+                                                                        if let Err(e) = recv_tx_clone.send((bytes.to_vec(),addr)) {
+                                                                            error!("recv_tx send err:{}", e);
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {warn!("66601:{}",e)}
+                                                                }
+                                                            }
+                                                            None => warn!("listener data_rx.recv none"),
+                                                        }
+                                                    }
+                                                    result = send_rx.recv() => {
+                                                        match result {
+                                                            Some(data) => {
+                                                                match kcp.send(&data) {
+                                                                    Ok(size) => debug!("listener send data(size-{}) success", size),
+                                                                    Err(e) => error!("listener send data err:{}", e),
+                                                                }
+                                                            }
+                                                            None => warn!("listener data_rx.recv none"),
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                        clients_clone.insert(
+                                            addr,
+                                            Clinet {
+                                                addr,
+                                                main_handle,
+                                                data_tx,
+                                                send_tx,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("socket.recv_from err: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         });
 
-        // 处理接收到的第一个数据包
-        kcp.input(&buffer[..len])?;
-
-        let stream = KcpStream {
-            kcp,
-            socket: self.socket.clone(),
-            remote,
-            connected: true,
-        };
-
-        Ok((stream, remote))
-    }
-
-    /// 获取本地地址
-    pub fn local_addr(&self) -> KcpResult<SocketAddr> {
-        Ok(self.socket.local_addr()?)
+        Ok(Self {
+            clients,
+            main_handle,
+            recv_rx,
+            config,
+        })
     }
 
     /// 关闭监听器
     pub fn close(&mut self) -> KcpResult<()> {
         Ok(())
     }
+
+    /// send
+    pub async fn send_to(&mut self, data: &[u8], addr: SocketAddr) -> KcpResult<()> {
+        match self.clients.get(&addr) {
+            Some(client) => {
+                client.send_tx.send(data.to_vec()).await.map_err(|e| {
+                    KcpError::IoError(format!("listener send_to err: {}", e.to_string()))
+                })?;
+            }
+            None => return Err(KcpError::IoError(format!("listener send_to err: None"))),
+        }
+        Ok(())
+    }
+
+    /// recv
+    pub async fn recv(&mut self) -> KcpResult<(Vec<u8>, SocketAddr)> {
+        match self.recv_rx.recv().await {
+            Some(result) => {
+                return Ok(result);
+            }
+            None => return Err(KcpError::IoError(format!("listener send_to err: None"))),
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
+    use tokio::time::sleep;
+
     use super::*;
 
-    #[test]
-    fn test_stream_config_default() {
-        let config = StreamConfig::default();
-        assert_eq!(config.update_interval, Duration::from_millis(10));
-        assert!(config.auto_update);
-    }
+    #[tokio::test(start_paused = false)]
+    async fn test_stream() {
+        let data = [0_u8, 1, 2, 3, 4, 5];
 
-    #[test]
-    fn test_stream_config_clone() {
-        let config = StreamConfig {
-            update_interval: Duration::from_millis(20),
-            auto_update: false,
-            connect_timeout: Duration::from_secs(10),
-        };
+        let handle = tokio::spawn(async move {
+            let mut listener = KcpListener::bind("0.0.0.0:19999").await.unwrap();
+            match listener.recv().await {
+                Ok(result) => {
+                    assert_eq!(result.0, data);
+                    let data = [5, 4, 3, 2, 1, 0_u8];
+                    let _ = listener.send_to(&data, result.1).await;
+                }
+                Err(_) => {}
+            }
+        });
 
-        let config2 = config.clone();
-        assert_eq!(config.update_interval, config2.update_interval);
+        sleep(Duration::from_secs(1)).await;
+        let mut stream = KcpStream::connect("127.0.0.1:19999").await.unwrap();
+        let _ = stream.send(&data).await;
+        let result = stream.recv().await.unwrap();
+        assert_eq!(result, vec![5, 4, 3, 2, 1, 0]);
+        let _ = handle.await;
     }
 }

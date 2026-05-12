@@ -45,13 +45,22 @@ path = "examples/low-level-api.rs"
 name = "stream-api"
 path = "examples/stream-api.rs"
 
+[[example]]
+name = "stream-easy-api"
+path = "examples/stream-easy-api.rs"
+
 [dependencies]
 bytes = "=1.11.1"
+dashmap = "=6.1.0"
+log = "=0.4.29"
 tokio = { version = "=1.52.3", features = ["full"] }
 
 [dependencies.mimalloc]
 version = "=0.1.50"
 default-features = false
+
+[dev-dependencies]
+tokio-test = "0.4.5"
 
 [dev-dependencies.criterion]
 version = "0.5"

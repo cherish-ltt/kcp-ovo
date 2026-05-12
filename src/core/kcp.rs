@@ -8,6 +8,7 @@ use bytes::{Buf, Bytes, BytesMut};
 
 use crate::KcpCmd;
 use crate::config::KcpConfig;
+use crate::core::kcp;
 use crate::error::{IncompleteDataType, KcpError, KcpResult};
 use crate::helper::{
     IKCP_ASK_SEND, IKCP_ASK_TELL, IKCP_CMD_ACK, IKCP_CMD_PUSH, IKCP_CMD_WASK, IKCP_CMD_WINS,
@@ -158,6 +159,9 @@ pub struct Kcp {
     /// 日志回调函数
     writelog: Option<LogCallback>,
 }
+
+unsafe impl Send for Kcp {}
+unsafe impl Sync for Kcp {}
 
 impl Kcp {
     /// 创建新的KCP控制块
@@ -558,7 +562,9 @@ impl Kcp {
         };
 
         // 验证conv是否匹配
-        if header.conv != self.conv {
+        if self.conv == 0 {
+            self.conv = header.conv;
+        } else if header.conv != self.conv {
             return Ok(()); // 静默丢弃不匹配的数据包
         }
 
@@ -618,8 +624,8 @@ impl Kcp {
                     if front_sn == self.rcv_nxt && self.nrcv_que < self.rcv_wnd as usize {
                         let seg = self.rcv_buf.pop_front().unwrap();
                         self.nrcv_buf -= 1;
-                        self.rcv_queue.push_back(seg);
                         self.nrcv_que += 1;
+                        self.rcv_queue.push_back(seg);
                         self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
                     } else {
                         break;
@@ -801,7 +807,7 @@ impl Kcp {
             seg.kcp_packet.header.cmd = KcpCmd::Push;
             seg.kcp_packet.header.wnd = self.rcv_wnd;
             seg.kcp_packet.header.ts = self.current;
-            seg.kcp_packet.header.sn = self.snd_nxt;
+            // seg.kcp_packet.header.sn = self.snd_nxt;
             seg.kcp_packet.header.una = self.snd_una;
             seg.resendts = self.current;
             seg.rto = self.rx_rto;
