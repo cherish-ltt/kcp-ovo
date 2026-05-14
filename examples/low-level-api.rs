@@ -177,6 +177,7 @@ fn example3_send_recv() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(dead_code)]
 /// 打印使用说明
 fn print_usage() {
     println!("底层API vs Stream API:");

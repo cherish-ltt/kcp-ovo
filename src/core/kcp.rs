@@ -139,6 +139,7 @@ pub struct Kcp {
     #[allow(dead_code)]
     user_data: Option<Box<dyn std::any::Any>>,
     /// 发送缓冲区
+    #[allow(dead_code)]
     buffer: Vec<u8>,
     /// 快速重传触发次数（0表示禁用）
     pub fastresend: i32,

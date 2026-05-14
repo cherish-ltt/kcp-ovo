@@ -34,6 +34,7 @@ pub struct KcpPacketHeader {
 }
 
 impl KcpPacketHeader {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         conv: u32,
         cmd: KcpCmd,

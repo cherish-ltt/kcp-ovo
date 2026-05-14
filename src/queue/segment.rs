@@ -112,9 +112,9 @@ mod tests {
         ];
         let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
         let seg = Segment::new(kcp_packet);
-        assert_eq!(seg.size(), 28 + 0);
+        assert_eq!(seg.size(), 28);
         assert_eq!(seg.get_data().to_vec().len(), 0);
-        assert_eq!(seg.is_empty(), true);
+        assert!(seg.is_empty());
         assert_eq!(seg.get_conv(), 1);
         assert_eq!(seg.get_cmd(), KcpCmd::Push);
     }

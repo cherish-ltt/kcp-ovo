@@ -65,6 +65,7 @@ impl Default for StreamConfig {
 /// KCP客户端流
 ///
 /// 提供类似TCP的连接和数据传输接口
+#[allow(dead_code)]
 pub struct KcpStream {
     /// 主线程
     main_handle: JoinHandle<()>,
@@ -272,6 +273,7 @@ impl KcpStream {
     }
 }
 
+#[allow(dead_code)]
 pub struct Clinet {
     /// SocketAddr
     addr: SocketAddr,
@@ -286,6 +288,7 @@ pub struct Clinet {
 /// KCP服务端监听器
 ///
 /// 用于接受KCP客户端连接
+#[allow(dead_code)]
 pub struct KcpListener {
     /// clients
     clients: Arc<DashMap<SocketAddr, Clinet>>,
@@ -512,21 +515,15 @@ mod test {
 
         let handle = tokio::spawn(async move {
             let mut listener = KcpListener::bind("0.0.0.0:19999").await.unwrap();
-            match listener.recv().await {
-                Ok(result) => {
-                    assert_eq!(result.0, data1);
-                    let data1 = [5, 4, 3, 2, 1, 0_u8];
-                    let _ = listener.send_to(&data1, result.1).await;
-                }
-                Err(_) => {}
+            if let Ok(result) = listener.recv().await {
+                assert_eq!(result.0, data1);
+                let data1 = [5, 4, 3, 2, 1, 0_u8];
+                let _ = listener.send_to(&data1, result.1).await;
             }
-            match listener.recv().await {
-                Ok(result) => {
-                    assert_eq!(result.0, data2);
-                    let data2 = [10, 9, 8, 7, 6, 5_u8];
-                    let _ = listener.send_to(&data2, result.1).await;
-                }
-                Err(_) => {}
+            if let Ok(result) = listener.recv().await {
+                assert_eq!(result.0, data2);
+                let data2 = [10, 9, 8, 7, 6, 5_u8];
+                let _ = listener.send_to(&data2, result.1).await;
             }
         });
 
