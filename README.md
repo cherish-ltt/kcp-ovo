@@ -1,8 +1,8 @@
 <div align="center">
 <h1>kcp-ovo</h1>
 <p>
-  <a href="https://github.com/cherish-ltt/kcp-ovo/actions/workflows/test.yml">
-    <img src="https://img.shields.io/github/actions/workflow/status/cherish-ltt/kcp-ovo/test.yml?branch=master" alt="Build Status"/>
+  <a href="https://github.com/cherish-ltt/kcp-ovo/actions/workflows/rust-ci.yml">
+    <img src="https://img.shields.io/github/actions/workflow/status/cherish-ltt/kcp-ovo/rust-ci.yml?branch=main" alt="Build Status"/>
   </a>
   <a href="https://crates.io/crates/kcp-ovo">
     <img src="https://img.shields.io/crates/v/kcp-ovo.svg" alt="crates.io version"/>
