@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.95.0"
 name = "kcp-ovo"
-version = "0.2.1"
+version = "0.2.2"
 build = false
 autolib = false
 autobins = false

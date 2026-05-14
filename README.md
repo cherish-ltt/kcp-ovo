@@ -14,7 +14,7 @@
     <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license"/>
   </a>
   <a href="https://www.rust-lang.org">
-    <img src="https://img.shields.io/badge/rust-1.92.0+-orange.svg" alt="license"/>
+    <img src="https://img.shields.io/badge/rust-1.95.0+-orange.svg" alt="license"/>
   </a>
 </p>
 </div>
