@@ -14,13 +14,13 @@
     <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license"/>
   </a>
   <a href="https://www.rust-lang.org">
-    <img src="https://img.shields.io/badge/rust-1.95.0+-orange.svg" alt="license"/>
+    <img src="https://img.shields.io/badge/rust-1.95.0+-orange.svg" alt="rustc"/>
   </a>
 </p>
 </div>
 
 
-> 🚀 KCP协议的纯Rust实现 - 快速可靠的ARQ协议，比TCP降低30%-40%延迟
+> 🚀 KCP协议的纯Rust实现 — 快速可靠的ARQ协议，比TCP降低30%-40%延迟
 
 ## 📖 简介
 
@@ -31,22 +31,29 @@
 ## ✨ 特性
 
 ### 核心特性
-- ✅ **纯Rust实现** - 无FFI依赖，完全使用Rust重写
-- ✅ **内存优化** - 使用mimalloc全局分配器优化内存性能
-- ✅ **类型安全** - 充分利用Rust类型系统，防止内存错误
-- ✅ **零成本抽象** - 性能接近原版C实现
-- ✅ **双API设计** - 提供底层API和Stream API（高级API）
+- ✅ **纯Rust实现** — 无FFI依赖，完全使用Rust重写
+- ✅ **内存优化** — 使用mimalloc全局分配器优化内存性能
+- ✅ **类型安全** — 充分利用Rust类型系统，防止内存错误
+- ✅ **零成本抽象** — 性能接近原版C实现
+- ✅ **双API设计** — 提供底层API和Stream API（高级API）
+
+### Stream Mode（流模式）
+- ✅ **无消息边界** — 纯字节流语义，类似TCP，不再要求255分片大小限制
+- ✅ **字节追加** — 接收端按序列号顺序连续拼接所有segment，一次性交付
+- ✅ **大消息支持** — 任意大小数据均可发送，不受u8::MAX分片数约束
+- ✅ **自动分片** — 超出MSS的数据自动切分，每个分片frg=0
+- ✅ **便捷构造** — `KcpConfig::stream_mode()` 一行启用
 
 ### Stream API（推荐）
-- ✅ **简单易用** - 类似TCP的使用体验
-- ✅ **自动管理** - 自动处理update和socket读写
-- ✅ **标准trait** - 实现Read/Write trait
-- ✅ **开箱即用** - 几行代码即可使用
+- ✅ **简单易用** — 类似TCP的使用体验
+- ✅ **自动管理** — 自动处理update和socket读写
+- ✅ **标准trait** — 实现Read/Write trait
+- ✅ **开箱即用** — 几行代码即可使用
 
 ### 底层API
-- ✅ **完全控制** - 精确控制KCP行为
-- ✅ **零开销** - 无额外抽象层
-- ✅ **易于集成** - 适合集成到现有事件循环
+- ✅ **完全控制** — 精确控制KCP行为
+- ✅ **零开销** — 无额外抽象层
+- ✅ **易于集成** — 适合集成到现有事件循环
 
 ## 🚀 快速开始
 
@@ -56,7 +63,7 @@
 
 ```toml
 [dependencies]
-kcp-ovo = "0.2"
+kcp-ovo = "0.3"
 ```
 
 ### Stream API（推荐）
@@ -128,6 +135,34 @@ fn main() -> kcp_ovo::KcpResult<()> {
 }
 ```
 
+### 流模式使用
+
+```rust
+use kcp_ovo::{Kcp, KcpConfig};
+
+// 启用流模式（一行代码）
+let config = KcpConfig::stream_mode();
+
+// 或通过 struct 字面量
+let config = KcpConfig {
+    stream_mode: true,
+    ..KcpConfig::fast_mode()
+};
+
+let mut kcp = Kcp::new(0x11223344, config)?;
+
+// 流模式下可发送任意大小的数据（不再受255分片限制）
+let large_data = vec![0u8; 1_000_000]; // 1MB
+kcp.send(&large_data)?;
+kcp.flush();
+
+// 接收端一次性读回全部字节，无消息边界
+let bytes = kcp.recv()?;
+assert_eq!(bytes.len(), 1_000_000);
+```
+
+> **注意**：流模式与非流模式**不能互连互通**，两端的 `stream_mode` 必须一致。
+
 ## 📊 性能
 
 ### 性能对比
@@ -143,9 +178,9 @@ fn main() -> kcp_ovo::KcpResult<()> {
 | 场景 | 推荐配置 | 预期延迟 |
 |------|---------|---------|
 | **游戏实时通信** | `fast_mode()` | 20-50ms |
-| **视频直播** | 自定义配置 | 100-200ms |
-| **文件传输** | 高吞吐配置 | 200-500ms |
-| **IoT设备** | 低功耗配置 | 可配置 |
+| **视频直播** | `stream_mode()` | 100-200ms |
+| **文件传输** | `stream_mode()` | 200-500ms |
+| **IoT设备** | 自定义配置 | 可配置 |
 
 ## 🔧 配置选项
 
@@ -160,13 +195,16 @@ let config = KcpConfig::default();
 // 快速模式（最低延迟）
 let config = KcpConfig::fast_mode();
 
+// 流模式（无消息边界，无255分片限制，默认低延迟参数）
+let config = KcpConfig::stream_mode();
+
 // 自定义配置
 let config = KcpConfig {
     mtu: 1400,           // 最大传输单元
     interval: 20,        // 内部更新间隔(ms)
     nodelay: true,       // 无延迟模式
     fastresend: 2,       // 快速重传触发次数
-    stream: false,       // 流式模式
+    stream_mode: true,   // 流模式：所有分片 frg=0，无255分片上限
     nocwnd: true,        // 禁用拥塞控制
     rcv_wnd: 128,        // 接收窗口大小
     ..Default::default()
@@ -175,23 +213,25 @@ let config = KcpConfig {
 
 ### 参数说明
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `mtu` | 1400 | 最大传输单元，影响单个包大小 |
-| `interval` | 100 | 内部更新间隔(ms)，影响响应速度 |
-| `nodelay` | false | 是否启用无延迟模式 |
-| `fastresend` | 0 | 快速重传触发次数 |
-| `nocwnd` | false | 是否禁用拥塞控制 |
-| `rcv_wnd` | 128 | 接收窗口大小(segment数) |
+| 参数 | 默认值 | 类型 | 说明 |
+|------|--------|------|------|
+| `mtu` | 1400 | u32 | 最大传输单元，影响单个包大小 |
+| `interval` | 100 | u64 | 内部更新间隔(ms)，影响响应速度 |
+| `nodelay` | false | bool | 是否启用无延迟模式 |
+| `fastresend` | 0 | i32 | 快速重传触发次数 |
+| `stream_mode` | false | bool | 流模式：所有分片 frg=0，无255分片上限 |
+| `nocwnd` | false | bool | 是否禁用拥塞控制 |
+| `rcv_wnd` | 128 | u16 | 接收窗口大小(segment数) |
+| `snd_wnd` | 32 | u16 | 发送窗口大小(segment数) |
 
 详细配置说明请参考：[性能优化指南](docs/performance.md)
 
 ## 📚 文档
 
-- [入门教程](docs/tutorial.md) - 5分钟快速入门
-- [API指南](docs/api-guide.md) - 完整API参考
-- [性能优化](docs/performance.md) - 性能调优指南
-- [故障排查](docs/troubleshooting.md) - 常见问题解决
+- [入门教程](docs/tutorial.md) — 5分钟快速入门
+- [API指南](docs/api-guide.md) — 完整API参考
+- [性能优化](docs/performance.md) — 性能调优指南
+- [故障排查](docs/troubleshooting.md) — 常见问题解决
 
 生成API文档：
 
@@ -220,46 +260,46 @@ src/
 ├── queue/          # 队列管理模块
 │   ├── segment.rs  # 数据段结构
 │   └── deque.rs    # 双向队列
-├── codec/          # 编解码模块
-│   └── mod.rs     # 大端序编解码工具
+├── helper/         # 编解码与常量模块
+│   ├── mod.rs      # 模块入口
+│   ├── packet.rs   # KcpPacket/KcpPacketHeader 编解码
+│   ├── time.rs     # 时间戳工具
+│   ├── kcp_cmd.rs  # KcpCmd 命令类型
+│   └── kcp_const_config.rs  # KCP协议常量
 ├── config/         # 配置模块
-│   └── params.rs   # KcpConfig配置
+│   └── params.rs   # KcpConfig 配置（含 stream_mode）
 ├── core/           # 核心协议模块
-│   └── kcp.rs      # KCP控制块（主要实现）
-└── stream.rs       # Stream API（可选feature）
+│   └── kcp.rs      # KCP控制块（主要实现，含流模式逻辑）
+└── stream.rs       # Stream API（可选 feature）
 ```
 
 ## 🎯 API选择指南
 
 ### Stream API（推荐大多数应用）
 
-**何时使用**:
-- ✅ 新项目开发
-- ✅ 需要快速上手
-- ✅ 类似TCP的使用体验
-- ✅ 不需要精细控制KCP
-
-**优点**:
-- 简单易用，几行代码即可使用
-- 自动管理KCP状态更新
-- 实现标准IO trait
-- 自动处理socket读写
-
+| 维度 | 说明 |
+|------|------|
+| **何时使用** | 新项目开发、需要快速上手、类似TCP的使用体验 |
+| **优点** | 简单易用，几行代码即可使用；自动管理KCP状态更新；实现标准IO trait；自动处理socket读写 |
 
 ### 底层API（推荐高级用户）
 
-**何时使用**:
-- ✅ 需要精细控制KCP行为
-- ✅ 集成到现有事件循环（如tokio）
-- ✅ 需要零开销抽象
-- ✅ 复杂的网络场景
+| 维度 | 说明 |
+|------|------|
+| **何时使用** | 需要精细控制KCP行为、集成到现有事件循环、需要零开销抽象 |
+| **优点** | 完全控制KCP行为（含 stream_mode）；精确管理update()时机；可以自定义输出逻辑；更灵活，无额外抽象层 |
 
-**优点**:
-- 完全控制KCP行为
-- 精确管理update()时机
-- 可以自定义输出逻辑
-- 更灵活，无额外抽象层
+### 流模式 vs 非流模式
 
+| 维度 | 非流模式 (stream_mode=false) | 流模式 (stream_mode=true) |
+|------|------------------------------|---------------------------|
+| **消息边界** | 有，frg链组装完整消息 | **无**，纯字节流，类似TCP |
+| **分片上限** | 255个分片（约350KB @1400MTU） | **无上限**，任意大小 |
+| **frg字段** | 递减链（最后一个分片frg=0） | **所有分片 frg=0** |
+| **peeksize** | 返回整个消息大小（等所有分片就绪） | **返回第一个segment大小** |
+| **recv** | 读取到frg=0为止 | **读取所有可用segment** |
+| **互连** | 可与非流模式对端通信 | **不能**与非流模式互连 |
+| **适用场景** | 有明确消息边界的应用 | 大文件传输、视频流、字节流应用 |
 
 ## 📦 Feature Flags
 
@@ -271,13 +311,13 @@ src/
 
 ```toml
 # 默认配置（包含Stream API）
-kcp-ovo = "0.2"
+kcp-ovo = "0.3"
 
 # 仅使用底层API
-kcp-ovo = { version = "0.2", default-features = false }
+kcp-ovo = { version = "0.3", default-features = false }
 
 # 显式启用Stream API
-kcp-ovo = { version = "0.2", features = ["stream"] }
+kcp-ovo = { version = "0.3", features = ["stream"] }
 ```
 
 ## 🧪 测试
@@ -292,12 +332,13 @@ cargo test
 cargo test -- --nocapture
 
 # 运行特定测试
-cargo test test_kcp_new
+cargo test test_stream_mode
 ```
 
 测试覆盖：
-- ✅ 24个核心单元测试
-- ✅ 2个Stream API测试
+- ✅ 核心单元测试（Kcp创建、发送、接收、input、flush）
+- ✅ 流模式测试（分片全部为frg=0、无255上限、peeksize/recv语义、多次send内存连续交付）
+- ✅ Stream API测试
 - ✅ 所有测试通过
 
 ## 🔄 开发路线图
@@ -307,7 +348,7 @@ cargo test test_kcp_new
 - [x] Phase 1: 项目初始化和基础结构
 - [x] Phase 2: 核心KCP协议实现
 - [x] Phase 3: 测试基础设施
-  - [x] 单元测试（24个核心测试）
+  - [x] 单元测试（35个测试）
   - [x] 测试依赖配置
 - [x] Phase 4: Stream API实现
   - [x] KcpStream客户端封装
@@ -318,13 +359,19 @@ cargo test test_kcp_new
   - [x] 性能优化指南
   - [x] 故障排查指南
   - [x] 3个示例程序
+- [x] **Phase 6: 流模式（Stream Mode）**
+  - [x] KcpConfig 新增 `stream_mode` 字段
+  - [x] KcpConfig::stream_mode() 便捷构造方法
+  - [x] send() 流模式分支（所有分片 frg=0，无 255 上限）
+  - [x] recv() 流模式分支（一次性读取所有 segment 拼接）
+  - [x] peeksize() 流模式分支（仅返回第一个 segment 大小）
+  - [x] 流模式测试覆盖
 
 ### 计划中 📋
 
-- [ ] Phase 6: 集成测试和边界测试
-- [ ] Phase 7: 性能基准测试
-  - [ ] 性能基准测试
-- [ ] 更多......
+- [ ] Phase 7: 集成测试和边界测试
+- [ ] Phase 8: 性能基准测试
+- [ ] 更多……
 
 ## 📄 许可证
 
@@ -336,12 +383,12 @@ MIT License
 
 ## 🙏 致谢
 
-- [skywind3000/kcp](https://github.com/skywind3000/kcp) - 原版KCP协议实现
-- [mimalloc-rust](https://github.com/purpleprotocol/mimalloc_rust) - Rust内存分配器
-- [dashmap](https://github.com/xacrimon/dashmap) - Blazingly fast concurrent map in Rust.
-- [bytes](https://github.com/tokio-rs/bytes) - 一个用于处理字节的工具库
-- [tokio](https://github.com/tokio-rs/tokio) - tokio一个运行时，用于用 Rust 编程语言编写可靠的、异步且精简的应用程序
-- 全部用到的rust-crates......
+- [skywind3000/kcp](https://github.com/skywind3000/kcp) — 原版KCP协议实现
+- [mimalloc-rust](https://github.com/purpleprotocol/mimalloc_rust) — Rust内存分配器
+- [dashmap](https://github.com/xacrimon/dashmap) — 高效的并发 map
+- [bytes](https://github.com/tokio-rs/bytes) — 字节处理工具库
+- [tokio](https://github.com/tokio-rs/tokio) — 异步运行时
+- 全部用到的 rust crates……
 
 ## 🤝 贡献
 

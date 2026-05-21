@@ -1,0 +1,175 @@
+{
+  "questions": [
+    {
+      "id": 1,
+      "question": "「流模式」在这个项目中的定义是什么？是指 (a) 在原始 KCP 协议层弃用 frg 分片机制，将字节流按序列号连续交付给上层；还是 (b) 只是在 stream.rs 中提供 Stream API 封装但底层仍使用 frg 分片；或者 (c) 在上层将大字节流切分为多个消息发送，每个消息独立 frg 分片？",
+      "options": [
+        "a[推荐] 底层 core/kcp.rs 中增加 stream 模式：当启用时，send() 不再使用 frg 分片/组装，而是每个 segment 都是 frg=0，recv() 按序列号顺序将 segment 数据连续交付，无消息边界",
+        "b) 仅在 stream.rs 中做封装，底层仍使用 frg 分片，只是在上层将大字节流切分为多次 send 调用",
+        "c) 不修改协议层，仅将 stream.rs 的 send/recv 接口修改为字节流输入输出，底层仍使用原有 frg 机制"
+      ]
+    },
+    {
+      "id": 2,
+      "question": "流模式下，用户层的编程模型是什么样的？",
+      "options": [
+        "a[推荐] read(buf) 从字节流中读取尽可能多的已经到达并排序好的数据，write(data) 将数据追加到字节流末尾，类似 TCP stream",
+        "b) send(msg) 发送一条消息，recv() 接收一条完整消息（但消息大小不受 255*MSS 限制）",
+        "c) 支持两种模式：用户可选择 send_msg 发送有边界消息或 send_stream 发送字节流"
+      ]
+    },
+    {
+      "id": 3,
+      "question": "流模式下，Kcp::send() 的分片策略如何设计？",
+      "options": [
+        "a[推荐] 每次 send 的数据也按 MSS 分片，但所有分片的 frg 都设为 0，且分片数不受 255 限制。接收端按 sn 顺序直接连接字节，不再等待 frg 组装完成",
+        "b) 仍使用 frg 分片，但 frg 类型从 u8 改为 u16 或 u32，以支持更多分片",
+        "c) 不分片，一个 send 对应一个 UDP 包，超过 MTU 的数据由 IP 层分片"
+      ]
+    },
+    {
+      "id": 4,
+      "question": "流模式下，Kcp::recv() 的设计策略如何？",
+      "options": [
+        "a[推荐] recv() 返回 rcv_queue 中所有已排序的 segment 的字节串连接，无消息边界；如果 rcv_queue 为空返回错误。用户需要自己管理消息边界",
+        "b) recv() 返回下一个完整的 segment 的字节，不做多个 segment 连接",
+        "c) recv(buf, len) 格式，用户指定读取字节数，返回实际读取的字节数，类似 TCP recv"
+      ]
+    },
+    {
+      "id": 5,
+      "question": "当前 Kcp 的 recv() 返回类型是 KcpResult<Bytes>，流模式下是否需要改变返回类型？",
+      "options": [
+        "a[推荐] 保持 KcpResult<Bytes> 不变，只是返回的 Bytes 是多个 segment 连接后的数据，不再有消息边界",
+        "b) 改为 KcpResult<Option<Bytes>>，用 None 表示暂无数据",
+        "c) 改为 fn recv(&mut self, buf: &mut [u8]) -> KcpResult<usize>，返回实际读取字节数"
+      ]
+    },
+    {
+      "id": 6,
+      "question": "流模式下 peeksize() 的行为如何设计？",
+      "options": [
+        "a[推荐] peeksize() 仍然可用，但返回 rcv_queue 中所有可读字节的总数，而不是某个消息的大小",
+        "b) 流模式下 peeksize() 无意义，直接返回 QueueEmpty 错误",
+        "c) 流模式下 peeksize() 仍返回第一个 segment 的大小"
+      ]
+    },
+    {
+      "id": 7,
+      "question": "如何在 Kcp 结构中引入流模式的开关？是通过配置还是新的方法？",
+      "options": [
+        "a[推荐] 在 KcpConfig 中新增 stream_mode: bool 字段，默认 false。由 Kcp::new() 传入并保存在 Kcp 实例中",
+        "b) 在 Kcp 结构中新增 set_stream_mode(bool) 方法，可动态切换",
+        "c) 新增 KcpStream 类型，独立于原有 Kcp"
+      ]
+    },
+    {
+      "id": 8,
+      "question": "流模式下，在 flush() 中从 snd_queue 移到 snd_buf 时，是否需要一次性将 snd_queue 中所有分片都移入 snd_buf？",
+      "options": [
+        "a[推荐] 按现有逻辑取决于窗口大小 can_send，每次 flush 只移动窗口允许的数量，不因流模式改变",
+        "b) 一次性将 snd_queue 中所有分片都移入 snd_buf，取消窗口限制",
+        "c) 每次 flush 只移动一个分片"
+      ]
+    },
+    {
+      "id": 9,
+      "question": "流模式下，input() 中处理 PUSH 包时，是否仍需按 frg 组装为消息再放入 rcv_queue？",
+      "options": [
+        "a[推荐] 不再等待 frg 组装。每个到达的 segment 单独放入 rcv_buf，只要 sn 连续就移入 rcv_queue。recv 时直接连接所有 segment 的数据",
+        "b) 仍需要等待 frg 组装，但取消 255 分片限制，使用 u32 替代 u8",
+        "c) 不改变 input 处理逻辑，只在 recv 时做字节流合并"
+      ]
+    },
+    {
+      "id": 10,
+      "question": "流模式下 recv() 读取数据时，如果 rcv_queue 中有多个 segment，是否一次性全部读取？",
+      "options": [
+        "a[推荐] 一次性读取 rcv_queue 中所有可读 segment 的数据，返回连接后的 Bytes。这样可以最大程度减少用户层调用次数",
+        "b) 只读取第一个 segment，保持每次 recv 返回一个 MSS 大小的数据",
+        "c) 由用户指定读取字节数，返回实际读取字节数"
+      ]
+    },
+    {
+      "id": 11,
+      "question": "stream.rs 中的 KcpStream::send() 目前调用的是 kcp.send()，流模式下是否直接使用 Kcp 的 stream 模式？",
+      "options": [
+        "a[推荐] KcpStream::send() 直接调用 kcp.send()，由 Kcp 内部的 stream_mode 决定分片策略，KcpStream 无需做特殊处理",
+        "b) KcpStream 中独立处理大字节流切分，调用多次 kcp.send()，不修改底层 Kcp",
+        "c) 新增 KcpStream::send_stream() 方法专门处理字节流，原有 send() 保持不变"
+      ]
+    },
+    {
+      "id": 12,
+      "question": "线程安全：如果用户在线程中同时调用同一个 Kcp 实例的 send()，流模式下是否需要额外的同步保护？",
+      "options": [
+        "a[推荐] 现有设计不支持多线程同时调用 Kcp 方法，这是用户的责任。不需要因为流模式而改变",
+        "b) 在 Kcp 内部加 Mutex 保护 send 入口",
+        "c) 仅在 stream.rs 的 KcpStream 层加同步"
+      ]
+    },
+    {
+      "id": 13,
+      "question": "流模式与非流模式的 Kcp 实例能否互连？即发送端开启流模式，接收端不开启，或反之？",
+      "options": [
+        "a[推荐] 不能互连。流模式改变了对 frg 字段的解释，发送端和接收端必须开启相同模式才能正常通信",
+        "b) 可以互连。发送端开了流模式，接收端仍按 frg 组装成功，反之亦然",
+        "c) 只能单向兼容：发送端流模式、接收端非流模式可以（因为发送端所有分片 frg=0，接收端视为单片消息），反之不行"
+      ]
+    },
+    {
+      "id": 14,
+      "question": "流模式下的单元测试策略如何设计？",
+      "options": [
+        "a[推荐] 新增测试：(1) 发送超过 255*MSS 的大数据并验证接收完整；(2) 多次 send 后连续 recv；(3) 字节流正确性验证；(4) 与非流模式对比测试",
+        "b) 仅测试 send/recv 返回值正确",
+        "c) 仅测试超过 255 分片的场景"
+      ]
+    },
+    {
+      "id": 15,
+      "question": "实现流模式后，是否需要更新 lib.rs 的公共 API 导出？",
+      "options": [
+        "a[推荐] 如果 KcpConfig 新增了字段，则无需额外导出；如果新增了方法，则需确保 Kcp 类型导出了新方法",
+        "b) 需要新增 module 导出",
+        "c) 不需要任何更新"
+      ]
+    },
+    {
+      "id": 16,
+      "question": "实现流模式后，是否需要更新示例代码（examples/ 目录）？",
+      "options": [
+        "a[推荐] 不需要更新现有示例。可选新增一个示例展示流模式的使用",
+        "b) 需要更新所有示例以适应新的 API",
+        "c) 不需要任何更新"
+      ]
+    },
+    {
+      "id": 17,
+      "question": "流模式下，处理对端重启后的场景如何？如果对端重新发起连接，新的序列号可能重复，流模式下会不会导致字节流混乱？",
+      "options": [
+        "a[推荐] 这是 KCP 协议本身的问题，与流模式无关。用户应自行管理 conv 和连接生命周期",
+        "b) 流模式下需要特殊处理这个场景，加入重启检测",
+        "c) 在 stream.rs 层加入序列号检测逻辑"
+      ]
+    },
+    {
+      "id": 18,
+      "question": "流模式下的性能考量：如果 recv() 一次性返回所有累积数据，对内存和复制开销的影响如何？",
+      "options": [
+        "a[推荐] 一次性返回所有数据会导致内存复制，但这是当前 Kcp::recv() 已有的行为，不因流模式而改变",
+        "b) 需要改用引用传递避免复制",
+        "c) 一次只读取一个 segment 以减少内存开销"
+      ]
+    },
+    {
+      "id": 19,
+      "question": "需要修改的文件清单是否包括以下几个？请确认修改范围",
+      "options": [
+        "a[推荐] 只修改 src/core/kcp.rs（send/recv/peeksize 中的流模式逻辑）和 src/config/params.rs（KcpConfig 新增 stream_mode 字段）。不修改 stream.rs、error.rs、packet.rs 等文件",
+        "b) 还需要修改 src/stream.rs 以适配流模式",
+        "c) 还需要修改 src/helper/packet.rs（KcpPacketHeader 的 frg 类型）和 src/queue/segment.rs"
+      ]
+    }
+  ]
+}

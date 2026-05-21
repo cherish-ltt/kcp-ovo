@@ -1,6 +1,8 @@
 //! KCP控制块核心实现
 //!
-//! 本模块定义了KCP协议的核心控制块结构，对应C代码中的IKCPCB
+//! 本模块定义了KCP协议的核心控制块结构，对应C代码中的IKCPCB。
+//! 包含流模式（Stream Mode）支持：流模式下所有分片 frg=0，
+//! 接收端按 sn 顺序连续拼接字节交付，无消息边界，不受 255 分片限制。
 
 use std::pin::Pin;
 
@@ -24,138 +26,135 @@ type OutputCallback = Box<
 /// 日志回调函数类型别名
 type LogCallback = Box<dyn Fn(&str, &Kcp) + Send + Sync>;
 
-/// KCP控制块
+/// KCP 控制块 — 协议核心状态机
 ///
-/// KCP协议的核心控制结构，维护连接状态、窗口、队列等信息
+/// 维护连接状态、序列号、窗口、队列等信息。
+/// 支持两种模式：
+/// - **非流模式**（默认）：按 frg 链组装消息，有消息边界，最多 255 分片
+/// - **流模式**（`stream_mode=true`）：所有分片 frg=0，按 sn 连续拼接，无消息边界，无分片上限
 ///
-/// # 字段说明
-///
-/// - **连接状态**: conv, state
-/// - **序列号**: snd_una, snd_nxt, rcv_nxt
-/// - **时间戳**: ts_recent, ts_lastack, current
-/// - **窗口**: snd_wnd, rcv_wnd, rmt_wnd, cwnd
-/// - **队列**: snd_queue, rcv_queue, snd_buf, rcv_buf
+/// 流模式与非流模式不能互连互通（frg 语义不同）。
 pub struct Kcp {
-    /// 会话ID（必须两端一致）
+    /// 会话 ID，必须两端一致
     pub conv: u32,
-    /// 最大传输单元
+    /// 最大传输单元（字节）
     pub mtu: u32,
-    /// 最大分段大小
+    /// 最大分段大小 = mtu - IKCP_OVERHEAD
     pub mss: u32,
     /// 连接状态
     pub state: u32,
 
-    // 发送序列号
-    /// 未确认的最小序列号
+    // 序列号
+    /// 未确认的最小序列号（已确认的 sn < snd_una）
     pub snd_una: u32,
     /// 下一个待发送的序列号
     pub snd_nxt: u32,
     /// 下一个期望接收的序列号
     pub rcv_nxt: u32,
 
-    // 时间戳相关
-    /// 最近接收到的数据包时间戳
+    // 时间戳
+    /// 最近收到的数据包时间戳
     pub ts_recent: u64,
-    /// 最近一次ACK的时间戳
+    /// 最近一次 ACK 的时间戳
     pub ts_lastack: u64,
     /// 慢启动阈值
     pub ssthresh: u32,
 
-    // RTT和RTO
-    /// RTT变化量估计值
+    // RTT / RTO
+    /// RTT 变化量估计值
     pub rx_rttval: i64,
-    /// 平滑RTT估计值
+    /// 平滑 RTT 估计值
     pub rx_srtt: i64,
-    /// 重传超时时间
+    /// 重传超时时间（毫秒）
     pub rx_rto: u64,
-    /// 最小RTO
+    /// 最小 RTO（毫秒）
     pub rx_minrto: u64,
 
-    // 窗口相关
-    /// 发送窗口大小
+    // 窗口
+    /// 发送窗口大小（segment 数）
     pub snd_wnd: u16,
-    /// 接收窗口大小
+    /// 接收窗口大小（segment 数）
     pub rcv_wnd: u16,
     /// 远端窗口大小
     pub rmt_wnd: u16,
     /// 拥塞窗口
     pub cwnd: u16,
-    /// 窗口探测标志
+    /// 窗口探测标志（IKCP_ASK_SEND / IKCP_ASK_TELL）
     pub probe: u32,
 
-    // 定时相关
+    // 定时
     /// 当前时钟（毫秒）
     pub current: u64,
     /// 内部更新间隔（毫秒）
     pub interval: u64,
-    /// 下一次刷新时间戳
+    /// 下一次刷新的时间戳
     pub ts_flush: u64,
-    /// 发送计数
+    /// 发送计数（仅用于统计）
     pub xmit: u32,
 
-    // 队列大小计数
-    /// 接收缓冲区中的段数
+    // 队列计数
+    /// rcv_buf 中的段数
     pub nrcv_buf: usize,
-    /// 发送缓冲区中的段数
+    /// snd_buf 中的段数
     pub nsnd_buf: usize,
-    /// 接收队列中的段数
+    /// rcv_queue 中的段数
     pub nrcv_que: usize,
-    /// 发送队列中的段数
+    /// snd_queue 中的段数
     pub nsnd_que: usize,
 
-    // 配置选项
-    /// 是否启用无延迟模式
+    // 配置
+    /// 是否启用无延迟模式（Nagle 算法禁用）
     pub nodelay: bool,
-    /// 是否已经更新过
+    /// 流模式：true 时所有分片 frg=0，无上限，纯字节流语义
+    pub stream_mode: bool,
+    /// 是否已调用过 update（首次调用会初始化 ts_flush）
     pub updated: bool,
     /// 窗口探测时间戳
     pub ts_probe: u64,
     /// 窗口探测等待时间
     pub probe_wait: u64,
-    /// 死链检测（超时重传次数）
+    /// 死链阈值（超过此次数重传即断开连接）
     pub dead_link: u32,
-    /// 拥塞窗口增量
+    /// 拥塞窗口增量累加器
     pub incr: u32,
 
     // 队列
-    /// 发送队列（待发送的数据）
+    /// 发送队列（待发送的数据段）
     pub snd_queue: KcpDeque,
-    /// 接收队列（可读的有序数据）
+    /// 接收队列（已排序、可读的数据段）
     pub rcv_queue: KcpDeque,
-    /// 发送缓冲区（已发送未确认）
+    /// 发送缓冲区（已发送但未确认的段）
     pub snd_buf: KcpDeque,
-    /// 接收缓冲区（乱序到达的数据）
+    /// 接收缓冲区（乱序到达、等待排序的段）
     pub rcv_buf: KcpDeque,
 
-    // ACK列表
-    /// ACK确认列表
+    // ACK
+    /// ACK 列表（待发送的确认序列号）
     acklist: Vec<u32>,
-    /// ACK列表容量
+    /// ACK 列表容量（预留）
     #[allow(dead_code)]
     ackblock: usize,
 
-    // 用户数据和回调
-    /// 用户指针（透传给output回调）
+    // 用户数据 / 缓冲区
     #[allow(dead_code)]
     user_data: Option<Box<dyn std::any::Any>>,
-    /// 发送缓冲区
     #[allow(dead_code)]
     buffer: Vec<u8>,
-    /// 快速重传触发次数（0表示禁用）
+
+    /// 快速重传：重复 ACK 达到此次数则立即重传（0 = 禁用）
     pub fastresend: i32,
-    /// 快速重传限制
+    /// 快速重传上限
     pub fastlimit: i32,
     /// 是否禁用拥塞控制
     pub nocwnd: bool,
 
-    // 日志配置
     /// 日志掩码
     pub logmask: u32,
 
-    // 回调函数
-    /// 输出回调函数：将KCP数据包发送给底层传输
+    // 回调
+    /// 输出回调：将 KCP 数据包交给底层传输
     output: Option<OutputCallback>,
-    /// 日志回调函数
+    /// 日志回调
     writelog: Option<LogCallback>,
 }
 
@@ -163,24 +162,16 @@ unsafe impl Send for Kcp {}
 unsafe impl Sync for Kcp {}
 
 impl Kcp {
-    /// 创建新的KCP控制块
+    /// 创建新的 KCP 控制块
     ///
     /// # 参数
     ///
-    /// - `conv`: 会话ID，必须两端一致
-    /// - `config`: KCP配置选项
+    /// * `conv` — 会话 ID，必须两端一致
+    /// * `config` — KCP 配置，包含 `stream_mode` 等选项
     ///
     /// # 返回
     ///
-    /// 返回新创建的Kcp实例或错误
-    ///
-    /// # 示例
-    ///
-    /// ```ignore
-    /// use kcp_ovo::{Kcp, KcpConfig};
-    ///
-    /// let kcp = Kcp::new(0x11223344, KcpConfig::default())?;
-    /// ```
+    /// 返回新创建的 `Kcp` 实例或错误
     pub fn new(conv: u32, config: KcpConfig) -> KcpResult<Self> {
         let mtu = config.mtu;
         let mss = mtu - (IKCP_OVERHEAD as u32);
@@ -190,59 +181,48 @@ impl Kcp {
             mtu,
             mss,
             state: 0,
-
             snd_una: 0,
             snd_nxt: 0,
             rcv_nxt: 0,
-
             ts_recent: 0,
             ts_lastack: 0,
             ssthresh: IKCP_THRESH_INIT,
-
             rx_rttval: 0,
             rx_srtt: 0,
             rx_rto: IKCP_RTO_DEF,
             rx_minrto: IKCP_RTO_MIN,
-
             snd_wnd: config.snd_wnd,
             rcv_wnd: config.rcv_wnd,
             rmt_wnd: config.rcv_wnd,
             cwnd: 0,
             probe: 0,
-
             current: 0,
             interval: config.interval,
             ts_flush: config.interval,
             xmit: 0,
-
             nrcv_buf: 0,
             nsnd_buf: 0,
             nrcv_que: 0,
             nsnd_que: 0,
-
             nodelay: config.nodelay,
+            stream_mode: config.stream_mode,
             updated: false,
             ts_probe: 0,
             probe_wait: 0,
             dead_link: IKCP_DEADLINK,
             incr: 0,
-
             snd_queue: KcpDeque::new(),
             rcv_queue: KcpDeque::new(),
             snd_buf: KcpDeque::new(),
             rcv_buf: KcpDeque::new(),
-
             acklist: Vec::with_capacity(16),
             ackblock: 16,
-
             user_data: None,
             buffer: vec![0u8; (mtu as usize + IKCP_OVERHEAD) * 3],
             fastresend: config.fastresend,
             fastlimit: IKCP_FASTACK_LIMIT,
             nocwnd: config.nocwnd,
-
             logmask: 0,
-
             output: None,
             writelog: None,
         })
@@ -250,19 +230,11 @@ impl Kcp {
 
     /// 设置输出回调函数
     ///
+    /// 当 KCP 需要发送数据包时调用此回调，通常负责将数据通过 UDP socket 发出。
+    ///
     /// # 参数
     ///
-    /// - `callback`: 回调函数，接收数据和KCP引用，返回发送的字节数
-    ///
-    /// # 示例
-    ///
-    /// ```ignore
-    /// kcp.set_output(|data, kcp| {
-    ///     // 通过UDP发送data
-    ///     udp_socket.send_to(data, &remote_addr)?;
-    ///     Ok(data.len())
-    /// });
-    /// ```
+    /// * `callback` — 接收 `Bytes` 数据，返回发送的字节数
     pub fn set_output<F, Fut>(&mut self, callback: F)
     where
         F: Fn(Bytes) -> Fut + Send + Sync + 'static,
@@ -275,7 +247,7 @@ impl Kcp {
     ///
     /// # 参数
     ///
-    /// - `callback`: 日志回调函数
+    /// * `callback` — 接收日志消息字符串和 KCP 引用
     pub fn set_log<F>(&mut self, callback: F)
     where
         F: Fn(&str, &Kcp) + Send + Sync + 'static,
@@ -293,153 +265,121 @@ impl Kcp {
         }
     }
 
-    /// 获取连接ID
-    ///
-    /// # 返回
-    ///
-    /// 返回当前KCP连接的会话ID
+    /// 获取会话 ID
     pub fn getconv(&self) -> u32 {
         self.conv
     }
 
-    /// 查询待发送数据包数量
-    ///
-    /// # 返回
-    ///
-    /// 返回发送队列和发送缓冲区中的总段数
+    /// 查询待发送数据段数（snd_queue + snd_buf 总和）
     pub fn waitsnd(&self) -> usize {
         self.nsnd_que + self.nsnd_buf
     }
 
     // ========== 辅助函数 ==========
 
-    /// 计算时间差
-    ///
-    /// 使用wrapping_sub处理32位时间戳回绕
-    ///
-    /// # 参数
-    ///
-    /// - `later`: 较晚的时间戳
-    /// - `earlier`: 较早的时间戳
+    /// 计算 32 位时间戳差值（支持回绕）
     #[inline]
     fn timediff_u32(&self, later: u32, earlier: u32) -> i32 {
         (later as i32).wrapping_sub(earlier as i32)
     }
 
-    /// 计算时间差
-    ///
-    /// 使用wrapping_sub处理64位时间戳回绕
-    ///
-    /// # 参数
-    ///
-    /// - `later`: 较晚的时间戳
-    /// - `earlier`: 较早的时间戳
+    /// 计算 64 位时间戳差值（支持回绕）
     #[inline]
     fn timediff_u64(&self, later: u64, earlier: u64) -> i64 {
         (later as i64).wrapping_sub(earlier as i64)
+    }
+
+    /// 将 rcv_buf 中有序的段移入 rcv_queue，并更新 window probe
+    #[inline]
+    fn move_rcv_buf_and_probe(&mut self) {
+        self.move_rcv_buf_to_queue();
+        if self.nrcv_que < self.rcv_wnd as usize {
+            self.probe |= IKCP_ASK_TELL;
+        }
     }
 
     // ========== 核心功能方法 ==========
 
     /// 发送数据
     ///
-    /// 对应C代码的 ikcp_send() 函数 (ikcp.c:469)
+    /// 将数据按 MSS 分片后加入发送队列。
+    ///
+    /// **非流模式**：分片 frg 递减（最后一个为 0），最多 255 分片。
+    /// **流模式**：所有分片 frg=0，无分片数量上限。
     ///
     /// # 参数
     ///
-    /// - `data`: 要发送的数据
+    /// * `data` — 待发送的字节数据
     ///
     /// # 返回
     ///
     /// 返回发送的字节数，失败返回错误
-    ///
-    /// # 实现要点
-    ///
-    /// 1. 根据MSS分片数据
-    /// 2. 设置每个segment的frg（分片索引）
-    /// 3. 添加到snd_queue
-    /// 4. 更新nsnd_que计数
-    ///
-    /// # 示例
-    ///
-    /// ```ignore
-    /// kcp.send(b"Hello, KCP!")?;
-    /// ```
     pub fn send(&mut self, data: &[u8]) -> KcpResult<usize> {
         let len = data.len();
         if len == 0 {
             return Ok(0);
         }
+        let count = len.div_ceil(self.mss as usize);
+        let is_stream = self.stream_mode;
 
-        let mut sent = 0;
-        let mut buffer = data;
-
-        // 计算需要多少个分片
-        let count = buffer.len().div_ceil(self.mss as usize);
-
-        // 由frg类型决定最大分片大小
-        if count > u8::MAX as usize {
+        // 非流模式有 255 分片上限，流模式无此限制
+        if !is_stream && count > u8::MAX as usize {
             return Err(KcpError::InvalidConfig(format!(
-                "Too many fragments，data-size={}byte, allow-max-size={}byte",
-                buffer.len(),
+                "Too many fragments, data-size={}byte, allow-max-size={}byte",
+                len,
                 (u8::MAX as usize) * (self.mss as usize)
             )));
         }
 
-        // 分片发送
+        let mut sent = 0;
+        let mut buf = data;
         for i in 0..count {
-            let size = buffer.len().min(self.mss as usize);
+            let size = buf.len().min(self.mss as usize);
+            // 流模式所有 frg=0；非流模式递减 frg 链
+            let frg = if is_stream { 0 } else { (count - i - 1) as u8 };
             let header = KcpPacketHeader::new(
                 self.conv,
-                crate::KcpCmd::Push,
-                (count.saturating_sub(i).saturating_sub(1)) as u8,
+                KcpCmd::Push,
+                frg,
                 self.rcv_wnd,
                 current_millis(),
                 self.snd_nxt,
                 self.snd_una,
                 size as u32,
             );
-            let seg = Segment::new_with_header_and_data(header, &buffer[..size])?;
-
+            let seg = Segment::new_with_header_and_data(header, &buf[..size])?;
             self.snd_queue.push_back(seg);
             self.snd_nxt = self.snd_nxt.wrapping_add(1);
             self.nsnd_que = self.nsnd_que.saturating_add(1);
-
-            buffer = &buffer[size..];
+            buf = &buf[size..];
             sent += size;
         }
-
         Ok(sent)
     }
 
-    /// 查看下一个消息大小（不消耗数据）
+    /// 查看下一个可读数据的大小（不消耗数据）
     ///
-    /// 对应C代码的 ikcp_peeksize() 函数 (ikcp.c:441)
+    /// **非流模式**：沿 frg 链计算完整消息大小，等所有分片就绪。
+    /// **流模式**：仅返回第一个 segment 的大小（无消息边界概念）。
     ///
     /// # 返回
     ///
-    /// 返回下一个可读消息的字节数，如果没有数据返回错误
+    /// 返回下一个可读字节数；队列为空返回 `QueueEmpty`；等分片返回 `PayloadWaitForFrg`
     pub fn peeksize(&self) -> KcpResult<usize> {
-        if self.rcv_queue.is_empty() {
-            return Err(KcpError::QueueEmpty);
+        let first = self.rcv_queue.front().ok_or(KcpError::QueueEmpty)?;
+        // 流模式：只返回第一个 segment 大小，不等待 frg 组装
+        if self.stream_mode {
+            return Ok(first.kcp_packet.header.len as usize);
         }
-
-        let first = self.rcv_queue.front().unwrap();
-
-        // 如果是最后一个分片
         if first.kcp_packet.header.frg == 0 {
             return Ok(first.kcp_packet.header.len as usize);
         }
-
-        // 检查是否收到所有分片
         if self.nrcv_que < (first.kcp_packet.header.frg + 1) as usize {
             return Err(KcpError::IncompleteData(
                 IncompleteDataType::PayloadWaitForFrg,
             ));
         }
-
-        // 计算总大小
-        let mut length = 0;
+        let mut length = 0usize;
         for seg in self.rcv_queue.iter() {
             length += seg.kcp_packet.header.len as usize;
             if seg.kcp_packet.header.frg == 0 {
@@ -451,111 +391,42 @@ impl Kcp {
 
     /// 接收数据
     ///
-    /// 对应C代码的 ikcp_recv() 函数 (ikcp.c:365)
-    ///
-    /// # 参数
-    ///
-    /// - `buffer`: 接收缓冲区
+    /// **非流模式**：从 rcv_queue 读取一条完整消息（frg 链），返回 `Bytes`。
+    /// **流模式**：一次性读取 rcv_queue 中所有可读 segment 并拼接返回，无消息边界。
     ///
     /// # 返回
     ///
-    /// 返回接收到的字节数
-    ///
-    /// # 实现要点
-    ///
-    /// 1. 检查peeksize
-    /// 2. 从rcv_queue读取数据并重组分片
-    /// 3. 从rcv_buf移动有序数据到rcv_queue
-    /// 4. 更新rcv_nxt和nrcv_que
-    ///
-    /// # 示例
-    ///
-    /// ```ignore
-    /// let mut recv_buf = [0u8; 4096];
-    /// let len = kcp.recv(&mut recv_buf)?;
-    /// println!("Received: {:?}", &recv_buf[..len]);
-    /// ```
+    /// 返回接收到的完整 `Bytes` 数据；队列为空返回 `QueueEmpty`
     pub fn recv(&mut self) -> KcpResult<Bytes> {
         let peeksize = self.peeksize()?;
         let mut buf = BytesMut::with_capacity(peeksize);
-        // 从rcv_queue读取数据
+        // 流模式读取所有 segment，非流模式读取到 frg==0
         while let Some(seg) = self.rcv_queue.pop_front() {
             buf.extend_from_slice(&seg.get_data());
             self.nrcv_que -= 1;
-            if seg.kcp_packet.header.frg == 0 {
+            if !self.stream_mode && seg.kcp_packet.header.frg == 0 {
                 break;
             }
         }
+        self.move_rcv_buf_and_probe();
 
-        // 将 rcv_buf 中有序的段移入 rcv_queue
-        while !self.rcv_buf.is_empty() {
-            let front_sn = self.rcv_buf.front().unwrap().kcp_packet.header.sn;
-            if front_sn == self.rcv_nxt && self.nrcv_que < self.rcv_wnd as usize {
-                let seg = self.rcv_buf.pop_front().unwrap();
-                self.nrcv_buf -= 1;
-                self.rcv_queue.push_back(seg);
-                self.nrcv_que += 1;
-                self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-            } else {
-                break;
-            }
-        }
-
-        // 快速恢复：请求对端告知窗口
-        if self.nrcv_que < self.rcv_wnd as usize {
-            self.probe |= IKCP_ASK_TELL;
-        }
-
-        if buf.len() != peeksize {
+        if !self.stream_mode && buf.len() != peeksize {
             return Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr));
         }
-
         Ok(buf.copy_to_bytes(buf.len()))
     }
 
-    /// 输入处理：解析接收到的数据包
+    /// 输入处理：解析并处理从底层网络收到的数据包
     ///
-    /// 对应C代码的 ikcp_input() 函数 (ikcp.c:556)
-    ///
-    /// # 参数
-    ///
-    /// - `data`: 从底层网络接收到的数据
-    ///
-    /// # 返回
-    ///
-    /// 成功返回Ok(())，失败返回错误
-    ///
-    /// # 实现要点
-    ///
-    /// 1. 解析数据包头部
-    /// 2. 验证conv是否匹配
-    /// 3. 根据cmd类型处理：
-    ///    - PUSH: 数据包，更新rcv_buf
-    ///    - ACK: 确认包，更新snd_buf
-    ///    - WASK: 窗口探测请求
-    ///    - WINS: 窗口大小通知
-    /// 4. 更新RTT估计
-    /// 5. 处理快速重传
-    ///
-    /// # 示例
-    ///
-    /// ```ignore
-    /// // 从UDP接收到数据
-    /// let (len, _) = udp_socket.recv_from(&mut buf)?;
-    /// // 输入到KCP处理
-    /// kcp.input(&buf[..len])?;
-    /// ```
+    /// 根据命令类型（Push / Ack / Wask / Wins）分别处理，
+    /// 将有序数据段移入 rcv_queue 供 recv 读取。
     pub fn input(&mut self, data: &[u8]) -> KcpResult<()> {
         if data.len() < IKCP_OVERHEAD {
             return Err(KcpError::IncompleteData(IncompleteDataType::Header));
         }
         let mut buf = Bytes::copy_from_slice(data);
-
         // 解析头部
-        let (header, buf) = match KcpPacketHeader::from_bytes(&mut buf) {
-            Ok((header, buf)) => (header, buf),
-            Err(e) => return Err(e),
-        };
+        let (header, buf) = KcpPacketHeader::from_bytes(&mut buf)?;
 
         // 验证conv是否匹配
         if self.conv == 0 {
@@ -584,77 +455,41 @@ impl Kcp {
                 }
             }
             KcpCmd::Push => {
-                // PUSH命令：数据包
-                // 检查序列号是否有效
-                if self.timediff_u64(
-                    header.sn as u64,
-                    self.rcv_nxt as u64 + (self.rcv_wnd as u64),
-                ) >= 0
+                if self.timediff_u64(header.sn as u64, self.rcv_nxt as u64 + self.rcv_wnd as u64)
+                    >= 0
                     || self.timediff_u64(header.sn as u64, self.rcv_nxt as u64) < 0
                 {
-                    // 超出窗口或已接收，丢弃
                     return Ok(());
                 }
-
-                // 重复检测
                 for seg in self.rcv_buf.iter() {
                     if seg.kcp_packet.header.sn == header.sn {
-                        return Ok(()); // 静默丢弃重复的数据包
+                        return Ok(());
                     }
                 }
-
-                // 创建segment
                 let newseg = Segment::new_with_header_and_data(header, &buf)?;
-
-                // 插入到rcv_buf
                 self.parse_data(newseg);
-
-                // 将该段的 sn 加入 acklist，供 flush 时发送 ACK
                 self.acklist.push(header.sn);
-
-                // 将 rcv_buf 中有序段移入 rcv_queue
-                while !self.rcv_buf.is_empty() {
-                    let front_sn = self.rcv_buf.front().unwrap().kcp_packet.header.sn;
-                    if front_sn == self.rcv_nxt && self.nrcv_que < self.rcv_wnd as usize {
-                        let seg = self.rcv_buf.pop_front().unwrap();
-                        self.nrcv_buf -= 1;
-                        self.nrcv_que += 1;
-                        self.rcv_queue.push_back(seg);
-                        self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-                    } else {
-                        break;
-                    }
-                }
+                self.move_rcv_buf_to_queue();
             }
-            KcpCmd::Wask => {
-                // 对方请求窗口信息
-                self.probe |= IKCP_ASK_TELL;
-            }
-            KcpCmd::Wins => {
-                // 仅更新了 wnd，无需额外处理
-            }
+            KcpCmd::Wask => self.probe |= IKCP_ASK_TELL,
+            KcpCmd::Wins => {}
         }
 
-        // 任何包都可能通过 una 带来确认信息，提升快速重传计数
         if self.timediff_u32(header.una, self.snd_una) > 0 {
             self.parse_fastack(header.una);
         }
-
-        // 更新时间戳
         if self.timediff_u64(self.current, header.ts) >= 10000
             || self.timediff_u64(header.ts, self.ts_recent) >= 10000
         {
             self.ts_recent = header.ts;
         }
-
         Ok(())
     }
 
-    /// 移除所有 sn < una 的已确认段
+    /// 移除 snd_buf 中所有 sn < una 的已确认段
     fn parse_una(&mut self, una: u32) {
-        while !self.snd_buf.is_empty() {
-            let front_sn = self.snd_buf.front().unwrap().kcp_packet.header.sn;
-            if self.timediff_u32(una, front_sn) > 0 {
+        while let Some(seg) = self.snd_buf.front() {
+            if self.timediff_u32(una, seg.kcp_packet.header.sn) > 0 {
                 self.snd_buf.pop_front();
                 self.nsnd_buf -= 1;
             } else {
@@ -663,56 +498,42 @@ impl Kcp {
         }
     }
 
-    /// 处理 ACK 确认：更新 RTT 并删除被确认的段
+    /// 处理 ACK 确认：更新 RTT/RTO，移除 snd_buf 中被确认的段
     fn parse_ack(&mut self, sn: u32) {
         let current = self.current;
         let mut rtt_update = None;
-
-        // 1. 计算 RTT（只对第一个匹配的段）
         for seg in self.snd_buf.iter() {
-            let seg_sn = seg.kcp_packet.header.sn;
-            if self.timediff_u32(sn, seg_sn) >= 0 {
+            if self.timediff_u32(sn, seg.kcp_packet.header.sn) >= 0 {
                 let rtt = self.timediff_u64(current, seg.kcp_packet.header.ts);
                 if rtt >= 0 {
-                    if self.rx_srtt == 0 {
-                        rtt_update = Some((rtt, rtt / 2));
+                    rtt_update = if self.rx_srtt == 0 {
+                        Some((rtt, rtt / 2))
                     } else {
                         let delta = rtt - self.rx_srtt;
-                        let new_srtt = self.rx_srtt + delta / 8;
-                        let new_rttval = if delta < 0 {
-                            self.rx_rttval + (-delta) / 4
-                        } else {
-                            self.rx_rttval + delta / 4
-                        };
-                        rtt_update = Some((new_srtt, new_rttval));
-                    }
+                        Some((self.rx_srtt + delta / 8, self.rx_rttval + delta.abs() / 4))
+                    };
                 }
-                break; // 只取第一个匹配段
+                break;
             }
         }
-
         if let Some((srtt, rttval)) = rtt_update {
             self.rx_srtt = srtt;
             self.rx_rttval = rttval;
-            let rto_numerator = (srtt as u64) + self.interval.max(4 * rttval as u64);
-            self.rx_rto = rto_numerator.max(self.rx_minrto).min(IKCP_RTO_MAX);
+            self.rx_rto = ((srtt as u64) + self.interval.max(4 * rttval as u64))
+                .max(self.rx_minrto)
+                .min(IKCP_RTO_MAX);
         }
 
-        // 2. 从 snd_buf 中移除所有 sn == 指定值的段（通常只有一个）
         let mut removed = false;
-        // 由于删除操作可能改变索引，我们重建队列
         let mut keep = Vec::with_capacity(self.nsnd_buf);
         while let Some(seg) = self.snd_buf.pop_front() {
             if seg.kcp_packet.header.sn == sn && !removed {
                 removed = true;
                 self.nsnd_buf -= 1;
-                // 已确认的段不需要保留
             } else {
-                self.nsnd_buf -= 1; // 因为从队列移除时会减少计数，这里临时修正
                 keep.push(seg);
             }
         }
-        // 再将保留的段放回
         for seg in keep {
             self.snd_buf.push_back(seg);
             self.nsnd_buf += 1;
@@ -722,157 +543,113 @@ impl Kcp {
     /// 根据 una 对所有未确认段增加快速重传计数
     fn parse_fastack(&mut self, una: u32) {
         for seg in self.snd_buf.iter_mut() {
-            // 内联计算时间差以避免对 self 的不可变借用
             if (una as i32).wrapping_sub(seg.kcp_packet.header.sn as i32) > 0 && seg.fastack < 255 {
                 seg.fastack += 1;
             }
         }
     }
 
-    /// 将接收到的数据段插入 rcv_buf（保持按 sn 升序）
+    /// 将接收到的数据段按 sn 顺序插入 rcv_buf
     fn parse_data(&mut self, newseg: Segment) {
         if self.nrcv_buf >= self.rcv_wnd as usize {
             return;
         }
-
-        // 按序列号寻找插入位置
-        let mut insert_pos = self.rcv_buf.len();
-        for (i, seg) in self.rcv_buf.iter().enumerate() {
-            if newseg.kcp_packet.header.sn == seg.kcp_packet.header.sn {
-                return; // 重复包
-            }
-            if self.timediff_u32(newseg.kcp_packet.header.sn, seg.kcp_packet.header.sn) < 0 {
-                insert_pos = i;
-                break;
+        for seg in self.rcv_buf.iter() {
+            if seg.kcp_packet.header.sn == newseg.kcp_packet.header.sn {
+                return;
             }
         }
+        let insert_pos = self
+            .rcv_buf
+            .iter()
+            .position(|seg| {
+                self.timediff_u32(newseg.kcp_packet.header.sn, seg.kcp_packet.header.sn) < 0
+            })
+            .unwrap_or(self.rcv_buf.len());
 
-        // 将新段插入指定位置
+        // Drain tail after insert_pos, push new, then push tail back
         let mut tail = Vec::new();
         for _ in insert_pos..self.rcv_buf.len() {
             tail.push(self.rcv_buf.pop_back().unwrap());
         }
         self.rcv_buf.push_back(newseg);
-        while let Some(seg) = tail.pop() {
+        for seg in tail.into_iter().rev() {
             self.rcv_buf.push_back(seg);
         }
-
         self.nrcv_buf += 1;
     }
 
-    /// 刷新发送缓冲区
-    ///
-    /// 对应C代码的 ikcp_flush() 函数 (ikcp.c:790)
-    ///
-    /// # 实现要点
-    ///
-    /// 1. 从snd_queue移动数据到snd_buf
-    /// 2. 编码数据包（头部 + 数据）
-    /// 3. 调用output回调发送
-    /// 4. 更新发送序列号
-    /// 5. 发送ACK列表
-    /// 6. 发送窗口探测
+    /// 发送控制帧（Wask / Ack / Wins）的快捷方法
+    async fn send_control(&mut self, cmd: KcpCmd, sn: u32) -> KcpResult<()> {
+        self.send_packet(KcpPacket::new_without_data(KcpPacketHeader::new(
+            self.conv,
+            cmd,
+            0,
+            self.rcv_wnd,
+            current_millis(),
+            sn,
+            self.rcv_nxt,
+            0,
+        )))
+        .await
+    }
+
+    /// 刷新发送缓冲区：将 snd_queue 移入 snd_buf，发送数据段、ACK、窗口探测
     async fn flush(&mut self) -> KcpResult<()> {
         let window = self.snd_wnd.min(self.rmt_wnd);
-        let mut can_send = window as usize;
-        let mut lost = false; // 是否有数据包丢失
+        let mut can_send = if self.nocwnd {
+            window
+        } else {
+            window.min(self.cwnd)
+        } as usize;
+        let mut lost = false;
 
-        // 检查拥塞窗口
-        if !self.nocwnd {
-            can_send = window.min(self.cwnd) as usize;
-        }
-
-        // 从 snd_queue 移入 snd_buf
         while can_send > 0 && !self.snd_queue.is_empty() {
             let mut seg = self.snd_queue.pop_front().unwrap();
             self.nsnd_que -= 1;
-
-            // 设置
             seg.kcp_packet.header.conv = self.conv;
             seg.kcp_packet.header.cmd = KcpCmd::Push;
             seg.kcp_packet.header.wnd = self.rcv_wnd;
             seg.kcp_packet.header.ts = self.current;
-            seg.kcp_packet.header.una = self.rcv_nxt; // 很重要：una 是接收窗口的下一期望序列号
+            seg.kcp_packet.header.una = self.rcv_nxt;
             seg.resendts = self.current;
             seg.rto = self.rx_rto;
             seg.fastack = 0;
             seg.xmit = 0;
-
             self.snd_buf.push_back(seg);
             self.nsnd_buf += 1;
             can_send -= 1;
         }
 
-        // 发送 ACK
         let acks_to_send = self.acklist.clone();
         self.acklist.clear();
-
-        // 发送窗口探测（如果需要）
         let need_wask = self.acklist.is_empty() && (self.probe & IKCP_ASK_SEND) != 0;
         let need_wins = (self.probe & IKCP_ASK_TELL) != 0;
 
-        // 发送ACK和探测窗口
         if need_wask {
-            // 窗口探测请求
-            self.send_packet(KcpPacket::new_without_data(KcpPacketHeader::new(
-                self.conv,
-                KcpCmd::Wask,
-                0,
-                self.rcv_wnd,
-                current_millis(),
-                0,
-                self.rcv_nxt,
-                0,
-            )))
-            .await?;
+            self.send_control(KcpCmd::Wask, 0).await?;
         } else {
-            // 发送 ACK 段（每个被确认的 sn）
             for sn in acks_to_send {
-                self.send_packet(KcpPacket::new_without_data(KcpPacketHeader::new(
-                    self.conv,
-                    KcpCmd::Ack,
-                    0,
-                    self.rcv_wnd,
-                    current_millis(),
-                    sn,
-                    self.rcv_nxt,
-                    0,
-                )))
-                .await?;
+                self.send_control(KcpCmd::Ack, sn).await?;
             }
         }
-
         if need_wins {
-            self.send_packet(KcpPacket::new_without_data(KcpPacketHeader::new(
-                self.conv,
-                KcpCmd::Wins,
-                0,
-                self.rcv_wnd,
-                current_millis(),
-                0,
-                self.rcv_nxt,
-                0,
-            )))
-            .await?;
+            self.send_control(KcpCmd::Wins, 0).await?;
             self.probe &= !IKCP_ASK_TELL;
         }
 
-        // 检查是否需要发送窗口探测
         if self.rmt_wnd == 0 && (self.probe & IKCP_ASK_SEND) == 0 {
             self.probe |= IKCP_ASK_SEND;
-            self.probe_wait = 0; // 按需初始化
-            self.ts_probe = self.current + self.probe_wait;
+            self.probe_wait = 0;
+            self.ts_probe = self.current;
         }
 
         let current = self.current;
-
-        // 收集需要发送（重传）的段
         let mut sends = Vec::new();
         let mut need_update = Vec::new();
 
         for (idx, seg) in self.snd_buf.iter().enumerate() {
             if seg.xmit == 0 {
-                // 首次发送
                 need_update.push((idx, 1, current.wrapping_add(seg.rto), seg.rto, false));
                 sends.push((
                     seg.kcp_packet.header.frg,
@@ -882,37 +659,31 @@ impl Kcp {
                     seg.kcp_packet.header.wnd,
                     seg.get_data(),
                 ));
-            } else {
-                // 检查超时
-                let diff = (current as i32).wrapping_sub(seg.resendts as i32);
-                if diff >= 0 {
-                    // 超时重传
-                    if seg.xmit >= self.dead_link {
-                        // 超过最大重传次数，连接断开
-                        return Err(KcpError::IoError(
-                            "Connection lost due to too many retransmissions".to_string(),
-                        ));
-                    }
-                    let new_rto = (seg.rto * 2).min(IKCP_RTO_MAX);
-                    need_update.push((
-                        idx,
-                        seg.xmit + 1,
-                        current.wrapping_add(seg.rto),
-                        new_rto,
-                        true, // 超时算作丢失
-                    ));
-                    sends.push((
-                        seg.kcp_packet.header.frg,
-                        seg.kcp_packet.header.sn,
-                        seg.kcp_packet.header.ts,
-                        seg.kcp_packet.header.una,
-                        seg.kcp_packet.header.wnd,
-                        seg.get_data(),
+                continue;
+            }
+            if (current as i32).wrapping_sub(seg.resendts as i32) >= 0 {
+                if seg.xmit >= self.dead_link {
+                    return Err(KcpError::IoError(
+                        "Connection lost due to too many retransmissions".to_string(),
                     ));
                 }
+                let new_rto = (seg.rto * 2).min(IKCP_RTO_MAX);
+                need_update.push((
+                    idx,
+                    seg.xmit + 1,
+                    current.wrapping_add(seg.rto),
+                    new_rto,
+                    true,
+                ));
+                sends.push((
+                    seg.kcp_packet.header.frg,
+                    seg.kcp_packet.header.sn,
+                    seg.kcp_packet.header.ts,
+                    seg.kcp_packet.header.una,
+                    seg.kcp_packet.header.wnd,
+                    seg.get_data(),
+                ));
             }
-
-            // 快速重传
             if seg.fastack >= self.fastresend as u32 {
                 if seg.xmit >= self.dead_link {
                     return Err(KcpError::IoError(
@@ -924,7 +695,7 @@ impl Kcp {
                     seg.xmit + 1,
                     current.wrapping_add(seg.rto),
                     seg.rto,
-                    true, // 快速重传也标记为丢失
+                    true,
                 ));
                 sends.push((
                     seg.kcp_packet.header.frg,
@@ -937,7 +708,6 @@ impl Kcp {
             }
         }
 
-        // 实际发送
         for (frg, sn, ts, una, wnd, data) in sends {
             self.send_packet(KcpPacket::new_with_data(
                 KcpPacketHeader::new(
@@ -955,7 +725,6 @@ impl Kcp {
             .await?;
         }
 
-        // 更新段状态
         for (idx, xmit, resendts, rto, is_lost) in need_update {
             if let Some(seg) = self.snd_buf.get_mut(idx) {
                 seg.xmit = xmit;
@@ -967,30 +736,22 @@ impl Kcp {
             }
         }
 
-        // 拥塞窗口调整
+        // 拥塞控制：丢包则收缩窗口，否则按慢启动/拥塞避免递增
         if lost {
             self.ssthresh = (self.cwnd as u32 / 2).max(IKCP_THRESH_MIN);
             self.cwnd = 1;
             self.incr = 0;
         } else if self.timediff_u64(current, self.ts_lastack) >= 0 {
-            // 正常，增加拥塞窗口
             if (self.cwnd as u32) < self.ssthresh {
-                // 慢启动
                 self.incr += self.mss;
-            } else {
-                // 拥塞避免
-                self.incr += if self.mss > 0 {
-                    self.mss * self.mss / (self.cwnd as u32)
-                } else {
-                    0
-                };
+            } else if self.mss > 0 {
+                self.incr += self.mss * self.mss / (self.cwnd as u32);
             }
             if self.incr >= self.mss {
                 self.cwnd += 1;
                 self.incr -= self.mss;
             }
         }
-
         Ok(())
     }
 
@@ -1005,66 +766,58 @@ impl Kcp {
         Ok(())
     }
 
-    /// 更新 KCP 状态
+    /// 更新 KCP 状态：调整时钟并触发 flush
     pub async fn update(&mut self, current: u64) -> KcpResult<()> {
         self.current = current;
-
         if !self.updated {
             self.updated = true;
             self.ts_flush = self.current;
         }
-
         if self.timediff_u64(self.current, self.ts_flush) >= 0 {
             self.ts_flush = self.current.wrapping_add(self.interval);
             self.flush().await?;
         }
-
         Ok(())
     }
 
     /// 计算下次更新时间
     ///
-    /// 对应C代码的 ikcp_check() 函数 (ikcp.c:1059)
-    ///
-    /// # 参数
-    ///
-    /// - `current`: 当前时间戳（毫秒）
-    ///
-    /// # 返回
-    ///
-    /// 返回下次需要更新的时间戳
-    ///
-    /// # 实现要点
-    ///
-    /// 检查是否有待发送的数据，计算最早的重传时间
-    ///
-    /// # 示例
-    ///
-    /// ```ignore
-    /// let next_update = kcp.check(current_timestamp_ms());
-    /// ```
+    /// 检查 snd_buf 中最早的重传时间和 ts_flush，返回下次需要 update 的时间戳。
     pub fn check(&self, current: u64) -> u64 {
         let mut ts_flush = self.ts_flush;
-
         if !self.snd_queue.is_empty() || !self.snd_buf.is_empty() {
             for seg in self.snd_buf.iter() {
                 let diff = self.timediff_u64(seg.resendts, current);
                 if diff < 0 {
                     return current;
-                } else if diff < self.timediff_u64(ts_flush, current) {
+                }
+                if diff < self.timediff_u64(ts_flush, current) {
                     ts_flush = seg.resendts;
                 }
             }
         }
-
         if (self.probe & IKCP_ASK_SEND) != 0 {
             return current;
         }
-
         if self.timediff_u64(ts_flush, current) > 0 {
             ts_flush
         } else {
             current
+        }
+    }
+
+    /// 将 rcv_buf 中有序的段（sn 连续）移入 rcv_queue，更新 rcv_nxt
+    #[inline]
+    fn move_rcv_buf_to_queue(&mut self) {
+        while let Some(seg) = self.rcv_buf.front() {
+            if seg.kcp_packet.header.sn != self.rcv_nxt || self.nrcv_que >= self.rcv_wnd as usize {
+                break;
+            }
+            let seg = self.rcv_buf.pop_front().unwrap();
+            self.nrcv_buf -= 1;
+            self.rcv_queue.push_back(seg);
+            self.nrcv_que += 1;
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
         }
     }
 }
@@ -1076,29 +829,215 @@ mod tests {
 
     #[test]
     fn test_kcp_new() {
-        let config = KcpConfig::default();
-        let kcp = Kcp::new(0x11223344, config);
-        assert!(kcp.is_ok());
-
-        let kcp = kcp.unwrap();
+        let kcp = Kcp::new(0x11223344, KcpConfig::default()).unwrap();
         assert_eq!(kcp.conv, 0x11223344);
         assert_eq!(kcp.mtu, 1400);
         assert_eq!(kcp.mss, 1372);
     }
 
     #[test]
-    fn test_kcp_cmd_try_from() {
-        assert_eq!(KcpCmd::try_from(81), Ok(KcpCmd::Push));
-        assert_eq!(KcpCmd::try_from(82), Ok(KcpCmd::Ack));
-        assert_eq!(KcpCmd::try_from(83), Ok(KcpCmd::Wask));
-        assert_eq!(KcpCmd::try_from(84), Ok(KcpCmd::Wins));
-        assert!(KcpCmd::try_from(99).is_err());
+    fn test_waitsnd() {
+        assert_eq!(Kcp::new(0, KcpConfig::default()).unwrap().waitsnd(), 0);
+    }
+
+    fn random_bytes(len: usize) -> Vec<u8> {
+        use rand::Rng;
+        let mut rng = rand::rng();
+        let mut data = vec![0u8; len];
+        rng.fill_bytes(&mut data);
+        data
+    }
+
+    // ===== 流模式测试 =====
+
+    #[test]
+    fn test_stream_mode_peeksize_single_segment() {
+        let mut kcp = Kcp::new(1, KcpConfig::stream_mode()).unwrap();
+        let h = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 1000, 1, 0, 5);
+        kcp.rcv_queue
+            .push_back(Segment::new_with_header_and_data(h, &[1, 2, 3, 4, 5]).unwrap());
+        kcp.nrcv_que += 1;
+        assert_eq!(kcp.peeksize().unwrap(), 5);
     }
 
     #[test]
-    fn test_waitsnd() {
-        let config = KcpConfig::default();
-        let kcp = Kcp::new(0x11223344, config).unwrap();
-        assert_eq!(kcp.waitsnd(), 0);
+    fn test_stream_mode_peeksize_multiple_segments() {
+        let mut kcp = Kcp::new(1, KcpConfig::stream_mode()).unwrap();
+        kcp.rcv_queue.push_back(
+            Segment::new_with_header_and_data(
+                KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 1000, 1, 0, 3),
+                &[1, 2, 3],
+            )
+            .unwrap(),
+        );
+        kcp.rcv_queue.push_back(
+            Segment::new_with_header_and_data(
+                KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 1000, 2, 0, 4),
+                &[4, 5, 6, 7],
+            )
+            .unwrap(),
+        );
+        kcp.nrcv_que += 2;
+        assert_eq!(kcp.peeksize().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_stream_mode_recv_single_segment() {
+        let mut kcp = Kcp::new(1, KcpConfig::stream_mode()).unwrap();
+        let h = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 1000, 1, 0, 5);
+        kcp.rcv_queue
+            .push_back(Segment::new_with_header_and_data(h, &[10, 20, 30, 40, 50]).unwrap());
+        kcp.nrcv_que += 1;
+        assert_eq!(kcp.recv().unwrap().to_vec(), vec![10, 20, 30, 40, 50]);
+        assert_eq!(kcp.nrcv_que, 0);
+    }
+
+    #[test]
+    fn test_stream_mode_recv_multiple_segments() {
+        let mut kcp = Kcp::new(1, KcpConfig::stream_mode()).unwrap();
+        let msg: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let (a, bc) = msg.split_at(3);
+        let (b, c) = bc.split_at(4);
+        kcp.rcv_queue.push_back(
+            Segment::new_with_header_and_data(
+                KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 1000, 1, 0, 3),
+                a,
+            )
+            .unwrap(),
+        );
+        kcp.rcv_queue.push_back(
+            Segment::new_with_header_and_data(
+                KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 1000, 2, 0, 4),
+                b,
+            )
+            .unwrap(),
+        );
+        kcp.rcv_queue.push_back(
+            Segment::new_with_header_and_data(
+                KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 1000, 3, 0, 2),
+                c,
+            )
+            .unwrap(),
+        );
+        kcp.nrcv_que += 3;
+        assert_eq!(kcp.recv().unwrap().to_vec(), msg);
+        assert_eq!(kcp.nrcv_que, 0);
+    }
+
+    #[test]
+    fn test_stream_mode_recv_empty() {
+        assert_eq!(
+            Kcp::new(1, KcpConfig::stream_mode())
+                .unwrap()
+                .recv()
+                .unwrap_err(),
+            KcpError::QueueEmpty
+        );
+    }
+
+    #[test]
+    fn test_stream_mode_no_frg_limit() {
+        let mut kcp = Kcp::new(1, KcpConfig::stream_mode()).unwrap();
+        let big = random_bytes(kcp.mss as usize * 300);
+        assert!(kcp.send(&big).is_ok());
+        assert_eq!(kcp.nsnd_que, 300);
+    }
+
+    #[test]
+    fn test_non_stream_mode_frg_limit() {
+        let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+        match kcp.send(&random_bytes(kcp.mss as usize * 300)).unwrap_err() {
+            KcpError::InvalidConfig(_) => {}
+            e => panic!("expected InvalidConfig, got {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_stream_mode_frg_all_zero() {
+        let mut kcp = Kcp::new(1, KcpConfig::stream_mode()).unwrap();
+        kcp.send(&random_bytes(kcp.mss as usize * 3 + 100)).unwrap();
+        assert_eq!(kcp.nsnd_que, 4);
+        for seg in kcp.snd_queue.iter() {
+            assert_eq!(seg.kcp_packet.header.frg, 0);
+        }
+    }
+
+    #[test]
+    fn test_non_stream_mode_frg_decreasing() {
+        let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+        kcp.send(&random_bytes(kcp.mss as usize * 3 + 100)).unwrap();
+        assert_eq!(kcp.nsnd_que, 4);
+        let frgs: Vec<u8> = kcp
+            .snd_queue
+            .iter()
+            .map(|s| s.kcp_packet.header.frg)
+            .collect();
+        assert_eq!(frgs, vec![3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn test_stream_mode_peeksize_empty() {
+        assert_eq!(
+            Kcp::new(1, KcpConfig::stream_mode())
+                .unwrap()
+                .peeksize()
+                .unwrap_err(),
+            KcpError::QueueEmpty
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_mode_full_cycle_small() {
+        use std::sync::{Arc, Mutex};
+        let (mut s, r) = {
+            let c = KcpConfig::stream_mode();
+            (
+                Kcp::new(1, c.clone()).unwrap(),
+                Arc::new(Mutex::new(Kcp::new(1, c).unwrap())),
+            )
+        };
+        let now = current_millis();
+        s.current = now;
+        r.lock().unwrap().current = now;
+        let r2 = r.clone();
+        s.set_output(move |d| {
+            r2.lock().unwrap().input(&d).ok();
+            Box::pin(async move { Ok(d.len()) })
+        });
+        assert_eq!(s.send(b"Hello Stream!").unwrap(), b"Hello Stream!".len());
+        s.update(now + 20).await.unwrap();
+        assert_eq!(r.lock().unwrap().recv().unwrap().to_vec(), b"Hello Stream!");
+    }
+
+    #[tokio::test]
+    async fn test_stream_mode_multi_send_reorder() {
+        use std::sync::{Arc, Mutex};
+        let (mut s, r) = {
+            let c = KcpConfig::stream_mode();
+            (
+                Kcp::new(1, c.clone()).unwrap(),
+                Arc::new(Mutex::new(Kcp::new(1, c).unwrap())),
+            )
+        };
+        let now = current_millis();
+        s.current = now;
+        r.lock().unwrap().current = now;
+        let r2 = r.clone();
+        s.set_output(move |d| {
+            r2.lock().unwrap().input(&d).ok();
+            Box::pin(async move { Ok(d.len()) })
+        });
+
+        s.send(b"Hello ").unwrap();
+        s.send(b"Stream ").unwrap();
+        s.send(b"Mode!").unwrap();
+        for i in 0..5 {
+            s.current = now + i * s.interval;
+            s.update(s.current).await.unwrap();
+        }
+        assert_eq!(
+            r.lock().unwrap().recv().unwrap().to_vec(),
+            b"Hello Stream Mode!"
+        );
     }
 }

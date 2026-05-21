@@ -1,4 +1,7 @@
 /target
 /kcp
 .DS_Store
-/pi-review
+AGENTS.md
+CLAUDE.md
+.claude/
+.gitnexus/

@@ -16,40 +16,18 @@ use crate::{
 pub struct Segment {
     /// 数据包
     pub kcp_packet: KcpPacket,
-
     /// 重传时间戳
     pub resendts: u64,
-
     /// 超时重传时间（毫秒）
     pub rto: u64,
-
     /// 快速重传计数
     pub fastack: u32,
-
     /// 发送次数
     pub xmit: u32,
 }
 
 impl Segment {
-    /// 创建新的数据段
-    ///
-    /// # 参数
-    ///
-    /// - `kcp_packet`: KcpPacket
-    ///
-    /// # 返回
-    ///
-    /// 返回新创建的Segment实例，所有字段初始化为默认值
-    ///
-    /// # 示例
-    ///
-    /// ```ignore
-    /// use kcp_ovo::queue::segment::Segment;
-    ///
-    /// let data: Vec<u8> = vec![0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    /// let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
-    /// let seg = Segment::new(kcp_packet);
-    /// ```
+    /// 创建新的数据段，发送相关字段初始化为 0
     pub fn new(kcp_packet: KcpPacket) -> Self {
         Self {
             resendts: 0,
@@ -61,20 +39,10 @@ impl Segment {
     }
 
     pub fn new_with_header_and_data(header: KcpPacketHeader, data: &[u8]) -> KcpResult<Self> {
-        Ok(Self {
-            resendts: 0,
-            rto: 0,
-            fastack: 0,
-            xmit: 0,
-            kcp_packet: KcpPacket::from_header_and_data(header, data)?,
-        })
+        Ok(Self::new(KcpPacket::from_header_and_data(header, data)?))
     }
 
     /// 获取段的总大小（包含头部）
-    ///
-    /// # 返回
-    ///
-    /// 返回段的总字节数，包含头部和数据载荷
     pub fn size(&self) -> usize {
         IKCP_OVERHEAD + self.kcp_packet.data.len()
     }
@@ -105,15 +73,22 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
+    fn make_packet(data_len: usize, payload: &[u8]) -> KcpPacket {
+        let raw: Vec<u8> = [
+            vec![
+                0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            (data_len as u32).to_be_bytes().to_vec(),
+            payload.to_vec(),
+        ]
+        .concat();
+        KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&raw)).unwrap()
+    }
+
     #[test]
     fn test_segment_new() {
-        let data: Vec<u8> = vec![
-            0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
-        let seg = Segment::new(kcp_packet);
+        let seg = Segment::new(make_packet(0, &[]));
         assert_eq!(seg.size(), 28);
-        assert_eq!(seg.get_data().to_vec().len(), 0);
         assert!(seg.is_empty());
         assert_eq!(seg.get_conv(), 1);
         assert_eq!(seg.get_cmd(), KcpCmd::Push);
@@ -121,15 +96,13 @@ mod tests {
 
     #[test]
     fn test_segment_new_with_data() {
-        let data: Vec<u8> = vec![
-            0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 1,
-            2, 3, 4, 5, 6, 7,
-        ];
-        let data_payload: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7];
-        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
-        let seg = Segment::new(kcp_packet);
-        assert_eq!(seg.size(), 28 + 7);
-        assert_eq!(seg.get_data().to_vec().len(), 7);
-        assert_eq!(seg.get_data().to_vec(), data_payload);
+        let payload = vec![1, 2, 3, 4, 5, 6, 7];
+        let seg = Segment::new_with_header_and_data(
+            KcpPacketHeader::new(1, KcpCmd::Push, 0, 1, 0, 0, 0, payload.len() as u32),
+            &payload,
+        )
+        .unwrap();
+        assert_eq!(seg.size(), 35);
+        assert_eq!(seg.get_data().to_vec(), payload);
     }
 }

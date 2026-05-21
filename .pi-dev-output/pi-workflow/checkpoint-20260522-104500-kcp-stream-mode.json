@@ -1,0 +1,509 @@
+{
+  "version": 2,
+  "createdAt": "2026-05-21T18:18:05.879Z",
+  "updatedAt": "2026-05-21T18:18:05.879Z",
+  "prompt": "[feat] 在 src 中实现 kcp实现缺少stream流模式，流模式下不再要求255分片大小限制，且字节追加，需要实现kcp完整流模式\n\n**角色**：你是一个资深 rust 工程师。\n**背景**：项目使用 kcp rust，当前缺少 kcp实现缺少stream流模式，流模式下不再要求255分片大小限制，且字节追加，需要实现kcp完整流模式。\n**任务**：\n1. 先分析代码库结构，给出逐步实施计划（列出要修改/创建的文件、数据库迁移、对现有代码的假设）。\n2. 计划经我确认后再编写代码。\n3. 实现后编写测试用例验证核心逻辑。\n**输出**：提供 unified diff 和两句话的变更说明。\n**约束**：禁止顺手重构无关代码；保持所有公共 API 签名兼容；不要为假设性需求添加抽象层。\n\n---\n## 设计评审记录\n\n以下是在开发前进行的设计评审问答，所有决策已确认：\n\n[评审问题 1]\n问题: 「流模式」在这个项目中的定义是什么？是指 (a) 在底层 core/kcp.rs 中修改 send() 逻辑，不再使用 frg 分片机制，而是将大于 MSS 的数据自动按 MSS 切分为多个 segment（但所有 segment 的 frg=0），recv() 时按 sn 顺序连续交付字节，无消息边界；还是 (b) 仅在 stream.rs 中封装大字节流，调用多次底层 send()，底层仍走原有 frg 分片？\n回答: a[推荐] 底层 core/kcp.rs 中增加 stream 模式逻辑：send() 切分时所有分片 frg=0，recv() 连续拼接所有 segment 字节交付，无消息边界，不受 255 分片限制\n\n[评审问题 2]\n问题: 流模式下如何消除 255 分片限制？当前 send() 中有 `if count > u8::MAX` 的检查。流模式下大文件需要更多分片时，逻辑如何改变？\n回答: a[推荐] 流模式下移除所有关于 frg 分片数量的检查约束（即移除 `if count > u8::MAX`），因为所有 segment 的 frg=0，接收端不再根据 frg 组装消息，纯按 sn 顺序交付\n\n[评审问题 3]\n问题: 流模式下 Kcp::send() 的参数和返回类型是否改变？\n回答: a[推荐] 保持 `fn send(&mut self, data: &[u8]) -> KcpResult<usize>` 不变，内部根据 stream_mode 决定分片方式\n\n[评审问题 4]\n问题: 流模式下 Kcp::recv() 的参数和返回类型如何调整？当前返回 `KcpResult<Bytes>`。\n回答: a[推荐] 保持 `fn recv(&mut self) -> KcpResult<Bytes>` 不变，只是返回的数据是 rcv_queue 中所有连续 segment 字节的拼接\n\n[评审问题 5]\n问题: 流模式下 peeksize() 的行为如何修改？当前 peeksize() 按 frg 链计算一个完整消息的大小。\n回答: a[推荐] 流模式下 peeksize() 返回 rcv_queue 中第一个 segment 的大小，不再等待 frg 组装\n\n[评审问题 6]\n问题: 如何在 Kcp 结构中引入流模式的开关？通过配置、方法、还是新类型？\n回答: a[推荐] 在 KcpConfig 中新增 `pub stream_mode: bool` 字段（默认 false），Kcp::new() 接收并存到 Kcp 实例\n\n[评审问题 7]\n问题: 流模式下 send() 的数据切分逻辑：每个切分后的 segment 的 frg 字段如何设置？\n回答: a[推荐] 所有切分后的 segment 的 frg 都设为 0。接收端按 sn 连续排序后直接拼接，不检查 frg\n\n[评审问题 8]\n问题: 流模式下 recv() 从 rcv_queue 读取数据的策略：是一次性读取所有可用 segment，还是只读一个 segment？\n回答: a[推荐] 一次性读取 rcv_queue 中所有可读 segment 的字节并拼接返回。这样可以最大程度地减少用户层调用次数，更接近 TCP stream 语义\n\n[评审问题 9]\n问题: 流模式下 input() 处理 PUSH 包时，segment 移入 rcv_queue 的条件是否改变？当前逻辑是等 sn 连续 + frg 组装完成后才移入 rcv_queue（通过 peeksize 间接实现），流模式下是否需要不同的条件？\n回答: a[推荐] 不需要改变 input() 中 segment 移入 rcv_queue 的条件——只要 sn 连续且窗口有空位就移入。流模式下 recv() 会按 sn 顺序连续拼接。input 中靠 frg 组装的部分（如 peeksize 的逻辑）对 rcv_queue 本身的数据结构无影响\n\n[评审问题 10]\n问题: 流模式下 recv() 中关于 `self.probe |= IKCP_ASK_TELL` 的逻辑是否保留？当前在 recv() 末尾有快速恢复窗口探测的逻辑。\n回答: a[推荐] 保留不动。窗口管理和流模式无关，流模式只是改变了 frg 语义和数据交付方式\n\n[评审问题 11]\n问题: 流模式下从 snd_queue 移入 snd_buf 的过程是否改变？当前 flush() 中受窗口大小限制。\n回答: a[推荐] 不改变。流模式不修改 flush 逻辑，窗口管理、拥塞控制、RTT 估计等不变\n\n[评审问题 12]\n问题: 流模式与非流模式的 Kcp 实例能否互连互通？即一端启用 stream_mode，另一端不启用。\n回答: a[推荐] 不能互连。流模式改变了对 frg 字段的解释方式——发送端所有分片 frg=0，非流模式接收端会将其视为一个完整的短消息（如果数据大于一个 segment 则会丢失数据），反之同理\n\n[评审问题 13]\n问题: 流模式下大消息（如 10MB）的 send/recv 测试场景如何设计？\n回答: a[推荐] (1) send 一个 1MB 的随机字节数组，recv 验证完全一致 (2) send 一个超过 255*MSS（约 350KB）的数据，验证分片数量上限已消除 (3) 连续多次 send + 连续 recv 验证字节顺序正确性\n\n[评审问题 14]\n问题: 需要修改的文件范围？\n回答: a[推荐] 只修改 src/core/kcp.rs（send/recv/peeksize 中的流模式分支逻辑）和 src/config/params.rs（KcpConfig 新增 stream_mode 字段）。不修改 stream.rs、packet.rs、error.rs 等\n\n[评审问题 15]\n问题: 流模式下，KcpConfig 是否应该提供一个便捷构造方法，如 `KcpConfig::stream_mode()`？\n回答: a[推荐] 是，新增 `pub fn stream_mode() -> Self` 方法，返回 stream_mode=true 的配置，默认 interval=20, nodelay=true\n\n[评审问题 16]\n问题: 流模式下 send() 的分片循环中，snd_nxt 的自增方式是否改变？当前每个分片都自增 snd_nxt。\n回答: a[推荐] 不变。每个 segment 仍然对应一个独立的序列号，按顺序自增，无论是否流模式\n\n[评审问题 17]\n问题: 流模式下 recv() 返回的 Bytes 中是否应该包含帧标记（如长度前缀）以方便上层用户区分消息边界？\n回答: a[推荐] 不加入任何帧标记。流模式就是无边界字节流，如果用户需要消息边界应在应用层实现（如 TLVs）。这与 TCP 语义一致",
+  "mode": "full-auto",
+  "steps": [
+    {
+      "status": "done",
+      "durationMs": 71544
+    },
+    {
+      "status": "done",
+      "loopCount": 2,
+      "durationMs": 671879
+    },
+    {
+      "status": "done",
+      "loopCount": 1,
+      "durationMs": 395429
+    },
+    {
+      "status": "done",
+      "durationMs": 276830
+    }
+  ],
+  "currentStepIndex": 3,
+  "loopCounts": {
+    "worker-reviewer": 2,
+    "trimmer-reviewer": 1
+  },
+  "planFilePath": ".pi-dev-output/pi-plans/20260522-104500-kcp-stream-mode.md",
+  "taskSummary": "feat - 在 src 中实现 kcp实现缺少stream流模式，流模式下不再要求255分片大小限制，且字节追加，需要实现kcp完整流模式",
+  "workflowType": "快速链式",
+  "fileChanges": [
+    {
+      "agent": "planner",
+      "stepIndex": 0,
+      "type": "edit",
+      "filePath": "src/core/kcp.rs",
+      "timestamp": "2026-05-21T17:55:41.713Z"
+    },
+    {
+      "agent": "planner",
+      "stepIndex": 0,
+      "type": "edit",
+      "filePath": "stream.rs、packet.rs、error.rs",
+      "timestamp": "2026-05-21T17:55:41.713Z"
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "core/kcp.rs",
+      "timestamp": "2026-05-21T18:04:14.444Z"
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "config/params.rs",
+      "timestamp": "2026-05-21T18:04:14.444Z"
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "src/config/params.rs",
+      "timestamp": "2026-05-21T18:04:14.444Z"
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "src/core/kcp.rs",
+      "timestamp": "2026-05-21T18:04:14.444Z"
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "tests/stream_mode_test.rs",
+      "timestamp": "2026-05-21T18:04:14.444Z"
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "kcp.rs",
+      "timestamp": "2026-05-21T18:04:14.444Z"
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "src/stream.rs",
+      "timestamp": "2026-05-21T18:04:14.445Z"
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "src/error.rs",
+      "timestamp": "2026-05-21T18:04:14.445Z"
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "src/packet.rs",
+      "timestamp": "2026-05-21T18:04:14.445Z"
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "helper/packet.rs",
+      "timestamp": "2026-05-21T18:04:14.445Z"
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "stream.rs",
+      "timestamp": "2026-05-21T18:04:14.449Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "core/kcp.rs",
+      "timestamp": "2026-05-21T18:05:09.304Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "config/params.rs",
+      "timestamp": "2026-05-21T18:05:09.304Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "src/config/params.rs",
+      "timestamp": "2026-05-21T18:05:09.304Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "src/core/kcp.rs",
+      "timestamp": "2026-05-21T18:05:09.304Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "tests/stream_mode_test.rs",
+      "timestamp": "2026-05-21T18:05:09.304Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "kcp.rs",
+      "timestamp": "2026-05-21T18:05:09.304Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "src/stream.rs",
+      "timestamp": "2026-05-21T18:05:09.304Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "src/error.rs",
+      "timestamp": "2026-05-21T18:05:09.304Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "src/packet.rs",
+      "timestamp": "2026-05-21T18:05:09.305Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "helper/packet.rs",
+      "timestamp": "2026-05-21T18:05:09.305Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "stream.rs、packet.rs、error.rs",
+      "timestamp": "2026-05-21T18:05:09.308Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "type": "edit",
+      "filePath": "stream.rs",
+      "timestamp": "2026-05-21T18:05:09.308Z"
+    },
+    {
+      "agent": "trimmer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "src/core/kcp.rs",
+      "timestamp": "2026-05-21T18:12:00.751Z"
+    },
+    {
+      "agent": "trimmer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "stream.rs、packet.rs、error.rs",
+      "timestamp": "2026-05-21T18:12:00.751Z"
+    },
+    {
+      "agent": "trimmer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "src/queue/segment.rs",
+      "timestamp": "2026-05-21T18:12:00.777Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "core/kcp.rs",
+      "timestamp": "2026-05-21T18:13:29.012Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "config/params.rs",
+      "timestamp": "2026-05-21T18:13:29.012Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "src/config/params.rs",
+      "timestamp": "2026-05-21T18:13:29.012Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "src/core/kcp.rs",
+      "timestamp": "2026-05-21T18:13:29.012Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "tests/stream_mode_test.rs",
+      "timestamp": "2026-05-21T18:13:29.012Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "kcp.rs",
+      "timestamp": "2026-05-21T18:13:29.012Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "src/stream.rs",
+      "timestamp": "2026-05-21T18:13:29.012Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "src/error.rs",
+      "timestamp": "2026-05-21T18:13:29.012Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "src/packet.rs",
+      "timestamp": "2026-05-21T18:13:29.012Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "helper/packet.rs",
+      "timestamp": "2026-05-21T18:13:29.012Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "stream.rs、packet.rs、error.rs",
+      "timestamp": "2026-05-21T18:13:29.015Z"
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "type": "edit",
+      "filePath": "stream.rs",
+      "timestamp": "2026-05-21T18:13:29.016Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "core/kcp.rs",
+      "timestamp": "2026-05-21T18:18:05.844Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "config/params.rs",
+      "timestamp": "2026-05-21T18:18:05.844Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "src/config/params.rs",
+      "timestamp": "2026-05-21T18:18:05.844Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "src/core/kcp.rs",
+      "timestamp": "2026-05-21T18:18:05.844Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "tests/stream_mode_test.rs",
+      "timestamp": "2026-05-21T18:18:05.844Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "kcp.rs",
+      "timestamp": "2026-05-21T18:18:05.844Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "src/stream.rs",
+      "timestamp": "2026-05-21T18:18:05.844Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "src/error.rs",
+      "timestamp": "2026-05-21T18:18:05.844Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "src/packet.rs",
+      "timestamp": "2026-05-21T18:18:05.844Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "helper/packet.rs",
+      "timestamp": "2026-05-21T18:18:05.844Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "Cargo.toml",
+      "timestamp": "2026-05-21T18:18:05.845Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "stream.rs、packet.rs、error.rs",
+      "timestamp": "2026-05-21T18:18:05.848Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "stream.rs",
+      "timestamp": "2026-05-21T18:18:05.848Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "README.md",
+      "timestamp": "2026-05-21T18:18:05.873Z"
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "type": "edit",
+      "filePath": "docs/api-guide.md",
+      "timestamp": "2026-05-21T18:18:05.873Z"
+    }
+  ],
+  "subAgentRuns": 8,
+  "filesModified": 55,
+  "filesCreated": 0,
+  "agentRunHistory": [
+    {
+      "agent": "planner",
+      "stepIndex": 0,
+      "startedAt": "2026-05-21T17:54:30.193Z",
+      "durationMs": 71513,
+      "exitCode": 0,
+      "toolCount": 0
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "startedAt": "2026-05-21T17:55:41.738Z",
+      "durationMs": 512702,
+      "exitCode": 0,
+      "toolCount": 2
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "startedAt": "2026-05-21T18:04:14.485Z",
+      "durationMs": 54817,
+      "exitCode": 0,
+      "toolCount": 13
+    },
+    {
+      "agent": "worker",
+      "stepIndex": 1,
+      "startedAt": "2026-05-21T18:05:09.348Z",
+      "durationMs": 35808,
+      "exitCode": 0,
+      "toolCount": 25
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 1,
+      "startedAt": "2026-05-21T18:05:45.193Z",
+      "durationMs": 68386,
+      "exitCode": 0,
+      "toolCount": 36
+    },
+    {
+      "agent": "trimmer",
+      "stepIndex": 2,
+      "startedAt": "2026-05-21T18:06:53.618Z",
+      "durationMs": 307127,
+      "exitCode": 0,
+      "toolCount": 48
+    },
+    {
+      "agent": "reviewer",
+      "stepIndex": 2,
+      "startedAt": "2026-05-21T18:12:00.781Z",
+      "durationMs": 88228,
+      "exitCode": 0,
+      "toolCount": 51
+    },
+    {
+      "agent": "docWriter",
+      "stepIndex": 3,
+      "startedAt": "2026-05-21T18:13:29.049Z",
+      "durationMs": 276792,
+      "exitCode": 0,
+      "toolCount": 63
+    }
+  ],
+  "baseline": [
+    {
+      "path": ".gitignore",
+      "hash": "1907284ba57cc295824bab161a2f8e3f6a29cc69"
+    },
+    {
+      "path": "Cargo.lock",
+      "hash": "bc6a588abf1f6e3cbb0bf9aa1bc03e5bbf712055"
+    },
+    {
+      "path": "Cargo.toml",
+      "hash": "3c7fd30bd0c362079792bb10a314a06c68425817"
+    },
+    {
+      "path": ".pi-dev-output/",
+      "hash": ""
+    }
+  ]
+}

@@ -360,8 +360,8 @@ pub struct KcpConfig {
     /// 快速重传触发次数 (默认: 0)
     pub fastresend: i32,
 
-    /// 是否流式模式 (默认: false)
-    pub stream: bool,
+    /// 是否流模式 (默认: false)
+    pub stream_mode: bool,
 
     /// 是否禁用拥塞控制 (默认: false)
     pub nocwnd: bool,
@@ -380,7 +380,7 @@ let config = KcpConfig::default();
 // interval: 100
 // nodelay: false
 // fastresend: 0
-// stream: false
+// stream_mode: false
 // nocwnd: false
 // rcv_wnd: 128
 ```
@@ -392,7 +392,7 @@ let config = KcpConfig::fast_mode();
 // interval: 20
 // nodelay: true
 // fastresend: 2
-// stream: false
+// stream_mode: false
 // nocwnd: false
 // rcv_wnd: 128
 ```
@@ -526,7 +526,7 @@ let config = KcpConfig {
     interval: 10,        // 极快的更新
     nodelay: true,       // 立即发送
     fastresend: 2,       // 快速重传
-    stream: false,
+    stream_mode: false,
     nocwnd: false,       // 保留拥塞控制
     rcv_wnd: 256,        // 适中的窗口
 };
@@ -540,7 +540,7 @@ let config = KcpConfig {
     interval: 100,       // 正常更新
     nodelay: false,      // 允许合并
     fastresend: 0,       // 超时重传
-    stream: false,
+    stream_mode: false,
     nocwnd: true,        // 禁用拥塞控制
     rcv_wnd: 2048,       // 大窗口
 };
@@ -554,7 +554,7 @@ let config = KcpConfig {
     interval: 50,        // 快速更新
     nodelay: true,       // 低延迟
     fastresend: 2,       // 快速重传
-    stream: true,        // 流式模式
+    stream_mode: true,        // 流模式
     nocwnd: false,
     rcv_wnd: 512,        // 大缓冲
 };
