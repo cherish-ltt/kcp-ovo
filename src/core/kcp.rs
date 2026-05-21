@@ -12,9 +12,9 @@ use crate::KcpCmd;
 use crate::config::KcpConfig;
 use crate::error::{IncompleteDataType, KcpError, KcpResult};
 use crate::helper::{
-    IKCP_ASK_SEND, IKCP_ASK_TELL, IKCP_DEADLINK, IKCP_FASTACK_LIMIT, IKCP_OVERHEAD, IKCP_RTO_DEF,
-    IKCP_RTO_MAX, IKCP_RTO_MIN, IKCP_THRESH_INIT, IKCP_THRESH_MIN, KcpPacket, KcpPacketHeader,
-    current_millis,
+    IKCP_ASK_SEND, IKCP_ASK_TELL, IKCP_DEADLINK, IKCP_FASTACK_LIMIT, IKCP_OVERHEAD,
+    IKCP_PROBE_INIT, IKCP_PROBE_LIMIT, IKCP_RTO_DEF, IKCP_RTO_MAX, IKCP_RTO_MIN, IKCP_THRESH_INIT,
+    IKCP_THRESH_MIN, KcpPacket, KcpPacketHeader, current_millis,
 };
 use crate::queue::{KcpDeque, Segment};
 
@@ -531,6 +531,7 @@ impl Kcp {
                 removed = true;
                 self.nsnd_buf -= 1;
             } else {
+                self.nsnd_buf -= 1; // popped from deque, compensate later
                 keep.push(seg);
             }
         }
@@ -622,12 +623,15 @@ impl Kcp {
         }
 
         let acks_to_send = self.acklist.clone();
-        self.acklist.clear();
-        let need_wask = self.acklist.is_empty() && (self.probe & IKCP_ASK_SEND) != 0;
+        let need_wask = acks_to_send.is_empty()
+            && (self.probe & IKCP_ASK_SEND) != 0
+            && self.timediff_u64(self.current, self.ts_probe) >= 0;
         let need_wins = (self.probe & IKCP_ASK_TELL) != 0;
+        self.acklist.clear();
 
         if need_wask {
             self.send_control(KcpCmd::Wask, 0).await?;
+            self.probe &= !IKCP_ASK_SEND;
         } else {
             for sn in acks_to_send {
                 self.send_control(KcpCmd::Ack, sn).await?;
@@ -640,8 +644,12 @@ impl Kcp {
 
         if self.rmt_wnd == 0 && (self.probe & IKCP_ASK_SEND) == 0 {
             self.probe |= IKCP_ASK_SEND;
-            self.probe_wait = 0;
-            self.ts_probe = self.current;
+            if self.probe_wait == 0 {
+                self.probe_wait = IKCP_PROBE_INIT;
+            } else {
+                self.probe_wait = (self.probe_wait * 2).min(IKCP_PROBE_LIMIT);
+            }
+            self.ts_probe = self.current + self.probe_wait;
         }
 
         let current = self.current;
@@ -1038,6 +1046,139 @@ mod tests {
         assert_eq!(
             r.lock().unwrap().recv().unwrap().to_vec(),
             b"Hello Stream Mode!"
+        );
+    }
+
+    // ===== Bug-fix regression tests =====
+
+    #[test]
+    fn test_parse_ack_nsnd_buf_integrity() {
+        let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+        // Manually populate snd_buf with 5 segments
+        for sn in 0..5u32 {
+            let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 1000, sn, 0, 10);
+            let seg = Segment::new_with_header_and_data(header, &[0u8; 10]).unwrap();
+            kcp.snd_buf.push_back(seg);
+            kcp.nsnd_buf += 1;
+        }
+        assert_eq!(kcp.nsnd_buf, 5);
+
+        // Process ACK for sn=2 — removes exactly one segment
+        kcp.parse_ack(2);
+
+        // nsnd_buf must reflect the remaining 4 segments
+        assert_eq!(kcp.nsnd_buf, 4);
+        // Remaining segments must be in order
+        let sns: Vec<u32> = kcp.snd_buf.iter().map(|s| s.kcp_packet.header.sn).collect();
+        assert_eq!(sns, vec![0, 1, 3, 4]);
+        assert_eq!(kcp.waitsnd(), 4);
+    }
+
+    #[test]
+    fn test_parse_data_out_of_order() {
+        let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+        // Insert segments out of order
+        for sn in [3u32, 1, 4, 0, 2] {
+            let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 1000, sn, 0, 5);
+            let seg = Segment::new_with_header_and_data(header, &[sn as u8; 5]).unwrap();
+            kcp.parse_data(seg);
+        }
+        assert_eq!(kcp.nrcv_buf, 5);
+        // rcv_buf must be sorted by sn
+        let sns: Vec<u32> = kcp.rcv_buf.iter().map(|s| s.kcp_packet.header.sn).collect();
+        assert_eq!(sns, vec![0, 1, 2, 3, 4]);
+
+        // Duplicate sn should be silently dropped
+        let dup_header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 1000, 2, 0, 3);
+        let dup_seg = Segment::new_with_header_and_data(dup_header, &[0u8; 3]).unwrap();
+        kcp.parse_data(dup_seg);
+        assert_eq!(kcp.nrcv_buf, 5);
+    }
+
+    #[tokio::test]
+    async fn test_non_stream_mode_full_cycle() {
+        use std::sync::{Arc, Mutex};
+        let (mut s, r) = {
+            let c = KcpConfig::fast_mode();
+            (
+                Kcp::new(1, c.clone()).unwrap(),
+                Arc::new(Mutex::new(Kcp::new(1, c).unwrap())),
+            )
+        };
+        let now = current_millis();
+        s.current = now;
+        r.lock().unwrap().current = now;
+        let r2 = r.clone();
+        s.set_output(move |d| {
+            r2.lock().unwrap().input(&d).ok();
+            Box::pin(async move { Ok(d.len()) })
+        });
+
+        // Send a message that spans multiple segments (3 * mss + 50 bytes = 4 segments)
+        let msg = random_bytes(s.mss as usize * 3 + 50);
+        assert_eq!(s.send(&msg).unwrap(), msg.len());
+        assert_eq!(s.nsnd_que, 4);
+
+        // Flush multiple times to ensure all segments arrive
+        for i in 0..5 {
+            s.current = now + i * s.interval;
+            s.update(s.current).await.unwrap();
+        }
+        // Receiver reassembles the message
+        let received = r.lock().unwrap().recv().unwrap();
+        assert_eq!(received.to_vec(), msg);
+        assert_eq!(r.lock().unwrap().nrcv_que, 0);
+    }
+
+    #[tokio::test]
+    async fn test_window_probe_backoff() {
+        let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+        let now = current_millis();
+        kcp.current = now;
+        kcp.rmt_wnd = 0;
+
+        // Dummy output so send_packet doesn't fail
+        kcp.set_output(move |data| Box::pin(async move { Ok(data.len()) }));
+
+        // 1st flush: probe_wait initialized to IKCP_PROBE_INIT
+        kcp.flush().await.unwrap();
+        assert_eq!(
+            kcp.probe & IKCP_ASK_SEND,
+            IKCP_ASK_SEND,
+            "ASK_SEND should be set after first flush with rmt_wnd=0"
+        );
+        assert_eq!(kcp.probe_wait, IKCP_PROBE_INIT);
+        assert_eq!(kcp.ts_probe, now + IKCP_PROBE_INIT);
+
+        // Simulate Wask was sent (probe cleared) and advance time past ts_probe
+        kcp.probe &= !IKCP_ASK_SEND;
+        kcp.current = now + IKCP_PROBE_INIT;
+
+        // 2nd flush: probe_wait should double
+        kcp.flush().await.unwrap();
+        assert_eq!(kcp.probe_wait, IKCP_PROBE_INIT * 2);
+        assert_eq!(kcp.ts_probe, kcp.current + IKCP_PROBE_INIT * 2);
+
+        // 3rd flush: probe_wait doubles again
+        kcp.probe &= !IKCP_ASK_SEND;
+        kcp.current = now + IKCP_PROBE_INIT * 3;
+        kcp.flush().await.unwrap();
+        assert_eq!(kcp.probe_wait, IKCP_PROBE_INIT * 4);
+        assert_eq!(kcp.ts_probe, kcp.current + IKCP_PROBE_INIT * 4);
+
+        // Advance time but NOT enough for the new ts_probe
+        kcp.probe &= !IKCP_ASK_SEND;
+        kcp.current = now + IKCP_PROBE_INIT * 4 + 10;
+        kcp.flush().await.unwrap();
+        // need_wask should be false (ts_probe hasn't elapsed), so probe stays set
+        assert_eq!(
+            kcp.probe & IKCP_ASK_SEND,
+            IKCP_ASK_SEND,
+            "probe should remain set when ts_probe not yet elapsed"
+        );
+        assert!(
+            kcp.current < kcp.ts_probe,
+            "current should be before ts_probe"
         );
     }
 }

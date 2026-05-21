@@ -27,3 +27,8 @@ pub const IKCP_WND_RCV: u32 = 128; // 默认接收窗口
 pub const IKCP_MTU_DEF: u32 = 1400; // 默认MTU
 #[allow(dead_code)]
 pub const IKCP_INTERVAL: u64 = 100; // 默认更新间隔
+
+/// 窗口探测初始等待时间（毫秒）
+pub const IKCP_PROBE_INIT: u64 = 7000;
+/// 窗口探测最大等待时间（毫秒）
+pub const IKCP_PROBE_LIMIT: u64 = 120000;
