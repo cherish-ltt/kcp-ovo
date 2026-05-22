@@ -171,6 +171,17 @@ impl KcpDeque {
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Segment> {
         self.inner.get_mut(index)
     }
+
+    /// 保留满足条件的元素，移除不满足的
+    ///
+    /// 供 BUG-8 使用：替代 parse_ack 中原 O(n) 弹出-重新压入模式，
+    /// 提供原地过滤能力，避免每次 ACK 处理都产生临时 Vec 分配。
+    pub fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&Segment) -> bool,
+    {
+        self.inner.retain(f);
+    }
 }
 
 impl Default for KcpDeque {

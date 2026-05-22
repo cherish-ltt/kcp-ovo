@@ -416,7 +416,8 @@ impl KcpListener {
                                                                             error!("recv_tx send err:{}", e);
                                                                         }
                                                                     }
-                                                                    Err(e) => {warn!("66601:{}",e)}
+                                                                    // 修复 BUG-10：替换无意义的魔数 66601 为可读的错误消息
+                                                                    Err(e) => {warn!("kcp recv failed: {}", e)}
                                                                 }
                                                             }
                                                             None => warn!("listener data_rx.recv none"),

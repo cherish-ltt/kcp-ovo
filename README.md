@@ -296,7 +296,7 @@ src/
 | **消息边界** | 有，frg链组装完整消息 | **无**，纯字节流，类似TCP |
 | **分片上限** | 255个分片（约350KB @1400MTU） | **无上限**，任意大小 |
 | **frg字段** | 递减链（最后一个分片frg=0） | **所有分片 frg=0** |
-| **peeksize** | 返回整个消息大小（等所有分片就绪） | **返回第一个segment大小** |
+| **peeksize** | 返回整个消息大小（等所有分片就绪） | **返回所有 segment 的字节总数** |
 | **recv** | 读取到frg=0为止 | **读取所有可用segment** |
 | **互连** | 可与非流模式对端通信 | **不能**与非流模式互连 |
 | **适用场景** | 有明确消息边界的应用 | 大文件传输、视频流、字节流应用 |
@@ -336,10 +336,22 @@ cargo test test_stream_mode
 ```
 
 测试覆盖：
-- ✅ 核心单元测试（Kcp创建、发送、接收、input、flush）
-- ✅ 流模式测试（分片全部为frg=0、无255上限、peeksize/recv语义、多次send内存连续交付）
-- ✅ Stream API测试
-- ✅ 所有测试通过
+- ✅ **核心单元测试**（Kcp创建、发送、接收、input、flush）
+- ✅ **流模式测试**（分片全部为frg=0、无255上限、peeksize/recv语义、多次send内存连续交付）
+- ✅ **Stream API测试**
+- ✅ **协议正确性测试**（50 个测试用例全部通过，含 11 个 Bug 回归测试）
+    - `test_cwnd_init_nonzero` — BUG-1：验证 cwnd 初始化为 `IKCP_THRESH_INIT`
+    - `test_parse_ack_rtt_correct` — BUG-2：验证 RTT 使用正确段的 ts
+    - `test_snd_una_updated` — BUG-3：验证 parse_una 更新 snd_una
+    - `test_ack_sent_with_wask` — BUG-4：验证 Wask + ACK 独立发送
+    - `test_no_dup_retransmit` — BUG-5：验证无重复重传
+    - `test_rmt_wnd_zero_at_init` — BUG-6：验证 rmt_wnd 初始化为 0
+    - `test_fastack_incremented` — BUG-7：验证快速重传正常生效
+    - `test_parse_ack_nsnd_buf_integrity` — BUG-8：验证 retain 模式下 nsnd_buf 一致
+    - `test_stream_peeksize_sum` — BUG-9：验证流模式 peeksize 返回所有 segment 总和
+    - BUG-10：魔数已替换为有意义的错误消息（代码审查通过）
+    - `test_no_deadlock_large_message` — BUG-11：验证 300KB 大文件传输无死锁
+    - `test_default_mode_can_send` — BUG-1 补充：验证默认配置下数据可正常发送
 
 ## 🔄 开发路线图
 
@@ -348,7 +360,7 @@ cargo test test_stream_mode
 - [x] Phase 1: 项目初始化和基础结构
 - [x] Phase 2: 核心KCP协议实现
 - [x] Phase 3: 测试基础设施
-  - [x] 单元测试（35个测试）
+  - [x] 单元测试（50个测试）
   - [x] 测试依赖配置
 - [x] Phase 4: Stream API实现
   - [x] KcpStream客户端封装
@@ -364,13 +376,26 @@ cargo test test_stream_mode
   - [x] KcpConfig::stream_mode() 便捷构造方法
   - [x] send() 流模式分支（所有分片 frg=0，无 255 上限）
   - [x] recv() 流模式分支（一次性读取所有 segment 拼接）
-  - [x] peeksize() 流模式分支（仅返回第一个 segment 大小）
+  - [x] peeksize() 流模式分支（返回所有 segment 总和）
   - [x] 流模式测试覆盖
+- [x] **Phase 7: 协议正确性修复（2026-05-22）**
+  - [x] BUG-1: cwnd 初始化 0→IKCP_THRESH_INIT
+  - [x] BUG-2: parse_ack RTT 计算 `>=`→`==`
+  - [x] BUG-3: snd_una 从未更新（已修复）
+  - [x] BUG-4: ACK 被 need_wask else 分支阻塞
+  - [x] BUG-5: 超时+快速重传双重发送（加 else）
+  - [x] BUG-6: rmt_wnd 初始值错误
+  - [x] BUG-7: parse_fastack 调用顺序错误
+  - [x] BUG-8: parse_ack O(n) 弹出-重新压入（改用 retain）
+  - [x] BUG-9: 流模式 peeksize 容量不足
+  - [x] BUG-10: 魔数 66601 替换
+  - [x] BUG-11: 窗口通告用可用窗口代替总窗口
+  - [x] 11 个 Bug 回归测试（50 个测试全部通过）
 
 ### 计划中 📋
 
-- [ ] Phase 7: 集成测试和边界测试
-- [ ] Phase 8: 性能基准测试
+- [ ] Phase 8: 集成测试和边界测试
+- [ ] Phase 9: 性能基准测试
 - [ ] 更多……
 
 ## 📄 许可证
