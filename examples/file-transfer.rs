@@ -37,13 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match args[1].as_str() {
         "recv" => {
-            let output_file = if args.len() > 2 {
-                &args[2]
-            } else {
-                "received.dat"
-            };
+            let output_file = if args.len() > 2 { &args[2] } else { "received.dat" };
             recv_file(output_file).await?;
-        }
+        },
         "send" => {
             if args.len() < 3 {
                 println!("错误: 请指定要发送的文件");
@@ -51,11 +47,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let input_file = &args[2];
             send_file(input_file).await?;
-        }
+        },
         _ => {
             println!("未知命令: {}", args[1]);
             println!("请使用 'send' 或 'recv'");
-        }
+        },
     }
 
     Ok(())
@@ -89,11 +85,7 @@ async fn recv_file(output_path: &str) -> io::Result<()> {
     let mut total_received: u64 = 0;
     let start_time = Instant::now();
 
-    println!(
-        "文件大小: {} bytes ({} MB)",
-        file_size,
-        file_size / 1024 / 1024
-    );
+    println!("文件大小: {} bytes ({} MB)", file_size, file_size / 1024 / 1024);
     println!();
 
     // 如果第一个包中还有剩余数据，先写入文件
@@ -134,11 +126,11 @@ async fn recv_file(output_path: &str) -> io::Result<()> {
                     );
                     io::stdout().flush()?;
                 }
-            }
+            },
             Err(e) => {
                 eprintln!("\n接收错误: {}", e);
                 return Ok(());
-            }
+            },
         }
     }
 
@@ -169,21 +161,14 @@ async fn send_file(input_path: &str) -> io::Result<()> {
 
     // 检查文件是否存在
     if !Path::new(input_path).exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("文件不存在: {}", input_path),
-        ));
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("文件不存在: {}", input_path)));
     }
 
     // 打开文件
     let mut input = File::open(input_path)?;
     let file_size = input.metadata()?.len();
 
-    println!(
-        "文件大小: {} bytes ({} MB)",
-        file_size,
-        file_size / 1024 / 1024
-    );
+    println!("文件大小: {} bytes ({} MB)", file_size, file_size / 1024 / 1024);
     println!();
 
     // 等待一下让接收端准备就绪
@@ -236,11 +221,11 @@ async fn send_file(input_path: &str) -> io::Result<()> {
                     // 小延迟以避免过快发送
                     thread::sleep(Duration::from_millis(1));
                 }
-            }
+            },
             Err(e) => {
                 eprintln!("\n读取文件错误: {}", e);
                 return Err(e);
-            }
+            },
         }
     }
 

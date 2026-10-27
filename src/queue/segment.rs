@@ -29,13 +29,7 @@ pub struct Segment {
 impl Segment {
     /// 创建新的数据段，发送相关字段初始化为 0
     pub fn new(kcp_packet: KcpPacket) -> Self {
-        Self {
-            resendts: 0,
-            rto: 0,
-            fastack: 0,
-            xmit: 0,
-            kcp_packet,
-        }
+        Self { resendts: 0, rto: 0, fastack: 0, xmit: 0, kcp_packet }
     }
 
     pub fn new_with_header_and_data(header: KcpPacketHeader, data: &[u8]) -> KcpResult<Self> {
@@ -75,9 +69,7 @@ mod tests {
 
     fn make_packet(data_len: usize, payload: &[u8]) -> KcpPacket {
         let raw: Vec<u8> = [
-            vec![
-                0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ],
+            vec![0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             (data_len as u32).to_be_bytes().to_vec(),
             payload.to_vec(),
         ]

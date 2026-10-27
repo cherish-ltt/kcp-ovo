@@ -382,20 +382,15 @@ impl Kcp {
         // 流模式：返回所有 segment 的总大小（recv 一次性读取全部）
         // 修复 BUG-9：原实现只返回第一个 segment 大小，导致 BytesMut 分配过小
         if self.stream_mode {
-            let total_len: usize = self
-                .rcv_queue
-                .iter()
-                .map(|s| s.kcp_packet.header.len as usize)
-                .sum();
+            let total_len: usize =
+                self.rcv_queue.iter().map(|s| s.kcp_packet.header.len as usize).sum();
             return Ok(total_len);
         }
         if first.kcp_packet.header.frg == 0 {
             return Ok(first.kcp_packet.header.len as usize);
         }
         if self.nrcv_que < (first.kcp_packet.header.frg + 1) as usize {
-            return Err(KcpError::IncompleteData(
-                IncompleteDataType::PayloadWaitForFrg,
-            ));
+            return Err(KcpError::IncompleteData(IncompleteDataType::PayloadWaitForFrg));
         }
         let mut length = 0usize;
         for seg in self.rcv_queue.iter() {
@@ -466,7 +461,7 @@ impl Kcp {
                 if let Some(ref writelog) = self.writelog {
                     writelog(&format!("input ack: sn={}", header.sn), self);
                 }
-            }
+            },
             KcpCmd::Push => {
                 if self.timediff_u64(header.sn as u64, self.rcv_nxt as u64 + self.rcv_wnd as u64)
                     >= 0
@@ -483,9 +478,9 @@ impl Kcp {
                 self.parse_data(newseg);
                 self.acklist.push(header.sn);
                 self.move_rcv_buf_to_queue();
-            }
+            },
             KcpCmd::Wask => self.probe |= IKCP_ASK_TELL,
-            KcpCmd::Wins => {}
+            KcpCmd::Wins => {},
         }
 
         // 修复 BUG-7：parse_fastack 必须在 parse_una 之前调用
@@ -644,11 +639,7 @@ impl Kcp {
         // 只能等窗口探测，连接建立被拖延到探测间隔的量级。
         // 对端收到该段后会回 ACK 并携带自身 wnd，rmt_wnd 随即被填上。
         let window = self.snd_wnd.min(self.rmt_wnd.max(1));
-        let mut can_send = if self.nocwnd {
-            window
-        } else {
-            window.min(self.cwnd)
-        } as usize;
+        let mut can_send = if self.nocwnd { window } else { window.min(self.cwnd) } as usize;
         let mut lost = false;
 
         while can_send > 0 && !self.snd_queue.is_empty() {
@@ -730,13 +721,7 @@ impl Kcp {
                     ));
                 }
                 let new_rto = (seg.rto * 2).min(IKCP_RTO_MAX);
-                need_update.push((
-                    idx,
-                    seg.xmit + 1,
-                    current.wrapping_add(seg.rto),
-                    new_rto,
-                    true,
-                ));
+                need_update.push((idx, seg.xmit + 1, current.wrapping_add(seg.rto), new_rto, true));
                 sends.push((
                     seg.kcp_packet.header.frg,
                     seg.kcp_packet.header.sn,
@@ -752,13 +737,7 @@ impl Kcp {
                         "Connection lost due to too many retransmissions".to_string(),
                     ));
                 }
-                need_update.push((
-                    idx,
-                    seg.xmit + 1,
-                    current.wrapping_add(seg.rto),
-                    seg.rto,
-                    true,
-                ));
+                need_update.push((idx, seg.xmit + 1, current.wrapping_add(seg.rto), seg.rto, true));
                 sends.push((
                     seg.kcp_packet.header.frg,
                     seg.kcp_packet.header.sn,
@@ -861,11 +840,7 @@ impl Kcp {
         if (self.probe & IKCP_ASK_SEND) != 0 {
             return current;
         }
-        if self.timediff_u64(ts_flush, current) > 0 {
-            ts_flush
-        } else {
-            current
-        }
+        if self.timediff_u64(ts_flush, current) > 0 { ts_flush } else { current }
     }
 
     /// 将 rcv_buf 中有序的段（sn 连续）移入 rcv_queue，更新 rcv_nxt
@@ -917,8 +892,7 @@ mod tests {
     fn test_stream_mode_peeksize_single_segment() {
         let mut kcp = Kcp::new(1, KcpConfig::stream_mode()).unwrap();
         let h = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 1000, 1, 0, 5);
-        kcp.rcv_queue
-            .push_back(Segment::new_with_header_and_data(h, &[1, 2, 3, 4, 5]).unwrap());
+        kcp.rcv_queue.push_back(Segment::new_with_header_and_data(h, &[1, 2, 3, 4, 5]).unwrap());
         kcp.nrcv_que += 1;
         assert_eq!(kcp.peeksize().unwrap(), 5);
     }
@@ -991,10 +965,7 @@ mod tests {
     #[test]
     fn test_stream_mode_recv_empty() {
         assert_eq!(
-            Kcp::new(1, KcpConfig::stream_mode())
-                .unwrap()
-                .recv()
-                .unwrap_err(),
+            Kcp::new(1, KcpConfig::stream_mode()).unwrap().recv().unwrap_err(),
             KcpError::QueueEmpty
         );
     }
@@ -1011,7 +982,7 @@ mod tests {
     fn test_non_stream_mode_frg_limit() {
         let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
         match kcp.send(&random_bytes(kcp.mss as usize * 300)).unwrap_err() {
-            KcpError::InvalidConfig(_) => {}
+            KcpError::InvalidConfig(_) => {},
             e => panic!("expected InvalidConfig, got {:?}", e),
         }
     }
@@ -1031,21 +1002,14 @@ mod tests {
         let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
         kcp.send(&random_bytes(kcp.mss as usize * 3 + 100)).unwrap();
         assert_eq!(kcp.nsnd_que, 4);
-        let frgs: Vec<u8> = kcp
-            .snd_queue
-            .iter()
-            .map(|s| s.kcp_packet.header.frg)
-            .collect();
+        let frgs: Vec<u8> = kcp.snd_queue.iter().map(|s| s.kcp_packet.header.frg).collect();
         assert_eq!(frgs, vec![3, 2, 1, 0]);
     }
 
     #[test]
     fn test_stream_mode_peeksize_empty() {
         assert_eq!(
-            Kcp::new(1, KcpConfig::stream_mode())
-                .unwrap()
-                .peeksize()
-                .unwrap_err(),
+            Kcp::new(1, KcpConfig::stream_mode()).unwrap().peeksize().unwrap_err(),
             KcpError::QueueEmpty
         );
     }
@@ -1054,10 +1018,7 @@ mod tests {
     async fn test_stream_mode_full_cycle_small() {
         let (mut s, r) = {
             let c = KcpConfig::stream_mode();
-            (
-                Kcp::new(1, c.clone()).unwrap(),
-                Arc::new(Mutex::new(Kcp::new(1, c).unwrap())),
-            )
+            (Kcp::new(1, c.clone()).unwrap(), Arc::new(Mutex::new(Kcp::new(1, c).unwrap())))
         };
         let now = current_millis();
         s.current = now;
@@ -1079,10 +1040,7 @@ mod tests {
     async fn test_stream_mode_multi_send_reorder() {
         let (mut s, r) = {
             let c = KcpConfig::stream_mode();
-            (
-                Kcp::new(1, c.clone()).unwrap(),
-                Arc::new(Mutex::new(Kcp::new(1, c).unwrap())),
-            )
+            (Kcp::new(1, c.clone()).unwrap(), Arc::new(Mutex::new(Kcp::new(1, c).unwrap())))
         };
         let now = current_millis();
         s.current = now;
@@ -1102,10 +1060,7 @@ mod tests {
             s.current = now + i * s.interval;
             s.update(s.current).await.unwrap();
         }
-        assert_eq!(
-            r.lock().unwrap().recv().unwrap().to_vec(),
-            b"Hello Stream Mode!"
-        );
+        assert_eq!(r.lock().unwrap().recv().unwrap().to_vec(), b"Hello Stream Mode!");
     }
 
     // ===== Bug-fix regression tests =====
@@ -1158,10 +1113,7 @@ mod tests {
     async fn test_non_stream_mode_full_cycle() {
         let (mut s, r) = {
             let c = KcpConfig::fast_mode();
-            (
-                Kcp::new(1, c.clone()).unwrap(),
-                Arc::new(Mutex::new(Kcp::new(1, c).unwrap())),
-            )
+            (Kcp::new(1, c.clone()).unwrap(), Arc::new(Mutex::new(Kcp::new(1, c).unwrap())))
         };
         let now = current_millis();
         s.current = now;
@@ -1238,10 +1190,7 @@ mod tests {
             IKCP_ASK_SEND,
             "probe should remain set when ts_probe not yet elapsed"
         );
-        assert!(
-            kcp.current < kcp.ts_probe,
-            "current should be before ts_probe"
-        );
+        assert!(kcp.current < kcp.ts_probe, "current should be before ts_probe");
     }
 
     /// 两端同时新建、rmt_wnd 均为 0 时，探路段应能在首轮 update 内送达对端，
@@ -1270,10 +1219,7 @@ mod tests {
         s.send(&msg).unwrap();
         s.update(now).await.unwrap();
 
-        assert_eq!(
-            s.nsnd_buf, 1,
-            "rmt_wnd 未知时必须放行探路段，否则两端相互空等"
-        );
+        assert_eq!(s.nsnd_buf, 1, "rmt_wnd 未知时必须放行探路段，否则两端相互空等");
         assert_eq!(r.lock().unwrap().nrcv_que, 1, "探路段应已送达对端");
         assert_eq!(r.lock().unwrap().recv().unwrap().to_vec(), msg);
     }
@@ -1295,10 +1241,7 @@ mod tests {
         kcp.send(&[1, 2, 3]).unwrap();
         kcp.flush().await.unwrap();
         // After flush, seg should be moved from snd_queue to snd_buf
-        assert!(
-            kcp.nsnd_buf > 0,
-            "Data should have been sent with default config"
-        );
+        assert!(kcp.nsnd_buf > 0, "Data should have been sent with default config");
         assert_eq!(kcp.nsnd_que, 0);
     }
 
@@ -1467,11 +1410,7 @@ mod tests {
 
         // Verify: with the fix (else if), only timeout triggers, not fastack too
         // Without the fix (two ifs), this seg would appear twice in sends
-        assert_eq!(
-            sends.len(),
-            1,
-            "Segment should only be scheduled for retransmit once"
-        );
+        assert_eq!(sends.len(), 1, "Segment should only be scheduled for retransmit once");
         assert_eq!(sends[0], 0);
     }
 
@@ -1553,19 +1492,10 @@ mod tests {
     #[tokio::test]
     async fn test_no_deadlock_large_message() {
         // Use larger rcv_wnd to accommodate 219 segments (300KB / 1372)
-        let s_config = KcpConfig {
-            rcv_wnd: 256,
-            ..KcpConfig::fast_mode()
-        };
-        let r_config = KcpConfig {
-            rcv_wnd: 256,
-            ..KcpConfig::fast_mode()
-        };
+        let s_config = KcpConfig { rcv_wnd: 256, ..KcpConfig::fast_mode() };
+        let r_config = KcpConfig { rcv_wnd: 256, ..KcpConfig::fast_mode() };
         let (mut s, r) = {
-            (
-                Kcp::new(1, s_config).unwrap(),
-                Arc::new(Mutex::new(Kcp::new(1, r_config).unwrap())),
-            )
+            (Kcp::new(1, s_config).unwrap(), Arc::new(Mutex::new(Kcp::new(1, r_config).unwrap())))
         };
         let now = current_millis();
         s.current = now;

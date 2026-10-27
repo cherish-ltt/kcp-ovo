@@ -31,9 +31,7 @@ impl KcpDeque {
     /// assert!(deque.is_empty());
     /// ```
     pub fn new() -> Self {
-        Self {
-            inner: VecDeque::new(),
-        }
+        Self { inner: VecDeque::new() }
     }
 
     /// 在队尾添加元素

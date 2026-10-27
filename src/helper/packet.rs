@@ -45,16 +45,7 @@ impl KcpPacketHeader {
         una: u32,
         len: u32,
     ) -> Self {
-        Self {
-            conv,
-            cmd,
-            frg,
-            wnd,
-            ts,
-            sn,
-            una,
-            len,
-        }
+        Self { conv, cmd, frg, wnd, ts, sn, una, len }
     }
 
     /// 从字节数组解析数据包头
@@ -90,16 +81,7 @@ impl KcpPacketHeader {
         let una = data.get_u32();
         let len = data.get_u32();
 
-        let header = Self {
-            conv,
-            cmd: KcpCmd::try_from(cmd)?,
-            frg,
-            wnd,
-            ts,
-            sn,
-            una,
-            len,
-        };
+        let header = Self { conv, cmd: KcpCmd::try_from(cmd)?, frg, wnd, ts, sn, una, len };
 
         Ok((header, Bytes::copy_from_slice(data)))
     }
@@ -138,10 +120,7 @@ pub struct KcpPacket {
 impl KcpPacket {
     #[inline]
     pub fn new_without_data(header: KcpPacketHeader) -> Self {
-        Self {
-            header,
-            data: Bytes::new(),
-        }
+        Self { header, data: Bytes::new() }
     }
 
     #[inline]
@@ -156,10 +135,7 @@ impl KcpPacket {
             return Err(KcpError::IncompleteData(IncompleteDataType::Payload));
         }
 
-        Ok(Self {
-            header,
-            data: Bytes::copy_from_slice(data),
-        })
+        Ok(Self { header, data: Bytes::copy_from_slice(data) })
     }
 
     /// 从字节数组解析完整数据包
@@ -171,10 +147,7 @@ impl KcpPacket {
             return Err(KcpError::IncompleteData(IncompleteDataType::Payload));
         }
 
-        Ok(Self {
-            header,
-            data: Bytes::copy_from_slice(&payload[..header.len as usize]),
-        })
+        Ok(Self { header, data: Bytes::copy_from_slice(&payload[..header.len as usize]) })
     }
 
     /// 编码完整数据包到字节数组
@@ -256,10 +229,7 @@ impl PacketBuilder {
 
     /// 构建数据包
     pub fn build(self) -> KcpPacket {
-        KcpPacket {
-            header: self.header,
-            data: self.data,
-        }
+        KcpPacket { header: self.header, data: self.data }
     }
 }
 

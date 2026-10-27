@@ -33,13 +33,8 @@ use rand::{RngExt, SeedableRng};
 ///
 /// 注意 80% 档无法靠缩小数据量把时长压下来：即使只传 1 字节也需要约 11 秒，
 /// 这是该丢包率下重传退避决定的固定下限，属于协议行为的真实反映。
-const SCENARIOS: [(f64, usize); 5] = [
-    (0.0, 320 * 1024),
-    (0.2, 12 * 1024),
-    (0.4, 2 * 1024),
-    (0.6, 160),
-    (0.8, 32),
-];
+const SCENARIOS: [(f64, usize); 5] =
+    [(0.0, 320 * 1024), (0.2, 12 * 1024), (0.4, 2 * 1024), (0.6, 160), (0.8, 32)];
 /// 单次迭代允许推进的最大虚拟毫秒数，防止极端丢包下无限循环。
 const MAX_VIRTUAL_MS: u64 = 60_000;
 /// 时钟步进，与 `KcpConfig::fast_mode()` 的 interval 同量级。
@@ -56,11 +51,7 @@ struct Link {
 
 impl Link {
     fn new(loss: f64, seed: u64) -> Self {
-        Self {
-            loss,
-            rng: StdRng::seed_from_u64(seed),
-            inflight: VecDeque::new(),
-        }
+        Self { loss, rng: StdRng::seed_from_u64(seed), inflight: VecDeque::new() }
     }
 
     fn admit(&mut self, packets: &Arc<Mutex<VecDeque<Bytes>>>) {
@@ -147,9 +138,7 @@ async fn transfer_once(loss: f64, seed: u64, payload: usize) -> u64 {
 }
 
 fn bench_kcp_transfer(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("build tokio runtime");
+    let rt = tokio::runtime::Builder::new_current_thread().build().expect("build tokio runtime");
 
     let mut group = c.benchmark_group("kcp_transfer");
     group.sample_size(20);

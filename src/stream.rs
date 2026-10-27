@@ -55,10 +55,7 @@ pub struct StreamConfig {
 
 impl Default for StreamConfig {
     fn default() -> Self {
-        Self {
-            update_interval: Duration::from_millis(10),
-            connect_timeout: Duration::from_secs(5),
-        }
+        Self { update_interval: Duration::from_millis(10), connect_timeout: Duration::from_secs(5) }
     }
 }
 
@@ -334,9 +331,7 @@ impl KcpListener {
         addr: A,
         config: StreamConfig,
     ) -> KcpResult<Self> {
-        let socket = UdpSocket::bind(addr)
-            .await
-            .map_err(|e| KcpError::IoError(e.to_string()))?;
+        let socket = UdpSocket::bind(addr).await.map_err(|e| KcpError::IoError(e.to_string()))?;
 
         let clients: Arc<DashMap<SocketAddr, Clinet>> = Arc::new(DashMap::new());
         let clients_clone = clients.clone();
@@ -466,12 +461,7 @@ impl KcpListener {
             }
         });
 
-        Ok(Self {
-            clients,
-            main_handle,
-            recv_rx,
-            config,
-        })
+        Ok(Self { clients, main_handle, recv_rx, config })
     }
 
     /// 关闭监听器
@@ -488,7 +478,7 @@ impl KcpListener {
                     .send(data.to_vec())
                     .await
                     .map_err(|e| KcpError::IoError(format!("listener send_to err: {}", e)))?;
-            }
+            },
             None => return Err(KcpError::IoError("listener send_to err: None".to_string())),
         }
         Ok(())

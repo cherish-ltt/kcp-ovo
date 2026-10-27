@@ -14,10 +14,7 @@ use std::{
 /// 返回从UNIX纪元开始的毫秒数
 #[inline]
 pub fn current_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
 static CONV_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -28,10 +25,7 @@ static CONV_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// 返回一个基于当前时间戳的唯一u32值
 #[inline]
 pub fn generate_conv() -> u32 {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u32;
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u32;
     let seq = CONV_COUNTER.fetch_add(1, Ordering::Relaxed);
     timestamp.wrapping_add(seq) // 混合时间与序列
 }
