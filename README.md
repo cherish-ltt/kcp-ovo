@@ -63,7 +63,7 @@
 
 ```toml
 [dependencies]
-kcp-ovo = "0.3"
+kcp-ovo = "0.4"
 ```
 
 ### Stream API（推荐）
@@ -320,13 +320,13 @@ src/
 
 ```toml
 # 默认配置（包含Stream API）
-kcp-ovo = "0.3"
+kcp-ovo = "0.4"
 
 # 仅使用底层API
-kcp-ovo = { version = "0.3", default-features = false }
+kcp-ovo = { version = "0.4", default-features = false }
 
 # 显式启用Stream API
-kcp-ovo = { version = "0.3", features = ["stream"] }
+kcp-ovo = { version = "0.4", features = ["stream"] }
 ```
 
 ## 🧪 测试
