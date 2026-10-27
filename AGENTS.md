@@ -504,3 +504,22 @@ panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-2
   缺陷的编号、成因、修复位置与回归用例统一登记在 10.3 节的缺陷台账里，
   代码中只保留与缺陷无关、但当前仍然成立的约束说明。
 - 测试用例的文档注释描述**被验证的行为**，而不是它修复了哪个缺陷。
+
+### 10.5 发布流程
+
+推送 `v*` 标签即触发发布，三个环节严格串行，前一个失败则后一个不执行：
+
+```
+ci 校验  →  GitHub Release  →  cargo publish
+```
+
+1. **ci 校验**（`release.yml` 的 `verify` job）：在标签提交上跑格式、lint 与全量测试，
+   不通过则不创建 Release，也不会发布到 crates.io。
+2. **GitHub Release**：内容读取 `.version/RELEASE-<tag>.md`（也接受 `.version/<tag>.md`）。
+   文件缺失或为空时写入默认提示，引导用 `git log` 确认变动，不阻断发布。
+3. **cargo publish**（`cargo-publish.yml`）：由 Release 成功完成事件触发，
+   检出该标签提交发布，使用 crates.io 的 OIDC 可信发布，无需长期令牌。
+
+发布新版本时按顺序做三件事：改 `Cargo.toml` 与 `Cargo.lock` 的版本号、
+补 `.version/RELEASE-<tag>.md`、打标签并推送。版本说明面向使用者，
+写「变了什么、需要注意什么」，不复述提交清单。

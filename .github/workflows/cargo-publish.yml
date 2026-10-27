@@ -1,21 +1,31 @@
 name: Publish to crates.io
 
+# 触发：Release 工作流成功结束后（即 ci 校验与 GitHub Release 均已完成）
+# 行为：检出该标签对应的提交并发布到 crates.io，保证发布顺序为
+#       ci → release → cargo publish。
 on:
-  push:
-    tags:        # 推荐：当推送标签时触发，如 v1.0.0
-      - 'v*'
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 jobs:
   publish:
+    # Release 失败（含标签提交未通过校验）时不发布
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
     runs-on: ubuntu-latest
     # 可选但强烈推荐，需要与你在crates.io上设置的Environment名称完全一致
     environment: release
 
     permissions:
       id-token: write  # 必须：用于请求OIDC令牌
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: dtolnay/rust-toolchain@1.99.1
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth

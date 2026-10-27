@@ -1,0 +1,92 @@
+# 发布 GitHub Release
+#
+# 触发：推送 v* 标签时（如 v0.4.0）
+# 行为：先在标签提交上跑一遍格式、lint 与测试，全绿后才创建 Release；
+#       Release 内容读取 .version/RELEASE-<tag>.md，
+#       若未找到对应版本说明文件，则写入默认提示，引导查看 git commit 确认变动。
+#
+# 流水线顺序：verify（ci 校验）→ release → cargo-publish。
+# Release 成功结束后，cargo-publish 才会被触发。
+#
+# 版本说明文件命名约定：.version/RELEASE-v0.4.0.md（与 tag 同名）
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: 校验标签提交
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+          components: rustfmt, clippy
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: 静态分析
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: 运行测试
+        run: cargo test --workspace --all-features
+
+  release:
+    name: 创建 GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      # 读取本 tag 对应的版本说明；不存在或为空时写默认提示。
+      - name: 准备 release 说明
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          FILE=".version/RELEASE-${TAG}.md"
+          # 也接受 .version/<tag>.md 这种简写命名
+          [ -s "$FILE" ] || FILE=".version/${TAG}.md"
+          BODY_TMP="/tmp/release-body.md"
+
+          if [ -s "$FILE" ]; then
+            cp "$FILE" "$BODY_TMP"
+            echo "已读取版本说明: $FILE"
+          else
+            sed "s|__TAG__|${TAG}|g" > "$BODY_TMP" <<'EOF'
+          > [!WARNING]
+          > 本版本 `__TAG__` 未找到对应的版本说明文件（`.version/RELEASE-__TAG__.md`）。
+          >
+          > 请通过 git commit 记录确认本次发布的改动内容，例如：
+          >
+          > ```bash
+          > git log --oneline "<上一个标签>"..__TAG__
+          > ```
+          >
+          > 建议在 `.version/RELEASE-__TAG__.md` 中补充完整的 release 说明，release 会自动读取该文件。
+          EOF
+            echo "未找到版本说明 $FILE，已写入默认提示"
+          fi
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: /tmp/release-body.md
