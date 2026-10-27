@@ -62,6 +62,18 @@ name = "retransmit"
 path = "tests/retransmit.rs"
 
 [[test]]
+name = "multiclient"
+path = "tests/multiclient.rs"
+
+[[test]]
+name = "outage"
+path = "tests/outage.rs"
+
+[[test]]
+name = "soak"
+path = "tests/soak.rs"
+
+[[test]]
 name = "timing"
 path = "tests/timing.rs"
 

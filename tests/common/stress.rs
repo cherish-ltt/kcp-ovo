@@ -199,6 +199,7 @@ pub fn random_net(rng: &mut super::Rng) -> Net {
         jitter: rng.next_u64() % 6,
         reorder: (rng.next_u64() % 20) as f64 / 100.0,
         duplicate: (rng.next_u64() % 15) as f64 / 100.0,
+        blackout: None,
     }
 }
 

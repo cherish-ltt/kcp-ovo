@@ -81,11 +81,14 @@ pub struct Net {
     pub reorder: f64,
     /// 触发一次重复投递的概率
     pub duplicate: f64,
+    /// 断网窗口 `(起点, 长度)`：窗口内两个方向的包全部丢弃。
+    /// 用来模拟真实网络中的黑洞期（切换基站、链路闪断等）。
+    pub blackout: Option<(u64, u64)>,
 }
 
 impl Default for Net {
     fn default() -> Self {
-        Self { loss: 0.0, delay: 10, jitter: 0, reorder: 0.0, duplicate: 0.0 }
+        Self { loss: 0.0, delay: 10, jitter: 0, reorder: 0.0, duplicate: 0.0, blackout: None }
     }
 }
 
@@ -108,6 +111,16 @@ impl Net {
         self.reorder = reorder;
         self.duplicate = duplicate;
         self
+    }
+
+    /// 从 `start` 毫秒起断网 `len` 毫秒
+    pub fn with_blackout(mut self, start: u64, len: u64) -> Self {
+        self.blackout = Some((start, len));
+        self
+    }
+
+    fn in_blackout(&self, now: u64) -> bool {
+        matches!(self.blackout, Some((start, len)) if now >= start && now < start + len)
     }
 }
 
@@ -199,6 +212,11 @@ impl Sim {
         let reorder = self.net.reorder;
         let now = self.now;
 
+        // 黑洞期内整批丢弃，且不消耗随机数，保证其它参数的复现性不受影响
+        if self.net.in_blackout(now) {
+            return;
+        }
+
         let mut accepted: Vec<InFlight> = Vec::new();
         for packet in batch {
             if self.rng.chance(loss) {
@@ -224,6 +242,13 @@ impl Sim {
     fn route(&mut self) -> usize {
         let now = self.now;
         let mut delivered = 0;
+
+        // 黑洞期内已在途的包也一并丢弃，模拟真实的链路闪断
+        if self.net.in_blackout(now) {
+            self.a_to_b.clear();
+            self.b_to_a.clear();
+            return 0;
+        }
 
         let mut ready = Vec::new();
         let mut keep = VecDeque::new();
