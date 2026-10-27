@@ -1,0 +1,13 @@
+edition = "2024"
+style_edition = "2024"
+max_width = 100
+use_small_heuristics = "Max"
+tab_spaces = 4
+reorder_imports = true
+reorder_modules = true
+newline_style = "Auto"
+match_block_trailing_comma = true
+merge_derives = false
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"
+use_field_init_shorthand = true

@@ -34,8 +34,8 @@ name = "kcp_ovo"
 path = "src/lib.rs"
 
 [[bench]]
-name = "bench-300ms"
-path = "benches/bench-300ms.rs"
+name = "kcp-transfer"
+path = "benches/kcp-transfer.rs"
 harness = false
 
 [[example]]
@@ -65,6 +65,7 @@ tokio-test = "0.4.5"
 
 [dev-dependencies.criterion]
 version = "0.8.2"
+features = ["async_tokio"]
 
 [dev-dependencies.proptest]
 version = "1.11.0"
