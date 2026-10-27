@@ -90,6 +90,10 @@ name = "malformed"
 path = "tests/malformed.rs"
 
 [[test]]
+name = "congestion"
+path = "tests/congestion.rs"
+
+[[test]]
 name = "fuzz_transfer"
 path = "tests/fuzz_transfer.rs"
 
