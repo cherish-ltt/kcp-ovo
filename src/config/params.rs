@@ -101,6 +101,36 @@ impl KcpConfig {
         Self::default()
     }
 
+    /// 快速模式并指定发送/接收窗口的段数
+    ///
+    /// `fast_mode()` 的其余参数（nodelay、interval=20、fastresend=2、nocwnd）保持不变。
+    ///
+    /// 之所以需要这个函数：`nocwnd=true` 时发送量只受 `snd_wnd.min(rmt_wnd)` 限制，
+    /// 拥塞窗口不再参与调节，`fast_mode()` 默认的 32 段就成了吞吐的硬上限。
+    /// 需要在单连接上跑满带宽时应显式放大窗口。
+    ///
+    /// 窗口按段数计，单段载荷约 `mtu - OVERHEAD`（默认 1372 字节），
+    /// 因此 `snd_wnd=512` 约对应 700KB 的在途数据。
+    ///
+    /// # 参数
+    ///
+    /// - `snd_wnd`: 发送窗口段数，须大于 0
+    /// - `rcv_wnd`: 接收窗口段数，须不小于 `snd_wnd` 才能让对方窗口通告不成为瓶颈
+    ///
+    /// # 示例
+    ///
+    /// ```
+    /// use kcp_ovo::config::KcpConfig;
+    ///
+    /// let config = KcpConfig::fast_mode_with_wnd(512, 512);
+    /// assert_eq!(config.snd_wnd, 512);
+    /// assert_eq!(config.rcv_wnd, 512);
+    /// assert!(config.nocwnd);
+    /// ```
+    pub fn fast_mode_with_wnd(snd_wnd: u16, rcv_wnd: u16) -> Self {
+        Self { snd_wnd, rcv_wnd, ..Self::fast_mode() }
+    }
+
     /// 流模式（无消息边界，无 255 分片限制）
     ///
     /// 流模式下：
@@ -152,6 +182,20 @@ mod tests {
         assert!(c.stream_mode && c.nodelay && c.nocwnd);
         assert_eq!(c.interval, 20);
         assert_eq!(c.fastresend, 2);
+    }
+
+    #[test]
+    fn test_fast_mode_with_wnd() {
+        let c = KcpConfig::fast_mode_with_wnd(512, 512);
+        assert_eq!(c.snd_wnd, 512);
+        assert_eq!(c.rcv_wnd, 512);
+        assert!(c.nodelay && c.nocwnd && !c.stream_mode);
+        assert_eq!(c.interval, 20);
+        assert_eq!(c.fastresend, 2);
+
+        let big = KcpConfig::fast_mode_with_wnd(1024, 2048);
+        assert_eq!(big.snd_wnd, 1024);
+        assert_eq!(big.rcv_wnd, 2048);
     }
 
     #[test]
