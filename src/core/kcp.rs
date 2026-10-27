@@ -13,8 +13,8 @@ use crate::config::KcpConfig;
 use crate::error::{IncompleteDataType, KcpError, KcpResult};
 use crate::helper::{
     IKCP_ASK_SEND, IKCP_ASK_TELL, IKCP_DEADLINK, IKCP_FASTACK_LIMIT, IKCP_OVERHEAD,
-    IKCP_PROBE_INIT, IKCP_PROBE_LIMIT, IKCP_RTO_DEF, IKCP_RTO_MAX, IKCP_RTO_MIN, IKCP_THRESH_INIT,
-    IKCP_THRESH_MIN, KcpPacket, KcpPacketHeader, current_millis,
+    IKCP_PROBE_LIMIT, IKCP_RTO_DEF, IKCP_RTO_MAX, IKCP_RTO_MIN, IKCP_THRESH_INIT, IKCP_THRESH_MIN,
+    KcpPacket, KcpPacketHeader, current_millis,
 };
 use crate::queue::{KcpDeque, Segment};
 
@@ -639,7 +639,11 @@ impl Kcp {
 
     /// 刷新发送缓冲区：将 snd_queue 移入 snd_buf，发送数据段、ACK、窗口探测
     async fn flush(&mut self) -> KcpResult<()> {
-        let window = self.snd_wnd.min(self.rmt_wnd);
+        // rmt_wnd 未知（尚未收到对端任何包）时放行 1 个包探路：
+        // 两端同时新建连接时都把 rmt_wnd 视为 0，若严格按 0 计算窗口则双方都发不出首包，
+        // 只能等窗口探测，连接建立被拖延到探测间隔的量级。
+        // 对端收到该段后会回 ACK 并携带自身 wnd，rmt_wnd 随即被填上。
+        let window = self.snd_wnd.min(self.rmt_wnd.max(1));
         let mut can_send = if self.nocwnd {
             window
         } else {
@@ -690,11 +694,14 @@ impl Kcp {
         if self.rmt_wnd == 0 && (self.probe & IKCP_ASK_SEND) == 0 {
             self.probe |= IKCP_ASK_SEND;
             if self.probe_wait == 0 {
-                self.probe_wait = IKCP_PROBE_INIT;
+                // 首次探测不等待：对端的窗口通告是打开发送窗口的前提，
+                // 初始退避若取 IKCP_PROBE_INIT(7s)，两端都未收到对端包时会互相空等 7 秒。
+                self.probe_wait = self.interval.max(1);
+                self.ts_probe = self.current;
             } else {
                 self.probe_wait = (self.probe_wait * 2).min(IKCP_PROBE_LIMIT);
+                self.ts_probe = self.current + self.probe_wait;
             }
-            self.ts_probe = self.current + self.probe_wait;
         }
 
         let current = self.current;
@@ -1194,35 +1201,36 @@ mod tests {
         // Dummy output so send_packet doesn't fail
         kcp.set_output(move |data| Box::pin(async move { Ok(data.len()) }));
 
-        // 1st flush: probe_wait initialized to IKCP_PROBE_INIT
+        // 1st flush: 首次探测不等待，退避初值取 interval
         kcp.flush().await.unwrap();
         assert_eq!(
             kcp.probe & IKCP_ASK_SEND,
             IKCP_ASK_SEND,
             "ASK_SEND should be set after first flush with rmt_wnd=0"
         );
-        assert_eq!(kcp.probe_wait, IKCP_PROBE_INIT);
-        assert_eq!(kcp.ts_probe, now + IKCP_PROBE_INIT);
+        let first_wait = kcp.interval.max(1);
+        assert_eq!(kcp.probe_wait, first_wait);
+        assert_eq!(kcp.ts_probe, now, "首次探测应当即到期");
 
         // Simulate Wask was sent (probe cleared) and advance time past ts_probe
         kcp.probe &= !IKCP_ASK_SEND;
-        kcp.current = now + IKCP_PROBE_INIT;
+        kcp.current = now + first_wait;
 
         // 2nd flush: probe_wait should double
         kcp.flush().await.unwrap();
-        assert_eq!(kcp.probe_wait, IKCP_PROBE_INIT * 2);
-        assert_eq!(kcp.ts_probe, kcp.current + IKCP_PROBE_INIT * 2);
+        assert_eq!(kcp.probe_wait, first_wait * 2);
+        assert_eq!(kcp.ts_probe, kcp.current + first_wait * 2);
 
         // 3rd flush: probe_wait doubles again
         kcp.probe &= !IKCP_ASK_SEND;
-        kcp.current = now + IKCP_PROBE_INIT * 3;
+        kcp.current = now + first_wait * 3;
         kcp.flush().await.unwrap();
-        assert_eq!(kcp.probe_wait, IKCP_PROBE_INIT * 4);
-        assert_eq!(kcp.ts_probe, kcp.current + IKCP_PROBE_INIT * 4);
+        assert_eq!(kcp.probe_wait, first_wait * 4);
+        assert_eq!(kcp.ts_probe, kcp.current + first_wait * 4);
 
         // Advance time but NOT enough for the new ts_probe
         kcp.probe &= !IKCP_ASK_SEND;
-        kcp.current = now + IKCP_PROBE_INIT * 4 + 10;
+        kcp.current = now + first_wait * 4 + 1;
         kcp.flush().await.unwrap();
         // need_wask should be false (ts_probe hasn't elapsed), so probe stays set
         assert_eq!(
@@ -1234,6 +1242,40 @@ mod tests {
             kcp.current < kcp.ts_probe,
             "current should be before ts_probe"
         );
+    }
+
+    /// 两端同时新建、rmt_wnd 均为 0 时，探路段应能在首轮 update 内送达对端，
+    /// 而不需要等窗口探测间隔。
+    #[tokio::test]
+    async fn test_connect_without_prior_peer_packet() {
+        let c = KcpConfig::fast_mode();
+        let mut s = Kcp::new(7, c.clone()).unwrap();
+        let r = Arc::new(Mutex::new(Kcp::new(7, c).unwrap()));
+        let now = current_millis();
+        s.current = now;
+        r.lock().unwrap().current = now;
+
+        // 两端初始都不知道对端窗口
+        assert_eq!(s.rmt_wnd, 0);
+        assert_eq!(r.lock().unwrap().rmt_wnd, 0);
+
+        // 发送端发出的包直接投递给接收端
+        let r2 = r.clone();
+        s.set_output(move |d| {
+            r2.lock().unwrap().input(&d).ok();
+            Box::pin(async move { Ok(d.len()) })
+        });
+
+        let msg = random_bytes(1000);
+        s.send(&msg).unwrap();
+        s.update(now).await.unwrap();
+
+        assert_eq!(
+            s.nsnd_buf, 1,
+            "rmt_wnd 未知时必须放行探路段，否则两端相互空等"
+        );
+        assert_eq!(r.lock().unwrap().nrcv_que, 1, "探路段应已送达对端");
+        assert_eq!(r.lock().unwrap().recv().unwrap().to_vec(), msg);
     }
 
     // ===== BUG-1: cwnd init =====
