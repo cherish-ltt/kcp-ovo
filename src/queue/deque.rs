@@ -172,8 +172,7 @@ impl KcpDeque {
 
     /// 保留满足条件的元素，移除不满足的
     ///
-    /// 供 BUG-8 使用：替代 parse_ack 中原 O(n) 弹出-重新压入模式，
-    /// 提供原地过滤能力，避免每次 ACK 处理都产生临时 Vec 分配。
+    /// 原地过滤，避免为每次调用分配临时 Vec。
     pub fn retain<F>(&mut self, f: F)
     where
         F: FnMut(&Segment) -> bool,

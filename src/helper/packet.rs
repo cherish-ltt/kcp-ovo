@@ -259,10 +259,8 @@ mod tests {
         assert_eq!(0, data.len());
     }
 
-    // TODO: 修复packet测试 - len字段编码问题
     #[test]
     fn test_packet_with_data() {
-        // 简化测试 - 只测试无数据的情况
         let packet = KcpPacket {
             header: KcpPacketHeader {
                 conv: 0x11223344,

@@ -2,14 +2,11 @@
 //!
 //! 前面所有用例只断言「数据是否完整送达」。这在拥塞控制失效时是盲区：
 //! `cwnd` 卡在 1 只会让传输变慢，内容依然正确，用例照样通过。
-//! 本文件专门断言**窗口的增长节奏与吞吐特征**，用于回归以下缺陷：
+//! 本文件专门断言**窗口的增长节奏与吞吐特征**，覆盖三类典型退化：
 //!
-//! - BUG-12：`ts_lastack` 从未被写入，`current >= ts_lastack` 恒真，
-//!   「每个 ACK 周期最多增长一次」的门限失效，`cwnd` 每轮 flush 都涨。
-//! - BUG-13：`ssthresh` 初值与 `cwnd` 初值同为 2，`cwnd < ssthresh` 永远不成立，
-//!   慢启动被整段跳过，`normal` 模式 `cwnd` 长期卡在 1。
-//! - BUG-14：`fastresend == 0`（`normal_mode` 默认值）时
-//!   `fastack >= 0` 恒真，每轮都判定丢包，`cwnd` 被反复砸回 1。
+//! - 确认时刻未推进，「每个 ACK 周期最多增长一次」的门限失效，`cwnd` 每轮都涨
+//! - `ssthresh` 初值不高于 `cwnd` 初值，`cwnd < ssthresh` 永不成立，慢启动被整段跳过
+//! - `fastresend == 0`（`normal_mode` 默认值）时误把阈值当 0，每轮都判定丢包
 
 mod common;
 
@@ -35,7 +32,7 @@ async fn cwnd_after_each_round(sim: &mut Sim, segments: usize) -> Vec<u16> {
     samples
 }
 
-/// 干净链路下 cwnd 必须持续增长，不能卡住（BUG-13 回归）
+/// 干净链路下 cwnd 必须持续增长，不能卡住
 #[tokio::test]
 async fn cwnd_grows_on_clean_link() {
     for (name, cfg) in [
@@ -49,7 +46,7 @@ async fn cwnd_grows_on_clean_link() {
         let end = *samples.last().unwrap();
         // 干净链路上没有任何丢包，cwnd 必须稳步爬升而不是卡在低位。
         // 只断言 `end > start` 太宽松：cwnd 从 1 涨到 2 也满足，
-        // 而 BUG-13 的症状恰恰是长期卡在 1~2 之间，会被漏掉。
+        // 而 cwnd 长期卡在 1~2 之间的退化会被漏掉。
         assert!(
             end >= start + 5,
             "{name} 模式 cwnd 增长过慢：起始 {start}，10 轮后 {end}，样本 {samples:?}"
@@ -75,7 +72,7 @@ async fn slow_start_increments_each_round() {
     }
 }
 
-/// 慢启动阈值初值必须高于 cwnd 初值，否则慢启动分支永不进入（BUG-13 回归）
+/// 慢启动阈值初值必须高于 cwnd 初值，否则慢启动分支永不进入
 #[tokio::test]
 async fn ssthresh_init_allows_slow_start() {
     let kcp = Kcp::new(1, KcpConfig::normal_mode()).unwrap();
@@ -87,7 +84,7 @@ async fn ssthresh_init_allows_slow_start() {
     );
 }
 
-/// fastresend=0 必须关闭快速重传，不能每轮都误判丢包（BUG-14 回归）
+/// fastresend=0 必须关闭快速重传，不能每轮都误判丢包
 #[tokio::test]
 async fn fastresend_zero_disables_fast_retransmit() {
     let cfg = KcpConfig {
@@ -143,7 +140,7 @@ async fn loss_halves_ssthresh_and_resets_cwnd() {
     assert!(observed_shrink, "30% 丢包下 cwnd 从未收缩，拥塞控制未生效");
 }
 
-/// 每个 ACK 周期最多让 cwnd 增长一次（BUG-12 回归）
+/// 每个 ACK 周期最多让 cwnd 增长一次
 ///
 /// 同一时刻连续投递多个重复 ACK，cwnd 的增量不应与 ACK 数量成正比。
 #[tokio::test]
