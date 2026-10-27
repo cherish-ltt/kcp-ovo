@@ -1,7 +1,7 @@
 //! 300ms 固定窗口吞吐基准
 //!
 //! 度量两种口径：
-//! - `cold`：从新建 Kcp 就开始计时，300ms 内送达字节数（含握手与窗口探测开销）
+//! - `cold`：从新建 Kcp 就开始计时，300ms 内送达字节数（含建立连接的开销）
 //! - `warm`：先由应用层补一个窗口通告包打开 rmt_wnd，再开始计时（稳态吞吐）
 //!
 //! 实现要点：
@@ -11,8 +11,8 @@
 //! - 每个丢包率跑 `ROUNDS` 轮，各轮换种子，取中位数以压制调度噪声
 //! - 附带 50/100/200/300ms 曲线与全部送达耗时，便于观察优化前后的形状变化
 //!
-//! 注意：当前实现两端在 rmt_wnd=0 时都不发包，都要等 IKCP_PROBE_INIT(7s) 的窗口探测，
-//! 因此 `cold` 在 300ms 内几乎必然为 0，这是协议行为而不是 bench 误差。
+//! `cold` 与 `warm` 的差距即为建立连接的成本：两端 rmt_wnd 均未知时，
+//! 实现会放行一个探路段并立即触发窗口探测，因此冷启动也应能在首轮送达数据。
 //!
 //! 运行：
 //! ```bash
@@ -173,9 +173,8 @@ async fn run(cfg: &KcpConfig, total: usize, loss: f64, seed: u64, warm: bool) ->
     let base_ms = current_millis();
     let now = base_ms;
 
-    // 预热：当前实现里两端在 rmt_wnd=0 时都不发包，都在等 IKCP_PROBE_INIT(7s) 的窗口探测，
-    // 不存在任何一方主动送出的首包。这里由应用层补一个 Wins 包通告接收端窗口，
-    // 把发送端的 rmt_wnd 打开，之后再计时得到的才是稳态吞吐，而不是协议在死等。
+    // 预热：由应用层补一个 Wins 包通告接收端窗口，把发送端的 rmt_wnd 直接打开，
+    // 跳过建立连接阶段，计时得到的是稳态吞吐。用于与 cold 对照，量化连接建立的成本。
     let mut warmed = false;
     if warm {
         let wins = KcpPacket::new_without_data(KcpPacketHeader::new(
