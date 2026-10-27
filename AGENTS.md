@@ -517,8 +517,10 @@ ci 校验  →  GitHub Release  →  cargo publish
    不通过则不创建 Release，也不会发布到 crates.io。
 2. **GitHub Release**：内容读取 `.version/RELEASE-<tag>.md`（也接受 `.version/<tag>.md`）。
    文件缺失或为空时写入默认提示，引导用 `git log` 确认变动，不阻断发布。
-3. **cargo publish**（`cargo-publish.yml`）：由 Release 成功完成事件触发，
-   检出该标签提交发布，使用 crates.io 的 OIDC 可信发布，无需长期令牌。
+3. **cargo publish**（`cargo-publish.yml`）：由 GitHub Release 发布事件
+   （`release: published`）触发，检出该标签提交发布，使用 crates.io 的 OIDC 可信发布，
+   无需长期令牌。crates.io 拒绝 `workflow_run` 触发的可信发布，串接只能用
+   `push` / `release` / `workflow_dispatch` 这三类事件。
 
 发布新版本时按顺序做三件事：改 `Cargo.toml` 与 `Cargo.lock` 的版本号、
 补 `.version/RELEASE-<tag>.md`、打标签并推送。版本说明面向使用者，
