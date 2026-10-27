@@ -109,6 +109,10 @@ path = "tests/property.rs"
 name = "torture"
 path = "tests/torture.rs"
 
+[[test]]
+name = "udp_chaos"
+path = "tests/udp_chaos.rs"
+
 [[bench]]
 name = "kcp-transfer"
 path = "benches/kcp-transfer.rs"
