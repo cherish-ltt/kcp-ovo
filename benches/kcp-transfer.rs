@@ -26,6 +26,15 @@ use kcp_ovo::core::kcp::Kcp;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
+/// bench 使用的发送窗口段数。
+///
+/// `nocwnd=true` 时不走拥塞窗口，发送量只受窗口限制，因此这里必须显式放大，
+/// 否则测到的是窗口上限而不是协议能力。取 512 是因为实测该值已到达吞吐饱和点：
+/// 256 段 8.3 MiB/s、512 段 16.0 MiB/s、1024 段 16.6 MiB/s、2048 段同为 16.6 MiB/s。
+const BENCH_SND_WND: u16 = 512;
+/// 接收窗口需不小于发送窗口，否则对方的窗口通告会先成为瓶颈。
+const BENCH_RCV_WND: u16 = 512;
+
 /// 各档丢包率对应的单次传输数据量（丢包率, 字节数）。
 ///
 /// 数据量按实测标定，使各组的单次虚拟时长落在数百毫秒到一秒量级，
@@ -34,7 +43,7 @@ use rand::{RngExt, SeedableRng};
 /// 注意 80% 档无法靠缩小数据量把时长压下来：即使只传 1 字节也需要约 11 秒，
 /// 这是该丢包率下重传退避决定的固定下限，属于协议行为的真实反映。
 const SCENARIOS: [(f64, usize); 5] =
-    [(0.0, 320 * 1024), (0.2, 12 * 1024), (0.4, 2 * 1024), (0.6, 160), (0.8, 32)];
+    [(0.0, 4 * 1024 * 1024), (0.2, 12 * 1024), (0.4, 2 * 1024), (0.6, 160), (0.8, 32)];
 /// 单次迭代允许推进的最大虚拟毫秒数，防止极端丢包下无限循环。
 const MAX_VIRTUAL_MS: u64 = 60_000;
 /// 时钟步进，与 `KcpConfig::fast_mode()` 的 interval 同量级。
@@ -76,7 +85,7 @@ impl Link {
 /// 返回虚拟时间而不是真实耗时，评判交给 criterion 的统计；
 /// 一轮的结果用于防止极端丢包下跑不完。
 async fn transfer_once(loss: f64, seed: u64, payload: usize) -> u64 {
-    let cfg = KcpConfig::fast_mode();
+    let cfg = KcpConfig::fast_mode_with_wnd(BENCH_SND_WND, BENCH_RCV_WND);
     let mut sender = Kcp::new(CONV, cfg.clone()).unwrap();
     let mut receiver = Kcp::new(CONV, cfg.clone()).unwrap();
 
