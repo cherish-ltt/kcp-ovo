@@ -68,6 +68,28 @@ impl Rng {
     }
 }
 
+/// 突发丢包模型（Gilbert-Elliott 化简形式）
+///
+/// 真实无线链路的丢包是成簇的：进隧道、弱信号、切换基站时连续几十个包一起丢。
+/// 独立同分布丢包永远造不出「连续一段全丢」的时序，也就测不到 RTO 退避、
+/// 窗口收缩与补发的真实交互。
+#[derive(Clone, Copy)]
+pub struct Burst {
+    /// 每个包从好状态迁入坏状态的概率
+    pub enter: f64,
+    /// 每个包从坏状态迁回好状态的概率
+    pub leave: f64,
+}
+
+/// 延迟尖刺：少量包被额外拖延，模拟队列堆积、重传定时器抖动
+#[derive(Clone, Copy)]
+pub struct Spike {
+    /// 单个包命中尖刺的概率
+    pub prob: f64,
+    /// 额外延迟（毫秒）
+    pub extra: u64,
+}
+
 /// 虚拟网络参数
 #[derive(Clone)]
 pub struct Net {
@@ -84,11 +106,27 @@ pub struct Net {
     /// 断网窗口 `(起点, 长度)`：窗口内两个方向的包全部丢弃。
     /// 用来模拟真实网络中的黑洞期（切换基站、链路闪断等）。
     pub blackout: Option<(u64, u64)>,
+    /// 成簇丢包模型（`None` 为按 `loss` 独立丢包）
+    pub burst: Option<Burst>,
+    /// 延迟尖刺（`None` 为无尖刺）
+    pub spike: Option<Spike>,
+    /// 路径 MTU：超过该字节数的包被链路丢弃，模拟隧道/中间设备的 PMTU 黑洞
+    pub path_mtu: Option<usize>,
 }
 
 impl Default for Net {
     fn default() -> Self {
-        Self { loss: 0.0, delay: 10, jitter: 0, reorder: 0.0, duplicate: 0.0, blackout: None }
+        Self {
+            loss: 0.0,
+            delay: 10,
+            jitter: 0,
+            reorder: 0.0,
+            duplicate: 0.0,
+            blackout: None,
+            burst: None,
+            spike: None,
+            path_mtu: None,
+        }
     }
 }
 
@@ -119,6 +157,24 @@ impl Net {
         self
     }
 
+    /// 启用成簇丢包：每个包有 `enter` 概率进入全丢状态，`leave` 概率返回正常
+    pub fn with_burst(mut self, enter: f64, leave: f64) -> Self {
+        self.burst = Some(Burst { enter, leave });
+        self
+    }
+
+    /// 启用延迟尖刺
+    pub fn with_spike(mut self, prob: f64, extra: u64) -> Self {
+        self.spike = Some(Spike { prob, extra });
+        self
+    }
+
+    /// 链路路径 MTU：超过该字节数的报文被丢弃
+    pub fn with_path_mtu(mut self, bytes: usize) -> Self {
+        self.path_mtu = Some(bytes);
+        self
+    }
+
     fn in_blackout(&self, now: u64) -> bool {
         matches!(self.blackout, Some((start, len)) if now >= start && now < start + len)
     }
@@ -138,6 +194,8 @@ pub struct Sim {
     a_to_b: VecDeque<InFlight>,
     b_to_a: VecDeque<InFlight>,
     rng: Rng,
+    /// 成簇丢包的状态机当前是否处于坏状态
+    burst_bad: bool,
     // 由 output 回调写入，drive() 取出并路由
     out_a: Arc<Mutex<Vec<Vec<u8>>>>,
     out_b: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -199,6 +257,7 @@ impl Sim {
             a_to_b: VecDeque::new(),
             b_to_a: VecDeque::new(),
             rng: Rng::new(seed),
+            burst_bad: false,
             out_a,
             out_b,
         }
@@ -210,6 +269,9 @@ impl Sim {
         let jitter = self.net.jitter;
         let duplicate = self.net.duplicate;
         let reorder = self.net.reorder;
+        let burst = self.net.burst;
+        let spike = self.net.spike;
+        let path_mtu = self.net.path_mtu;
         let now = self.now;
 
         // 黑洞期内整批丢弃，且不消耗随机数，保证其它参数的复现性不受影响
@@ -219,12 +281,36 @@ impl Sim {
 
         let mut accepted: Vec<InFlight> = Vec::new();
         for packet in batch {
-            if self.rng.chance(loss) {
+            // 路径 MTU 黑洞：超长报文被中间设备静默丢弃，这是真实网络里
+            // 最难排查的故障之一，KCP 本身没有 PMTU 发现机制
+            if let Some(limit) = path_mtu
+                && packet.len() > limit
+            {
+                continue;
+            }
+            // 成簇丢包：坏状态整段丢弃，状态迁移按包推进
+            let burst_lost = match burst {
+                Some(b) => {
+                    self.burst_bad = if self.burst_bad {
+                        !self.rng.chance(b.leave)
+                    } else {
+                        self.rng.chance(b.enter)
+                    };
+                    self.burst_bad
+                },
+                None => false,
+            };
+            if burst_lost || self.rng.chance(loss) {
                 continue;
             }
             let mut arrive_at = now + delay;
             if jitter > 0 {
                 arrive_at += self.rng.next_u64() % (jitter + 1);
+            }
+            if let Some(s) = spike
+                && self.rng.chance(s.prob)
+            {
+                arrive_at += s.extra;
             }
             accepted.push(InFlight { packet: packet.clone(), arrive_at });
             if duplicate > 0.0 && self.rng.chance(duplicate) {

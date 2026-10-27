@@ -200,6 +200,27 @@ pub fn random_net(rng: &mut super::Rng) -> Net {
         reorder: (rng.next_u64() % 20) as f64 / 100.0,
         duplicate: (rng.next_u64() % 15) as f64 / 100.0,
         blackout: None,
+        burst: None,
+        spike: None,
+        path_mtu: None,
+    }
+}
+
+/// 最恶劣的固定损伤组合：成簇丢包 + 延迟尖刺 + 乱序 + 重复
+///
+/// 与 `random_net` 的区别是这里一定带突发丢包与尖刺，用来覆盖
+/// 「连续丢一段 + 个别包严重迟到」这类只在真实无线链路上出现的时序。
+pub fn hostile_net(rng: &mut super::Rng) -> Net {
+    Net {
+        loss: 0.05,
+        delay: 5 + rng.next_u64() % 8,
+        jitter: 3,
+        reorder: 0.25,
+        duplicate: 0.1,
+        blackout: None,
+        burst: Some(super::Burst { enter: 0.06, leave: 0.25 }),
+        spike: Some(super::Spike { prob: 0.05, extra: 120 }),
+        path_mtu: None,
     }
 }
 
