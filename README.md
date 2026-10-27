@@ -385,6 +385,7 @@ cargo test test_stream_mode
 | `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、未知命令、WASK/WINS 洪水、伪造 conv、恶意 frg 链 |
 | `matrix.rs` | 配置组合矩阵：MTU × 窗口 × interval × fastresend × nodelay × 流模式 |
 | `timing.rs` | ACK 语义与时序：重复段补 ACK、逐段确认、乱序缺口、探测退避 |
+| `congestion.rs` | 拥塞窗口：慢启动节奏、AIMD 收缩、`fastresend=0` 开关、三模式吞吐 |
 | `soak.rs` | 规模与长跑：1MB~4MB 大流量、1000 轮长会话、SN 回绕、恶劣网络收敛、队列有界 |
 | `outage.rs` | 断网与恢复：黑洞期补发、多次闪断、双向恢复、长断网不静默丢数据 |
 | `multiclient.rs` | 多客户端并发：20~50 连接并发、部分断网隔离、混合丢包率、conv 不串台 |
