@@ -362,6 +362,36 @@ cargo test test_stream_mode
     - `test_no_deadlock_large_message` — BUG-11：验证 300KB 大文件传输无死锁
     - `test_default_mode_can_send` — BUG-1 补充：验证默认配置下数据可正常发送
 
+### 黑盒测试
+
+除单元测试外，`tests/` 下用虚拟链路跑真实 `Kcp` 实例做黑盒验证。
+`tests/common/` 提供确定性仿真设施：`Rng`（固定种子）、`Net`（丢包/延迟/抖动/乱序/重复）、
+`Sim`（双端虚拟时钟）、`Sink`（单端抓包）。所有随机用例都由固定种子驱动，
+失败时用同一 seed 即可复现；全部用例合计约 2 秒。
+
+| 文件 | 关注点 |
+| --- | --- |
+| `transfer.rs` | 基本收发、分片、模式差异 |
+| `lossy.rs` | 丢包、乱序、重复下的可靠性 |
+| `window.rs` | 收发窗口、零窗口、窗口通告 |
+| `lifecycle.rs` | 创建、更新、关闭、死链 |
+| `stream_api.rs` | `KcpStream` / `KcpListener` 接口 |
+| `api_contract.rs` | 公开 API 契约与错误类型 |
+| `retransmit.rs` | 重传与死链判定 |
+| `fuzz_transfer.rs` | 随机链路下 9 条协议不变式（字节精确、消息边界、窗口上限、断链恢复） |
+| `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、未知命令、WASK/WINS 洪水、伪造 conv、恶意 frg 链 |
+| `matrix.rs` | 配置组合矩阵：MTU × 窗口 × interval × fastresend × nodelay × 流模式 |
+| `timing.rs` | ACK 语义与时序：重复段补 ACK、逐段确认、乱序缺口、探测退避 |
+| `udp_smoke.rs` | 真实 UDP 端到端冒烟：并发客户端、大载荷、异常关闭 |
+
+```bash
+# 只跑黑盒测试
+cargo test --test fuzz_transfer --test malformed --test matrix --test timing --test udp_smoke
+
+# 覆盖率（需先安装 cargo-llvm-cov）
+cargo llvm-cov --workspace --all-features --summary-only
+```
+
 ## 📄 许可证
 
 MIT License
