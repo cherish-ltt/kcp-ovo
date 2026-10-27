@@ -247,8 +247,8 @@ msrv = "1.99.1"
 
 #### 背景：为什么把黑盒测试提到门槛级
 
-本项目的每一轮黑盒测试扩充，都稳定地挖出了新缺陷，至今已累计发现并修复 23 个真实问题，
-其中 4 个会导致线上连接永久卡死或静默丢数据，另有 4 个会让吞吐严重劣化或配置失效。
+本项目的每一轮黑盒测试扩充，都稳定地挖出了新缺陷，至今已累计发现并修复 27 个真实问题，
+其中 7 个会导致线上连接永久卡死、panic 或静默丢数据，另有 4 个会让吞吐严重劣化或配置失效。
 下文只是其中一部分典型样本，完整台账与回归测试索引见 10.3 节。
 
 | 缺陷 | 表现 | 只有黑盒才暴露的原因 |
@@ -261,6 +261,8 @@ msrv = "1.99.1"
 | `check()` 等待探测时返回 current | 调用方按 flush 间隔空转，探测退避失效 | 需要零窗口态持续一段时间 |
 | 死链阈值未覆盖 | 长断网后行为不确定 | 需要仿真链路黑洞 |
 | `parse_una` 无条件回写 | 回绕点附近 `snd_una` 与 `snd_buf` 脱节 | 需要乱序 + 回绕组合 |
+| una 越过 `snd_nxt` 被照单全收 | 在途段被清空、`snd_una` 冲出已发送范围，之后真实 ACK 全部判为过期，数据静默丢失 | 需要链路比特翻转或伪造包与正常传输交织 |
+| 窗口额度未扣除在途段 | 每轮 flush 再塞满一个窗口，在途量随轮次无界增长，对端整片丢弃 | 需要对端接收窗口小于发送窗口且链路有延迟 |
 
 这些缺陷的共同点是：**单元测试覆盖不到，代码走查看不出，只有把真实实例放进
 真实时序、真实丢包、真实数据量里长时间对拍才会浮现。** 因此黑盒测试不是补充，
@@ -296,7 +298,12 @@ msrv = "1.99.1"
   **严禁删除断言、缩小覆盖范围或改成恒真来让测试变绿。**
 - **禁止无界等待**：所有循环必须有明确的 tick 上限，超时即断言失败，
   不允许让用例挂死。
-- **验收时长**：整套黑盒用例应在 30 秒内跑完（当前约 2 秒）。超出说明仿真规模失控，
+- **属性测试**：`tests/property.rs` 用 proptest 在参数空间内搜索并收缩反例，
+  用来覆盖手写场景想不到的输入组合。失败时 proptest 会把最小反例写入
+  `tests/property.proptest-regressions`，该文件必须随修复一起提交，
+  使同一反例在后续每轮 CI 中都会重放。属性测试的 `cases` 必须显式设定，
+  不要依赖默认 256 例把时长推高。
+- **验收时长**：整套黑盒用例应在 30 秒内跑完（当前约 3 秒）。超出说明仿真规模失控，
   应压缩数据量而不是砍掉场景。
 
 #### 验收命令
@@ -375,9 +382,14 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-21 | `nodelay` 字段只存不用 | 配置语义 | 把 `nodelay` 改成 true 行为完全不变，低延迟配置形同虚设 | `kcp.rs` 构造 / `flush` |
 | BUG-22 | `IKCP_DEADLINK` 为 100，C 原版为 20 | 死链判定 | 弱网下要重传 100 次才判死链，坏连接长时间占用资源 | `kcp_const_config.rs::IKCP_DEADLINK` |
 | BUG-23 | `IKCP_PROBE_INIT` 为 7000 且退避按 2 倍 | 窗口探测 | 与 C 原版（5000、1.5 倍）不一致，探测流量偏高 | `kcp_const_config.rs` / `kcp.rs::flush` |
+| BUG-24 | `input` 无条件接受越过 `snd_nxt` 的 una | 确认语义 | **伪造/翻转的 una 清空在途段并把 `snd_una` 推出已发送范围，之后真实 ACK 全被判过期，数据静默丢失** | `kcp.rs::input` 的 una 判定 |
+| BUG-25 | `flush` 每轮按整个窗口放行新段，不扣除在途段 | 流控 | **在途量随 flush 次数无界增长，远超对端接收窗口，引发整片丢弃与重传风暴；对端未响应时每轮再塞一段探路** | `kcp.rs::flush` 的准入额度 |
+| BUG-26 | 同轮有 ACK 待发时探测让路 | 窗口探测 | `IKCP_ASK_SEND` 长期挂起，`check()` 持续返回 `current`，零窗口期间调用方全速空转 | `kcp.rs::flush` 的 `need_wask` |
+| BUG-27 | 构造期不校验 `mtu` 与收发窗口 | 配置校验 | `mtu < 28` 下溢 panic、`mtu == 28` 时 `mss = 0` 触发除零 panic、窗口为 0 的连接永久不可用 | `kcp.rs` 构造函数 |
 
-其中 BUG-9、BUG-10、BUG-18、BUG-19 属于「线上会永久卡死或静默丢数据」的严重级缺陷，
-BUG-13、BUG-14、BUG-17 属于「不丢数据但吞吐严重劣化」的性能级缺陷。
+其中 BUG-9、BUG-10、BUG-18、BUG-19、BUG-24、BUG-25、BUG-27 属于「线上会永久卡死、
+panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-26 属于「不丢数据但
+吞吐或 CPU 严重劣化」的性能级缺陷。
 
 #### 二、回归测试索引
 
@@ -398,6 +410,15 @@ BUG-13、BUG-14、BUG-17 属于「不丢数据但吞吐严重劣化」的性能�
 | BUG-19 | `ack_sn_must_not_delete_beyond_una` | `tests/timing.rs` |
 | BUG-19 | `ack_without_una_does_not_shrink_queue` | `tests/timing.rs` |
 | BUG-19 | `test_parse_ack_retain` | `src/core/kcp.rs` 的 `mod tests` |
+| BUG-24 | `una_ahead_of_snd_nxt_must_not_discard_unacked_segments` | `tests/adversarial.rs` |
+| BUG-24 | `valid_una_still_acknowledges_after_forward_una_rejected` | `tests/adversarial.rs` |
+| BUG-24 | `forward_una_flood_does_not_kill_live_connection` | `tests/adversarial.rs` |
+| BUG-25 | `in_flight_segments_never_exceed_peer_receive_window` | `tests/adversarial.rs` |
+| BUG-25 | `unknown_peer_admits_only_one_probe_segment` | `tests/adversarial.rs` |
+| BUG-25 | `small_receive_window_bounds_in_flight` | `tests/property.rs` |
+| BUG-27 | `degenerate_configs_are_rejected` | `tests/adversarial.rs` |
+| BUG-27 | `arbitrary_config_is_rejected_or_usable` | `tests/property.rs` |
+| BUG-27 | `minimum_usable_config_transfers` | `tests/adversarial.rs` |
 
 **性能级缺陷（吞吐劣化）**
 
@@ -420,6 +441,9 @@ BUG-13、BUG-14、BUG-17 属于「不丢数据但吞吐严重劣化」的性能�
 | BUG-12/13/14 | `loss_halves_ssthresh_and_resets_cwnd` | `tests/congestion.rs:121` |
 | BUG-12/13/14 | `modes_have_comparable_throughput` | `tests/congestion.rs:178` |
 | BUG-8 | `bulk_transfer_one_megabyte` | `tests/soak.rs:18` |
+| BUG-26 | `probe_is_not_swallowed_by_pending_ack` | `tests/adversarial.rs` |
+| BUG-26 | `stalled_receiver_recovers_with_bounded_probe_traffic` | `tests/torture.rs` |
+| BUG-25 | `zero_window_does_not_inflate_send_buffer` | `tests/torture.rs` |
 
 **正确性缺陷**
 

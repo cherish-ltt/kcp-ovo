@@ -365,9 +365,10 @@ cargo test test_stream_mode
 ### 黑盒测试
 
 除单元测试外，`tests/` 下用虚拟链路跑真实 `Kcp` 实例做黑盒验证。
-`tests/common/` 提供确定性仿真设施：`Rng`（固定种子）、`Net`（丢包/延迟/抖动/乱序/重复）、
+`tests/common/` 提供确定性仿真设施：`Rng`（固定种子）、`Net`（丢包/延迟/抖动/乱序/重复/突发丢包/延迟尖刺/路径 MTU）、
 `Sim`（双端虚拟时钟）、`Sink`（单端抓包）。所有随机用例都由固定种子驱动，
-失败时用同一 seed 即可复现；全部用例合计约 2 秒。
+失败时用同一 seed 即可复现；`tests/property.rs` 另有 proptest 在参数空间内自动搜索并收缩反例。
+全部用例合计约 2 秒。
 
 黑盒测试是本项目的上线硬门槛，新增功能必须补齐对应场景才能合并，详见
 [AGENTS.md](AGENTS.md) 第 10.1 节。
@@ -390,10 +391,17 @@ cargo test test_stream_mode
 | `outage.rs` | 断网与恢复：黑洞期补发、多次闪断、双向恢复、长断网不静默丢数据 |
 | `multiclient.rs` | 多客户端并发：20~50 连接并发、部分断网隔离、混合丢包率、conv 不串台 |
 | `udp_smoke.rs` | 真实 UDP 端到端冒烟：并发客户端、大载荷、异常关闭 |
+| `adversarial.rs` | 敌意输入与账本边界：越过 `snd_nxt` 的伪造 `una`、在途段不得越过对端窗口、未知对端只放行一段探路、退化配置拒绝、头部极值扫描 |
+| `property.rs` | 属性测试：任意字节/头部/配置不崩且账本自洽、随机链路（含小接收窗口）字节精确、双向同时传输 |
+| `torture.rs` | 极端链路叠加：成簇丢包、延迟尖刺不引发重传风暴、路径 MTU 黑洞上报死链、双向同时断网、回绕叠加断网、100 连接、零窗口探测有界 |
+| `udp_chaos.rs` | 真实 UDP 混沌：8 客户端消息边界、垃圾报文轰炸后仍可服务、静默客户端不拖累他人、40KB 大消息 |
 
 ```bash
 # 只跑黑盒测试
 cargo test --test fuzz_transfer --test malformed --test matrix --test timing --test udp_smoke
+
+# 新增的强化场景
+cargo test --test adversarial --test property --test torture --test udp_chaos
 
 # 覆盖率（需先安装 cargo-llvm-cov）
 cargo llvm-cov --workspace --all-features --summary-only
