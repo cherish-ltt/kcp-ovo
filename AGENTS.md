@@ -247,9 +247,9 @@ msrv = "1.99.1"
 
 #### 背景：为什么把黑盒测试提到门槛级
 
-本项目的每一轮黑盒测试扩充，都稳定地挖出了新缺陷，至今已累计发现并修复 18 个真实问题，
-其中 3 个会导致线上连接永久卡死或静默丢数据，另有 3 个会让吞吐严重劣化。
-下文只是其中一部分典型样本，完整台账与回归测试索引见 10.2 节。
+本项目的每一轮黑盒测试扩充，都稳定地挖出了新缺陷，至今已累计发现并修复 23 个真实问题，
+其中 4 个会导致线上连接永久卡死或静默丢数据，另有 4 个会让吞吐严重劣化或配置失效。
+下文只是其中一部分典型样本，完整台账与回归测试索引见 10.3 节。
 
 | 缺陷 | 表现 | 只有黑盒才暴露的原因 |
 | --- | --- | --- |
@@ -319,7 +319,28 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 3. 在 `README.md` 的「黑盒测试」表里补一行，说明该文件覆盖的关注点。
 4. 若用例挖出产品缺陷，**先提交修复**，再提交用例，并在提交信息里写清缺陷成因。
 
-### 10.2 缺陷登记表与回归测试索引
+### 10.2 原版实现只作参考，不是正确性依据
+
+`skywind3000/kcp` 的 C 实现是本项目的重要参考，但它**并非完美无瑕**，
+同样存在设计缺陷、已知问题与历史包袱（序号比较、窗口边界、探测退避、
+心跳与死链判定等处都有可讨论空间，部分问题在上游 issue 中长期未解决）。
+
+因此：
+
+1. **不得以「和原版一致」作为正确性论据**。判断一段逻辑是否正确，
+   依据是协议不变式、状态机自洽性和可验证的行为断言，而不是「C 版也这么写」。
+   对齐原版只是发现差异时的**起点**，之后必须独立判断这个差异是该修的偏差，
+   还是该保留的改进。
+2. **遇到原版本身的错误要明确记录**。若确认原版行为有缺陷，本项目可以选择
+   不跟随，但必须在缺陷登记表里写清「原版如此、本项目为何不同」，
+   并在对应位置补上能体现差异的用例，避免后人「照着原版改回去」。
+3. **与 C 版互通时区分两类差异**。线格式（包头布局、命令字、序号语义、
+   `una` 推进规则）必须保持一致，否则无法互通；而 RTO 策略、退避曲线、
+   拥塞窗口起效方式等内部策略属于实现自由，按本项目自己的判断取舍。
+4. **回归验证同样适用**：拿原版行为当基准写断言前，先确认该行为本身正确。
+   把原版的缺陷固化成断言，等于把缺陷永久焊死在代码里。
+
+### 10.3 缺陷登记表与回归测试索引
 
 本节是**缺陷台账**：每个曾经发现并修复的缺陷，都必须在此登记成因、修复位置与
 回归测试位置。新增缺陷时按 `BUG-<序号>` 顺延编号，并补齐对应行。
@@ -349,8 +370,13 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-16 | `check()` 等待探测时返回 `current` | 时序 | 调用方按 flush 间隔空转，探测退避形同虚设 | `kcp.rs::check` |
 | BUG-17 | 重传段参与 RTT 采样 | RTT 计算 | `rx_rttval` 比 `rx_srtt` 大一个数量级，RTO 退避到 10 秒以上 | `kcp.rs::parse_ack`（Karn 算法） |
 | BUG-18 | 接收窗口上界用 u64 展开比较 | 协议不变式 | **SN 回绕点另一侧的合法段被判为窗口外丢弃** | `kcp.rs::input` 的 `Push` 分支 |
+| BUG-19 | ACK 按 sn 精确删除与 una 推进并存 | 确认语义 | **sn 与 una 矛盾时会删除对端未收到的段，静默丢数据** | `kcp.rs::parse_ack`（改为只做 RTT 采样） |
+| BUG-20 | 零窗口探测退避从 `interval` 起步 | 窗口探测 | 零窗口连接被 WASK 每 20ms 轰炸，`IKCP_PROBE_INIT` 定义了从未被使用 | `kcp.rs::flush` 的探测分支 |
+| BUG-21 | `nodelay` 字段只存不用 | 配置语义 | 把 `nodelay` 改成 true 行为完全不变，低延迟配置形同虚设 | `kcp.rs` 构造 / `flush` |
+| BUG-22 | `IKCP_DEADLINK` 为 100，C 原版为 20 | 死链判定 | 弱网下要重传 100 次才判死链，坏连接长时间占用资源 | `kcp_const_config.rs::IKCP_DEADLINK` |
+| BUG-23 | `IKCP_PROBE_INIT` 为 7000 且退避按 2 倍 | 窗口探测 | 与 C 原版（5000、1.5 倍）不一致，探测流量偏高 | `kcp_const_config.rs` / `kcp.rs::flush` |
 
-其中 BUG-9、BUG-10、BUG-18 属于「线上会永久卡死或静默丢数据」的严重级缺陷，
+其中 BUG-9、BUG-10、BUG-18、BUG-19 属于「线上会永久卡死或静默丢数据」的严重级缺陷，
 BUG-13、BUG-14、BUG-17 属于「不丢数据但吞吐严重劣化」的性能级缺陷。
 
 #### 二、回归测试索引
@@ -361,12 +387,17 @@ BUG-13、BUG-14、BUG-17 属于「不丢数据但吞吐严重劣化」的性能�
 | --- | --- | --- |
 | BUG-9 | `duplicate_segment_triggers_ack` | `tests/timing.rs:18` |
 | BUG-9 | `ack_loss_does_not_stall_connection` | `tests/timing.rs:38` |
-| BUG-10 | `ack_is_per_segment` | `tests/timing.rs:87` |
+| BUG-10 | `ack_is_per_segment`（已按 una 驱动语义重写） | `tests/timing.rs` |
 | BUG-10 | `sender_fully_acknowledged_after_delivery` | `tests/timing.rs:66` |
 | BUG-18 | `sequence_wraparound_is_transparent` | `tests/soak.rs:108` |
+| BUG-18 | `wraparound_with_bidirectional_window_span` | `tests/soak.rs` |
+| BUG-18 | `wraparound_mixed_with_retransmission` | `tests/soak.rs` |
 | BUG-18 | `stale_sn_not_redelivered` | `tests/malformed.rs:101` |
-| BUG-4 | `test_parse_una_never_moves_backward` | `src/core/kcp.rs:1626` |
+| BUG-4 | `test_parse_una_never_moves_backward` | `src/core/kcp.rs` 的 `mod tests` |
 | BUG-4 | `reordered_delivery_is_reassembled` | `tests/lossy.rs:64` |
+| BUG-19 | `ack_sn_must_not_delete_beyond_una` | `tests/timing.rs` |
+| BUG-19 | `ack_without_una_does_not_shrink_queue` | `tests/timing.rs` |
+| BUG-19 | `test_parse_ack_retain` | `src/core/kcp.rs` 的 `mod tests` |
 
 **性能级缺陷（吞吐劣化）**
 
@@ -407,10 +438,18 @@ BUG-13、BUG-14、BUG-17 属于「不丢数据但吞吐严重劣化」的性能�
 | BUG-11 | `window_advertisement_follows_queue` | `tests/timing.rs:142` |
 | BUG-11 | `sender_never_exceeds_peer_window` | `tests/fuzz_transfer.rs:98` |
 | BUG-11 | `receiver_never_exceeds_own_window` | `tests/fuzz_transfer.rs:137` |
+| BUG-11 | `probe_does_not_suppress_ack` | `tests/window.rs` |
 | BUG-15 | `oversized_payload_parsed_safely` | `tests/malformed.rs:206` |
 | BUG-15 | `stream_mode_accepts_large_message` | `tests/window.rs:66` |
 | BUG-16 | `check_waits_for_probe_deadline` | `tests/timing.rs:222` |
 | BUG-16 | `window_probe_is_emitted_when_peer_window_closed` | `tests/window.rs:86` |
+| BUG-20 | `probe_backoff_starts_at_probe_init` | `tests/window.rs` |
+| BUG-20 | `test_window_probe_backoff` | `src/core/kcp.rs` 的 `mod tests` |
+| BUG-20 | `long_zero_window_still_probes_and_resumes` | `tests/window.rs` |
+| BUG-21 | `nodelay_changes_min_rto` | `tests/matrix.rs` |
+| BUG-21 | `nodelay_affects_first_retransmit_deadline` | `tests/matrix.rs` |
+| BUG-22 | `default_dead_link_matches_ikcp` | `tests/retransmit.rs` |
+| BUG-23 | `probe_backoff_starts_at_probe_init` | `tests/window.rs` |
 
 #### 三、维护规则
 
@@ -426,3 +465,18 @@ BUG-13、BUG-14、BUG-17 属于「不丢数据但吞吐严重劣化」的性能�
    tick 上限），参考 `tests/congestion.rs` 的写法。
 5. **禁止只放宽断言**：调整阈值前必须说明为何原阈值不合理。
    「跑不过就把阈值调大」等于删除该用例。
+
+### 10.4 注释规范
+
+注释只解释**意图、边界和取舍**，不复述代码字面意思。
+
+- **允许**：文档注释（`///`、`//!`）描述公开 API 的语义、参数约束、错误条件；
+  关键路径上的解释型注释说明「为什么这样写」——隐藏约束、微妙不变量、
+  反直觉的取舍、特定写法规避的陷阱。
+- **禁止**：复述代码在做什么（如 `// 更新远端窗口大小` 后面紧跟
+  `self.rmt_wnd = header.wnd;`）。
+- **严禁**：在代码里写缺陷修复说明。不写 `// 修复 BUG-XX`、
+  `// BUG-XX 回归`、`// 原实现……现在改为……`、`// C 原版如何、Rust 原译如何`。
+  缺陷的编号、成因、修复位置与回归用例统一登记在 10.3 节的缺陷台账里，
+  代码中只保留与缺陷无关、但当前仍然成立的约束说明。
+- 测试用例的文档注释描述**被验证的行为**，而不是它修复了哪个缺陷。
