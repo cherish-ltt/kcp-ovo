@@ -33,6 +33,34 @@ stream = []
 name = "kcp_ovo"
 path = "src/lib.rs"
 
+[[test]]
+name = "transfer"
+path = "tests/transfer.rs"
+
+[[test]]
+name = "lossy"
+path = "tests/lossy.rs"
+
+[[test]]
+name = "window"
+path = "tests/window.rs"
+
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle.rs"
+
+[[test]]
+name = "stream_api"
+path = "tests/stream_api.rs"
+
+[[test]]
+name = "api_contract"
+path = "tests/api_contract.rs"
+
+[[test]]
+name = "retransmit"
+path = "tests/retransmit.rs"
+
 [[bench]]
 name = "kcp-transfer"
 path = "benches/kcp-transfer.rs"
