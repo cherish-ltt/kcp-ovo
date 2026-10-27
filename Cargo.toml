@@ -34,6 +34,10 @@ name = "kcp_ovo"
 path = "src/lib.rs"
 
 [[example]]
+name = "bench-300ms"
+path = "examples/bench-300ms.rs"
+
+[[example]]
 name = "file-transfer"
 path = "examples/file-transfer.rs"
 
