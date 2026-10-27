@@ -179,6 +179,21 @@ impl Kcp {
     ///
     /// 返回新创建的 `Kcp` 实例或错误
     pub fn new(conv: u32, config: KcpConfig) -> KcpResult<Self> {
+        // mtu 必须装得下一个包头：不足时 mss 减法下溢，恰好等于时 mss=0，
+        // 分片数与拥塞窗口的计算都会除零。窗口为 0 的连接则永远无法承载数据，
+        // 与其让它在运行期静默卡死，不如在构造期拒绝。
+        if config.mtu <= IKCP_OVERHEAD as u32 {
+            return Err(KcpError::InvalidConfig(format!(
+                "mtu 必须大于 {IKCP_OVERHEAD} 字节，实际 {}",
+                config.mtu
+            )));
+        }
+        if config.snd_wnd == 0 || config.rcv_wnd == 0 {
+            return Err(KcpError::InvalidConfig(format!(
+                "snd_wnd 与 rcv_wnd 必须大于 0，实际 {} / {}",
+                config.snd_wnd, config.rcv_wnd
+            )));
+        }
         let mtu = config.mtu;
         let mss = mtu - (IKCP_OVERHEAD as u32);
 
@@ -507,7 +522,13 @@ impl Kcp {
         // parse_fastack 里 `una > seg.sn` 永假，快速重传会完全失效。
         // 确认只由 una 驱动；若再按 ACK 包的 sn 精确删除，一个「sn=0 却携带 una=3」
         // 的包会把对端尚未收到的段一并移出 snd_buf。
-        if self.timediff_u32(header.una, self.snd_una) > 0 {
+        //
+        // una 不得越过 snd_nxt：对端只能确认已经发出的段。链路上的比特翻转足以
+        // 把 una 抬到任意值，若照单全收，snd_buf 会被清空、snd_una 被推到发送范围
+        // 之外，此后所有真实 ACK 都被判成过期，丢失的段再也不会重传 —— 静默丢数据。
+        if self.timediff_u32(header.una, self.snd_una) > 0
+            && self.timediff_u32(self.snd_nxt, header.una) >= 0
+        {
             self.parse_fastack(header.una);
             self.parse_una(header.una);
         }
@@ -643,13 +664,13 @@ impl Kcp {
 
     /// 刷新发送缓冲区：将 snd_queue 移入 snd_buf，发送数据段、ACK、窗口探测
     async fn flush(&mut self) -> KcpResult<()> {
-        // 尚未收到对端任何包时放行 1 段探路，用于打通双向握手。
-        // 对端窗口已知且为 0 时（接收端已满）必须严格停发，否则每轮 flush
-        // 都会再挤入 1 段，snd_buf 无界增长且违反对端通告的窗口。
-        let usable_wnd =
-            if self.peer_seen { if self.rmt_wnd == 0 { 0 } else { self.rmt_wnd } } else { 1 };
-        let window = self.snd_wnd.min(usable_wnd);
-        let mut can_send = if self.nocwnd { window } else { window.min(self.cwnd) } as usize;
+        // 尚未收到对端任何包时放行 1 段探路，用于打通双向握手；此后只按对端
+        // 通告的窗口发放额度。额度必须扣除已在途的段：窗口约束的是「已发出但
+        // 未确认」的总量，否则每轮 flush 都能再塞满一个窗口，在途量随 flush
+        // 次数无界增长，远超对端接收能力，接收端只能整片丢弃并引发重传风暴。
+        let window = if self.peer_seen { self.snd_wnd.min(self.rmt_wnd) as usize } else { 1 };
+        let limit = if self.nocwnd { window } else { window.min(self.cwnd as usize) };
+        let mut can_send = limit.saturating_sub(self.nsnd_buf);
         let mut lost = false;
 
         while can_send > 0 && !self.snd_queue.is_empty() {
@@ -701,9 +722,11 @@ impl Kcp {
         }
 
         // 收集待发送的 ACK 列表，评估是否需要窗口探测
-        // ACK 与 WASK 互不阻塞：两者是独立操作
+        // 探测不能因为本轮恰好有 ACK 要发就让路：一旦让路，ASK_SEND 会挂在
+        // probe 里，check() 于是持续返回 current，调用方按此立即 update 又被
+        // ts_flush 节流，形成零窗口期间的全速空转。
         let acks_to_send = self.acklist.clone();
-        let need_wask = acks_to_send.is_empty() && probe_due && (self.probe & IKCP_ASK_SEND) != 0;
+        let need_wask = probe_due && (self.probe & IKCP_ASK_SEND) != 0;
         let need_wins = (self.probe & IKCP_ASK_TELL) != 0;
         self.acklist.clear();
 
@@ -1562,8 +1585,10 @@ mod tests {
     // ===== 大消息与窗口通告 =====
     #[tokio::test]
     async fn test_no_deadlock_large_message() {
-        // Use larger rcv_wnd to accommodate 219 segments (300KB / 1372)
-        let s_config = KcpConfig { rcv_wnd: 256, ..KcpConfig::fast_mode() };
+        // 219 段的数据要一次发完，发送窗口与对端通告窗口都必须容得下整条消息。
+        // 这条用例不驱动接收端的 update，因此不会回灌 ACK：窗口一小，合规的发送方
+        // 必须停在窗口上，用例会卡在半条消息上，测的就不再是窗口通告逻辑。
+        let s_config = KcpConfig { snd_wnd: 256, rcv_wnd: 256, ..KcpConfig::fast_mode() };
         let r_config = KcpConfig { rcv_wnd: 256, ..KcpConfig::fast_mode() };
         let (mut s, r) = {
             (Kcp::new(1, s_config).unwrap(), Arc::new(Mutex::new(Kcp::new(1, r_config).unwrap())))
@@ -1571,7 +1596,7 @@ mod tests {
         let now = current_millis();
         s.current = now;
         // 模拟已与对端握手：对端窗口已知
-        s.rmt_wnd = 32;
+        s.rmt_wnd = 256;
         s.peer_seen = true;
         r.lock().unwrap().current = now;
         let r2 = r.clone();
