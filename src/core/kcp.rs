@@ -474,8 +474,9 @@ impl Kcp {
                 }
             },
             KcpCmd::Push => {
-                if self.timediff_u64(header.sn as u64, self.rcv_nxt as u64 + self.rcv_wnd as u64)
-                    >= 0
+                // 窗口上界必须用 u32 回绕比较：SN 回绕后 rcv_nxt + rcv_wnd 会越过
+                // u32 上限，用 u64 展开比较会把回绕点另一侧的合法段判成窗口外。
+                if self.timediff_u32(header.sn, self.rcv_nxt.wrapping_add(self.rcv_wnd as u32)) >= 0
                 {
                     return Ok(());
                 }
@@ -483,7 +484,7 @@ impl Kcp {
                 // 要么对应一个丢失的 ACK。两种情况下发送方都还挂着重传，
                 // 若这里静默吞掉，ACK 丢失就会演变成永久死锁。
                 // 已入 rcv_queue 的段仍按重复处理不再回 ACK。
-                if self.timediff_u64(header.sn as u64, self.rcv_nxt as u64) < 0 {
+                if self.timediff_u32(header.sn, self.rcv_nxt) < 0 {
                     if self.rcv_queue.iter().any(|s| s.kcp_packet.header.sn == header.sn) {
                         return Ok(());
                     }
@@ -537,7 +538,11 @@ impl Kcp {
             }
         }
         // 修复 BUG-3：snd_una 必须跟随未被确认的最小 SN
-        self.snd_una = una;
+        // 只允许单调前进：乱序或过期的 una 不能把 snd_una 拉回去，
+        // 否则回绕点附近会与 snd_buf 内的段脱节。
+        if self.timediff_u32(una, self.snd_una) > 0 {
+            self.snd_una = una;
+        }
     }
 
     /// 处理 ACK 确认：更新 RTT/RTO，移除 snd_buf 中被确认的段
@@ -553,14 +558,19 @@ impl Kcp {
         for seg in self.snd_buf.iter() {
             // 修复 BUG-2：必须精确匹配被确认的分段
             if self.timediff_u32(sn, seg.kcp_packet.header.sn) == 0 {
-                let rtt = self.timediff_u64(current, seg.kcp_packet.header.ts);
-                if rtt >= 0 {
-                    rtt_update = if self.rx_srtt == 0 {
-                        Some((rtt, rtt / 2))
-                    } else {
-                        let delta = rtt - self.rx_srtt;
-                        Some((self.rx_srtt + delta / 8, self.rx_rttval + delta.abs() / 4))
-                    };
+                // Karn 算法：重传段的 ACK 无法区分是对首传还是重传的确认，
+                // 其 ts 仍是首传时刻，直接采样会把重传等待时间算进 RTT，
+                // 使 rttval 爆炸式增长、RTO 迅速退避到几十秒。
+                if seg.xmit == 1 {
+                    let rtt = self.timediff_u64(current, seg.kcp_packet.header.ts);
+                    if rtt >= 0 {
+                        rtt_update = if self.rx_srtt == 0 {
+                            Some((rtt, rtt / 2))
+                        } else {
+                            let delta = rtt - self.rx_srtt;
+                            Some((self.rx_srtt + delta / 8, self.rx_rttval + delta.abs() / 4))
+                        };
+                    }
                 }
                 break;
             }
@@ -1285,9 +1295,11 @@ mod tests {
     fn test_parse_ack_rtt_correct() {
         let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
         // snd_buf with 3 segments at different timestamps
+        // xmit=1 表示已首发一次，只有这样的段才允许参与 RTT 采样
         for (sn, ts) in [(0u32, 100u64), (1, 200), (2, 300)] {
             let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, ts, sn, 0, 10);
-            let seg = Segment::new_with_header_and_data(header, &[0u8; 10]).unwrap();
+            let mut seg = Segment::new_with_header_and_data(header, &[0u8; 10]).unwrap();
+            seg.xmit = 1;
             kcp.snd_buf.push_back(seg);
             kcp.nsnd_buf += 1;
         }
@@ -1300,6 +1312,24 @@ mod tests {
         let expected_rtt = (500i64).wrapping_sub(200i64); // = 300
         assert_eq!(kcp.rx_srtt, expected_rtt);
         assert_eq!(kcp.rx_rttval, expected_rtt / 2);
+    }
+
+    // ===== Karn 算法：重传段不参与 RTT 采样 =====
+    #[test]
+    fn test_retransmitted_segment_skips_rtt_sample() {
+        let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+        let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 100, 0, 0, 10);
+        let mut seg = Segment::new_with_header_and_data(header, &[0u8; 10]).unwrap();
+        // 已重传过（xmit > 1）：其 ts 仍是首传时刻，ACK 无法判断确认的是哪一次
+        seg.xmit = 3;
+        kcp.snd_buf.push_back(seg);
+        kcp.nsnd_buf += 1;
+        kcp.current = 9000;
+
+        let before = kcp.rx_srtt;
+        kcp.parse_ack(0);
+        assert_eq!(kcp.rx_srtt, before, "重传段不应更新 RTT");
+        assert_eq!(kcp.nsnd_buf, 0, "重传段仍应被正常确认移除");
     }
 
     // ===== BUG-3: snd_una updated =====
