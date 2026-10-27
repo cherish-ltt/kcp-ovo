@@ -369,6 +369,9 @@ cargo test test_stream_mode
 `Sim`（双端虚拟时钟）、`Sink`（单端抓包）。所有随机用例都由固定种子驱动，
 失败时用同一 seed 即可复现；全部用例合计约 2 秒。
 
+黑盒测试是本项目的上线硬门槛，新增功能必须补齐对应场景才能合并，详见
+[AGENTS.md](AGENTS.md) 第 10.1 节。
+
 | 文件 | 关注点 |
 | --- | --- |
 | `transfer.rs` | 基本收发、分片、模式差异 |
@@ -382,6 +385,9 @@ cargo test test_stream_mode
 | `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、未知命令、WASK/WINS 洪水、伪造 conv、恶意 frg 链 |
 | `matrix.rs` | 配置组合矩阵：MTU × 窗口 × interval × fastresend × nodelay × 流模式 |
 | `timing.rs` | ACK 语义与时序：重复段补 ACK、逐段确认、乱序缺口、探测退避 |
+| `soak.rs` | 规模与长跑：1MB~4MB 大流量、1000 轮长会话、SN 回绕、恶劣网络收敛、队列有界 |
+| `outage.rs` | 断网与恢复：黑洞期补发、多次闪断、双向恢复、长断网不静默丢数据 |
+| `multiclient.rs` | 多客户端并发：20~50 连接并发、部分断网隔离、混合丢包率、conv 不串台 |
 | `udp_smoke.rs` | 真实 UDP 端到端冒烟：并发客户端、大载荷、异常关闭 |
 
 ```bash
