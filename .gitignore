@@ -1,4 +1,5 @@
 /target
+/target-*
 /kcp
 /.cargo-home
 .DS_Store
