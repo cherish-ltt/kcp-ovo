@@ -517,20 +517,17 @@ ci 校验  →  GitHub Release  →  cargo publish
    不通过则不创建 Release，也不会发布到 crates.io。
 2. **GitHub Release**：内容读取 `.version/RELEASE-<tag>.md`（也接受 `.version/<tag>.md`）。
    文件缺失或为空时写入默认提示，引导用 `git log` 确认变动，不阻断发布。
-3. **cargo publish**（`cargo-publish.yml`）：由 `release.yml` 的 `publish` job
-   以可复用工作流（`workflow_call`）直接调用，检出该标签提交发布，
-   使用 crates.io 的 OIDC 可信发布，无需长期令牌。
+3. **cargo publish**（`release.yml` 的 `publish` job）：Release 创建成功后执行
+   `cargo publish`，Environment 为 `release`，使用 crates.io 的 OIDC 可信发布，
+   无需长期令牌。
 
-串接方式受两条平台限制约束，改动前务必确认：
+发布步骤必须写在 `release.yml` 内，不能拆到独立工作流：crates.io 可信发布按 JWT 中的
+工作流文件名与环境校验，本仓库绑定的是 `release.yml` + `release`。已实测三条串接路径
+都不可行，改动前不要再试：
 
-- crates.io 可信发布只接受 `push` / `release` / `workflow_dispatch` 事件，
-  用 `workflow_run` 触发会直接被拒绝（400）。
-- `GITHUB_TOKEN` 创建的 Release 不会触发 `release: published` 事件，
-  所以不能靠「Release 完成后再由事件拉起发布」串联。
-
-`workflow_call` 与调用方共享同一次 `push` 事件，发布动作仍归属
-`cargo-publish.yml`，因此同时满足可信发布的绑定要求与流水线顺序。
-`cargo-publish.yml` 保留 `workflow_dispatch`，发布失败后可手动重试。
+- `workflow_run` 事件被 crates.io 直接拒绝（400，不支持该触发方式）。
+- `GITHUB_TOKEN` 创建的 Release 不会触发 `release: published` 事件。
+- 用 `workflow_call` 复用其它工作流时，JWT 上报的仍是调用方文件名。
 
 发布新版本时按顺序做三件事：改 `Cargo.toml` 与 `Cargo.lock` 的版本号、
 补 `.version/RELEASE-<tag>.md`、打标签并推送。版本说明面向使用者，
