@@ -16,8 +16,8 @@
 //!
 //! 运行：
 //! ```bash
-//! cargo run --release --example bench-300ms
-//! cargo run --release --example bench-300ms -- --total 1048576 --rounds 5 --seed 7
+//! cargo bench --bench bench-300ms
+//! cargo bench --bench bench-300ms -- --total 1048576 --rounds 5 --seed 7
 //! ```
 
 use std::collections::VecDeque;

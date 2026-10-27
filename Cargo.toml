@@ -33,9 +33,10 @@ stream = []
 name = "kcp_ovo"
 path = "src/lib.rs"
 
-[[example]]
+[[bench]]
 name = "bench-300ms"
-path = "examples/bench-300ms.rs"
+path = "benches/bench-300ms.rs"
+harness = false
 
 [[example]]
 name = "file-transfer"
