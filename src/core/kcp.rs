@@ -109,6 +109,11 @@ pub struct Kcp {
     pub stream_mode: bool,
     /// 是否已调用过 update（首次调用会初始化 ts_flush）
     pub updated: bool,
+    /// 是否已收到过对端至少一个数据包
+    ///
+    /// 用于区分“对端窗口未知”和“对端窗口已知且为 0”：前者需要放行探路段，
+    /// 后者必须严格停止发送，否则每轮 flush 都会挤入 1 段，使 snd_buf 无界增长。
+    pub peer_seen: bool,
     /// 窗口探测时间戳
     pub ts_probe: u64,
     /// 窗口探测等待时间
@@ -211,6 +216,7 @@ impl Kcp {
             nodelay: config.nodelay,
             stream_mode: config.stream_mode,
             updated: false,
+            peer_seen: false,
             ts_probe: 0,
             probe_wait: 0,
             dead_link: IKCP_DEADLINK,
@@ -450,6 +456,7 @@ impl Kcp {
 
         // 更新远端窗口大小
         self.rmt_wnd = header.wnd;
+        self.peer_seen = true;
 
         // 根据命令类型处理
         match header.cmd {
@@ -634,11 +641,12 @@ impl Kcp {
 
     /// 刷新发送缓冲区：将 snd_queue 移入 snd_buf，发送数据段、ACK、窗口探测
     async fn flush(&mut self) -> KcpResult<()> {
-        // rmt_wnd 未知（尚未收到对端任何包）时放行 1 个包探路：
-        // 两端同时新建连接时都把 rmt_wnd 视为 0，若严格按 0 计算窗口则双方都发不出首包，
-        // 只能等窗口探测，连接建立被拖延到探测间隔的量级。
-        // 对端收到该段后会回 ACK 并携带自身 wnd，rmt_wnd 随即被填上。
-        let window = self.snd_wnd.min(self.rmt_wnd.max(1));
+        // 尚未收到对端任何包时放行 1 段探路，用于打通双向握手。
+        // 对端窗口已知且为 0 时（接收端已满）必须严格停发，否则每轮 flush
+        // 都会再挤入 1 段，snd_buf 无界增长且违反对端通告的窗口。
+        let usable_wnd =
+            if self.peer_seen { if self.rmt_wnd == 0 { 0 } else { self.rmt_wnd } } else { 1 };
+        let window = self.snd_wnd.min(usable_wnd);
         let mut can_send = if self.nocwnd { window } else { window.min(self.cwnd) } as usize;
         let mut lost = false;
 
@@ -660,13 +668,35 @@ impl Kcp {
             can_send -= 1;
         }
 
+        // 对端窗口未知时按退避间隔重发窗口探测；已知时清空退避。
+        // probe_due 只看本轮是否到期，与 ts_probe 的取值解耦：
+        // 首次探测需要立即发出，但 ts_probe 必须同时按退避量推后，
+        // 否则它在后续每轮 flush 都会再次到期，退避形同虚设。
+        let mut probe_due = false;
+        if self.rmt_wnd == 0 {
+            if self.probe_wait == 0 {
+                self.probe_wait = self.interval.max(1);
+                self.ts_probe = self.current + self.probe_wait;
+                self.probe |= IKCP_ASK_SEND;
+                probe_due = true;
+            } else if self.timediff_u64(self.current, self.ts_probe) >= 0 {
+                self.probe_wait = (self.probe_wait * 2).min(IKCP_PROBE_LIMIT);
+                self.ts_probe = self.current + self.probe_wait;
+                self.probe |= IKCP_ASK_SEND;
+                probe_due = true;
+            }
+        } else {
+            // 对端窗口已知后必须清空探测退避，否则重新进入 rmt_wnd==0 时
+            // 会沿用上一轮翻倍后的等待值，把首次探测推到很远的未来。
+            self.ts_probe = 0;
+            self.probe_wait = 0;
+        }
+
         // 收集待发送的 ACK 列表，评估是否需要窗口探测
         // 修复 BUG-4：ACK 发送不再被 need_wask else 分支阻塞，
         // Wask 和 ACK 是独立的两个操作（与原版 C 代码一致）
         let acks_to_send = self.acklist.clone();
-        let need_wask = acks_to_send.is_empty()
-            && (self.probe & IKCP_ASK_SEND) != 0
-            && self.timediff_u64(self.current, self.ts_probe) >= 0;
+        let need_wask = acks_to_send.is_empty() && probe_due && (self.probe & IKCP_ASK_SEND) != 0;
         let need_wins = (self.probe & IKCP_ASK_TELL) != 0;
         self.acklist.clear();
 
@@ -680,19 +710,6 @@ impl Kcp {
         if need_wins {
             self.send_control(KcpCmd::Wins, 0).await?;
             self.probe &= !IKCP_ASK_TELL;
-        }
-
-        if self.rmt_wnd == 0 && (self.probe & IKCP_ASK_SEND) == 0 {
-            self.probe |= IKCP_ASK_SEND;
-            if self.probe_wait == 0 {
-                // 首次探测不等待：对端的窗口通告是打开发送窗口的前提，
-                // 初始退避若取 IKCP_PROBE_INIT(7s)，两端都未收到对端包时会互相空等 7 秒。
-                self.probe_wait = self.interval.max(1);
-                self.ts_probe = self.current;
-            } else {
-                self.probe_wait = (self.probe_wait * 2).min(IKCP_PROBE_LIMIT);
-                self.ts_probe = self.current + self.probe_wait;
-            }
         }
 
         let current = self.current;
@@ -1022,8 +1039,9 @@ mod tests {
         };
         let now = current_millis();
         s.current = now;
-        // BUG-6 fix: rmt_wnd starts at 0. Set non-zero to simulate ACK exchange
+        // 模拟已与对端握手：对端窗口已知
         s.rmt_wnd = 32;
+        s.peer_seen = true;
         r.lock().unwrap().current = now;
         let r2 = r.clone();
         s.set_output(move |d| {
@@ -1044,8 +1062,9 @@ mod tests {
         };
         let now = current_millis();
         s.current = now;
-        // BUG-6 fix: rmt_wnd starts at 0. Set non-zero to simulate ACK exchange
+        // 模拟已与对端握手：对端窗口已知
         s.rmt_wnd = 32;
+        s.peer_seen = true;
         r.lock().unwrap().current = now;
         let r2 = r.clone();
         s.set_output(move |d| {
@@ -1117,8 +1136,9 @@ mod tests {
         };
         let now = current_millis();
         s.current = now;
-        // BUG-6 fix: rmt_wnd starts at 0. Set non-zero to simulate ACK exchange
+        // 模拟已与对端握手：对端窗口已知
         s.rmt_wnd = 32;
+        s.peer_seen = true;
         r.lock().unwrap().current = now;
         let r2 = r.clone();
         s.set_output(move |d| {
@@ -1150,47 +1170,42 @@ mod tests {
         kcp.current = now;
         kcp.rmt_wnd = 0;
 
-        // Dummy output so send_packet doesn't fail
-        kcp.set_output(move |data| Box::pin(async move { Ok(data.len()) }));
+        let mut wnds = Vec::new();
+        kcp.set_output(move |data| {
+            Box::pin(async move {
+                let _ = data;
+                Ok(data.len())
+            })
+        });
 
-        // 1st flush: 首次探测不等待，退避初值取 interval
+        // 首次 flush：对端窗口未知且无历史退避，应当即到期并推进一次退避
         kcp.flush().await.unwrap();
-        assert_eq!(
-            kcp.probe & IKCP_ASK_SEND,
-            IKCP_ASK_SEND,
-            "ASK_SEND should be set after first flush with rmt_wnd=0"
-        );
         let first_wait = kcp.interval.max(1);
-        assert_eq!(kcp.probe_wait, first_wait);
-        assert_eq!(kcp.ts_probe, now, "首次探测应当即到期");
+        wnds.push((kcp.probe_wait, kcp.ts_probe));
 
-        // Simulate Wask was sent (probe cleared) and advance time past ts_probe
-        kcp.probe &= !IKCP_ASK_SEND;
+        // 未到期前不推进退避
+        kcp.current = now + first_wait - 1;
+        kcp.flush().await.unwrap();
+        assert_eq!(kcp.probe_wait, first_wait, "未到 ts_probe 前退避不应变化");
+
+        // 到期后退避翻倍，ts_probe 推后
         kcp.current = now + first_wait;
-
-        // 2nd flush: probe_wait should double
         kcp.flush().await.unwrap();
         assert_eq!(kcp.probe_wait, first_wait * 2);
         assert_eq!(kcp.ts_probe, kcp.current + first_wait * 2);
 
-        // 3rd flush: probe_wait doubles again
-        kcp.probe &= !IKCP_ASK_SEND;
-        kcp.current = now + first_wait * 3;
+        kcp.current = now + first_wait + first_wait * 2;
         kcp.flush().await.unwrap();
         assert_eq!(kcp.probe_wait, first_wait * 4);
         assert_eq!(kcp.ts_probe, kcp.current + first_wait * 4);
 
-        // Advance time but NOT enough for the new ts_probe
-        kcp.probe &= !IKCP_ASK_SEND;
-        kcp.current = now + first_wait * 4 + 1;
+        // 对端通告窗口后，退避状态必须清零
+        kcp.rmt_wnd = 32;
+        kcp.current = now + first_wait * 100;
         kcp.flush().await.unwrap();
-        // need_wask should be false (ts_probe hasn't elapsed), so probe stays set
-        assert_eq!(
-            kcp.probe & IKCP_ASK_SEND,
-            IKCP_ASK_SEND,
-            "probe should remain set when ts_probe not yet elapsed"
-        );
-        assert!(kcp.current < kcp.ts_probe, "current should be before ts_probe");
+        assert_eq!(kcp.probe_wait, 0, "对端窗口已知后应清空退避");
+        assert_eq!(kcp.ts_probe, 0);
+        let _ = wnds;
     }
 
     /// 两端同时新建、rmt_wnd 均为 0 时，探路段应能在首轮 update 内送达对端，
@@ -1349,11 +1364,10 @@ mod tests {
             });
         }
 
-        // First flush: rmt_wnd=0 → probe set, but no acks yet
+        // First flush: rmt_wnd=0 → 立即发出一次 Wask
         kcp.flush().await.unwrap();
-        // After this flush, we should have probe set for ASK_SEND
-        // (the probe logic runs after ACK/Wask sending in flush)
-        assert_ne!(kcp.probe & IKCP_ASK_SEND, 0);
+        assert!(*sent_wask.lock().unwrap(), "对端窗口未知时首轮 flush 应发出 Wask");
+        assert!(!*sent_ack.lock().unwrap(), "此时还没有待确认的 ACK");
 
         // Add acks to acklist (simulating input coming in) and set probe for Wask
         kcp.acklist.push(42);
@@ -1363,7 +1377,7 @@ mod tests {
         kcp.ts_probe = now - 1000; // past due
         kcp.probe_wait = 7000;
 
-        // Second flush: need_wask might be set, BUT acks_to_send has items
+        // Second flush: need_wask 与 ACK 发送互不阻塞
         kcp.flush().await.unwrap();
 
         // Verify: ACKs should have been sent (regardless of Wask being sent or not)
@@ -1499,8 +1513,9 @@ mod tests {
         };
         let now = current_millis();
         s.current = now;
-        // BUG-6 fix: rmt_wnd starts at 0. Set non-zero to simulate ACK exchange
+        // 模拟已与对端握手：对端窗口已知
         s.rmt_wnd = 32;
+        s.peer_seen = true;
         r.lock().unwrap().current = now;
         let r2 = r.clone();
         s.set_output(move |d| {

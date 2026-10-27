@@ -295,6 +295,8 @@ pub struct KcpListener {
     config: StreamConfig,
     /// recv-msg
     recv_rx: UnboundedReceiver<(Vec<u8>, SocketAddr)>,
+    /// 实际绑定的本地地址（绑定 0 端口时用于获取系统分配的端口）
+    local_addr: SocketAddr,
 }
 
 impl KcpListener {
@@ -332,6 +334,7 @@ impl KcpListener {
         config: StreamConfig,
     ) -> KcpResult<Self> {
         let socket = UdpSocket::bind(addr).await.map_err(|e| KcpError::IoError(e.to_string()))?;
+        let local_addr = socket.local_addr().map_err(|e| KcpError::IoError(e.to_string()))?;
 
         let clients: Arc<DashMap<SocketAddr, Clinet>> = Arc::new(DashMap::new());
         let clients_clone = clients.clone();
@@ -461,7 +464,12 @@ impl KcpListener {
             }
         });
 
-        Ok(Self { clients, main_handle, recv_rx, config })
+        Ok(Self { clients, main_handle, recv_rx, config, local_addr })
+    }
+
+    /// 获取监听器实际绑定的本地地址
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 
     /// 关闭监听器
