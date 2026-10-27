@@ -21,6 +21,8 @@ use kcp_ovo::core::kcp::Kcp;
 use kcp_ovo::helper::generate_conv;
 use kcp_ovo::{KcpConfig, KcpResult};
 
+pub mod stress;
+
 /// 确定性伪随机数发生器（xorshift64*），测试必须可复现，不能用系统随机源
 pub struct Rng(u64);
 
@@ -55,6 +57,14 @@ impl Rng {
             chunk.copy_from_slice(&v[..n]);
         }
         out
+    }
+
+    /// 生成 [1, max_segments] 段长度的随机数据
+    pub fn bytes_segments(&mut self, mss: usize, max_segments: usize) -> Vec<u8> {
+        let segs = 1 + self.next_u64() as usize % max_segments;
+        let jitter = self.next_u64() as usize % 7;
+        let len = (mss * segs).saturating_sub(jitter).max(1);
+        self.bytes(len)
     }
 }
 

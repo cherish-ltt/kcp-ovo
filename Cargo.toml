@@ -61,6 +61,26 @@ path = "tests/api_contract.rs"
 name = "retransmit"
 path = "tests/retransmit.rs"
 
+[[test]]
+name = "timing"
+path = "tests/timing.rs"
+
+[[test]]
+name = "udp_smoke"
+path = "tests/udp_smoke.rs"
+
+[[test]]
+name = "matrix"
+path = "tests/matrix.rs"
+
+[[test]]
+name = "malformed"
+path = "tests/malformed.rs"
+
+[[test]]
+name = "fuzz_transfer"
+path = "tests/fuzz_transfer.rs"
+
 [[bench]]
 name = "kcp-transfer"
 path = "benches/kcp-transfer.rs"
