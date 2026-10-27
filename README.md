@@ -198,6 +198,10 @@ let config = KcpConfig::fast_mode();
 // 流模式（无消息边界，无255分片限制，默认低延迟参数）
 let config = KcpConfig::stream_mode();
 
+// 快速模式 + 指定窗口：大流量场景下放大窗口以跑满带宽
+// nocwnd=true 时拥塞窗口不参与调节，32 段的默认窗口就是吞吐硬上限
+let config = KcpConfig::fast_mode_with_wnd(512, 512);
+
 // 自定义配置
 let config = KcpConfig {
     mtu: 1400,           // 最大传输单元
@@ -223,6 +227,11 @@ let config = KcpConfig {
 | `nocwnd` | false | bool | 是否禁用拥塞控制 |
 | `rcv_wnd` | 128 | u16 | 接收窗口大小(segment数) |
 | `snd_wnd` | 32 | u16 | 发送窗口大小(segment数) |
+
+> `nocwnd=true`（`fast_mode()` 默认）时拥塞窗口被绕过，发送量只受
+> `snd_wnd.min(rmt_wnd)` 限制，32 段即约 44KB 在途数据，会成为吞吐的硬上限。
+> 需要跑满带宽请用 `KcpConfig::fast_mode_with_wnd(snd, rcv)` 显式放大，
+> 实测 512 段已接近本机吞吐饱和点。窗口按段计，单段载荷约 `mtu - 24` 字节。
 
 详细配置说明请参考：[性能优化指南](docs/performance.md)
 

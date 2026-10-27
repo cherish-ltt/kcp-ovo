@@ -11,7 +11,7 @@
 
 [package]
 edition = "2024"
-rust-version = "1.95.0"
+rust-version = "1.99.1"
 name = "kcp-ovo"
 version = "0.3.1"
 build = false
