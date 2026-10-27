@@ -77,7 +77,7 @@ use std::io::{Read, Write};
 fn main() -> std::io::Result<()> {
     let mut listener = KcpListener::bind("0.0.0.0:8888").await?;
     println!("服务器启动在 0.0.0.0:8888");
-    
+
     Ok(())
 }
 ```
