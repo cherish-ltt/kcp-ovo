@@ -395,7 +395,8 @@ impl Kcp {
         if first.kcp_packet.header.frg == 0 {
             return Ok(first.kcp_packet.header.len as usize);
         }
-        if self.nrcv_que < (first.kcp_packet.header.frg + 1) as usize {
+        // 先转 usize 再加一：frg 是 u8，frg=255 时 u8 加法会溢出
+        if self.nrcv_que < first.kcp_packet.header.frg as usize + 1 {
             return Err(KcpError::IncompleteData(IncompleteDataType::PayloadWaitForFrg));
         }
         let mut length = 0usize;
@@ -462,7 +463,10 @@ impl Kcp {
         match header.cmd {
             KcpCmd::Ack => {
                 // ACK命令：确认包
-                if self.timediff_u32(header.sn, self.snd_una) > 0 {
+                // 用 snd_nxt 做上界而不是 snd_una：第一个待确认段 sn=0 时
+                // snd_una 也是 0，若拿 snd_una 比较会把合法 ACK 判成过期。
+                // 超出 snd_nxt 的 ACK 一定是伪造或过期的，直接忽略。
+                if self.timediff_u32(self.snd_nxt, header.sn) >= 0 {
                     self.parse_ack(header.sn);
                 }
                 if let Some(ref writelog) = self.writelog {
@@ -472,8 +476,18 @@ impl Kcp {
             KcpCmd::Push => {
                 if self.timediff_u64(header.sn as u64, self.rcv_nxt as u64 + self.rcv_wnd as u64)
                     >= 0
-                    || self.timediff_u64(header.sn as u64, self.rcv_nxt as u64) < 0
                 {
+                    return Ok(());
+                }
+                // 落在接收窗口内但在 rcv_nxt 之前的段不能直接丢弃：它要么是重复段，
+                // 要么对应一个丢失的 ACK。两种情况下发送方都还挂着重传，
+                // 若这里静默吞掉，ACK 丢失就会演变成永久死锁。
+                // 已入 rcv_queue 的段仍按重复处理不再回 ACK。
+                if self.timediff_u64(header.sn as u64, self.rcv_nxt as u64) < 0 {
+                    if self.rcv_queue.iter().any(|s| s.kcp_packet.header.sn == header.sn) {
+                        return Ok(());
+                    }
+                    self.acklist.push(header.sn);
                     return Ok(());
                 }
                 for seg in self.rcv_buf.iter() {
@@ -481,9 +495,10 @@ impl Kcp {
                         return Ok(());
                     }
                 }
+                // 重传段一律重新排队 ACK，保证 ACK 丢失后能被下一次重传修复。
+                self.acklist.push(header.sn);
                 let newseg = Segment::new_with_header_and_data(header, &buf)?;
                 self.parse_data(newseg);
-                self.acklist.push(header.sn);
                 self.move_rcv_buf_to_queue();
             },
             KcpCmd::Wask => self.probe |= IKCP_ASK_TELL,
@@ -856,6 +871,11 @@ impl Kcp {
         }
         if (self.probe & IKCP_ASK_SEND) != 0 {
             return current;
+        }
+        // 等待窗口探测时，下次唤醒应落在 ts_probe 而非定期 flush，
+        // 否则调用方会按 flush 间隔空转，探测退避失去意义。
+        if self.rmt_wnd == 0 && self.ts_probe > 0 {
+            return self.ts_probe;
         }
         if self.timediff_u64(ts_flush, current) > 0 { ts_flush } else { current }
     }
