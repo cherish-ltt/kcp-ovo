@@ -21,9 +21,12 @@ pub struct KcpConfig {
 
     /// 是否启用无延迟模式
     ///
-    /// true: 禁用纳格算法，立即发送数据
-    /// false: 启用纳格算法，等待更多数据一起发送
-    /// 默认值：false
+    /// - `true`：最小 RTO 取 30ms（`IKCP_RTO_NDL`），首传不额外等待，
+    ///   超时重传按 RTO 翻倍退避
+    /// - `false`：最小 RTO 取 100ms（`IKCP_RTO_MIN`），首传额外等待 `rto/8`
+    ///   给数据聚合留余量，超时重传取实测 RTT 与当前 RTO 的较大者
+    ///
+    /// 默认为 `false`。它与 `interval` 一起决定连接的实际往返延迟下界。
     pub nodelay: bool,
 
     /// 快速重传模式

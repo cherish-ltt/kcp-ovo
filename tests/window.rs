@@ -4,6 +4,7 @@
 
 mod common;
 
+use common::stress::Sink;
 use common::{Net, Rng, Sim, Solo, assert_same, parse_cmd};
 use kcp_ovo::{KcpCmd, KcpConfig};
 
@@ -270,4 +271,100 @@ async fn stream_mode_same_data_does_not_stall() {
         }
     }
     assert_same(&got, &msg);
+}
+
+/// 零窗口下的探测退避必须从 IKCP_PROBE_INIT 起步
+///
+/// 首次等待若取 `interval`（fast 模式 20ms），退避序列会退化成几十毫秒级。
+/// 对端只是暂时满窗时，本端会持续不断地砸 WASK，白白消耗带宽，
+/// 也逼对端频繁回 WINS。
+#[tokio::test]
+async fn probe_backoff_starts_at_probe_init() {
+    let mut sink = Sink::new(KcpConfig::fast_mode());
+    // 对端明确通告 0 窗口
+    sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 0)).unwrap();
+
+    let mut wask_at = Vec::new();
+    for t in 1..=20_000u64 {
+        sink.clear();
+        sink.update(t).await.unwrap();
+        if sink.count_cmd(KcpCmd::Wask) > 0 {
+            wask_at.push(t);
+        }
+    }
+
+    let init = kcp_ovo::helper::IKCP_PROBE_INIT;
+    assert!(wask_at.len() >= 2, "20 秒内应至少发出两次探测，实际 {wask_at:?}");
+    // 首次探测必须立即发出：对端刚进入零窗口，本端需要马上询问一次
+    assert!(wask_at[0] <= 100, "首次探测应立即可发出，实际在 {}ms", wask_at[0]);
+    // 之后按 IKCP_PROBE_INIT 起步、逐次翻倍
+    let first_gap = wask_at[1] - wask_at[0];
+    assert!(
+        first_gap >= init,
+        "两次探测间隔 {first_gap}ms 小于 IKCP_PROBE_INIT={init}ms，退避起步过早"
+    );
+    assert!(first_gap < init * 2 + 100, "两次探测间隔 {first_gap}ms 远超 IKCP_PROBE_INIT={init}ms");
+    if wask_at.len() >= 3 {
+        // 与 C 原版一致：从第二次起按 1.5 倍增长
+        let second_gap = wask_at[2] - wask_at[1];
+        assert!(
+            second_gap >= first_gap + first_gap / 2 - 100,
+            "退避未按 1.5 倍增长：{first_gap}ms -> {second_gap}ms"
+        );
+    }
+}
+
+/// 长时间零窗口后恢复：探测必须持续进行，恢复后能立刻续传
+///
+/// 退避到上限后若探测彻底停摆，对端窗口重新打开时本端永远发现不了，
+/// 连接就永久卡死。这里跨越多个退避周期，验证探测不会中断。
+#[tokio::test]
+async fn long_zero_window_still_probes_and_resumes() {
+    let mut sink = Sink::new(KcpConfig::fast_mode());
+    sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 0)).unwrap();
+
+    // 跨越多个退避周期（上限 120s），累计推进 10 分钟
+    let mut probe_count = 0usize;
+    for t in (1..=600_000u64).step_by(100) {
+        sink.clear();
+        sink.update(t).await.unwrap();
+        probe_count += sink.count_cmd(KcpCmd::Wask);
+    }
+    assert!(probe_count >= 5, "10 分钟内仅发出 {probe_count} 次探测，探测已停摆");
+    // 退避上限生效：不应退化成每个 interval 都探测
+    assert!(probe_count < 50, "10 分钟内发出 {probe_count} 次探测，退避上限未生效");
+
+    // 对端窗口重新打开后，探针应立即被清空
+    sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 64)).unwrap();
+    sink.update(700_000).await.unwrap();
+    assert_eq!(sink.kcp.borrow().probe_wait, 0, "窗口恢复后退避应清零");
+    assert_eq!(sink.kcp.borrow().ts_probe, 0);
+    assert!(sink.kcp.borrow().rmt_wnd > 0, "对端窗口应已更新");
+}
+
+/// 探测帧不得挤占 ACK：同一轮里两者都要发出
+///
+/// 若探测与 ACK 共用同一个 else 分支，零窗口时数据段的确认会被一直推迟，
+/// 发送方只能靠超时重传，吞吐直接塌陷。
+#[tokio::test]
+async fn probe_does_not_suppress_ack() {
+    let mut sink = Sink::new(KcpConfig::fast_mode());
+    // 数据段本身携带 wnd 字段，因此必须先发包、再用 Wins 把对端窗口压到 0
+    sink.kcp.borrow_mut().input(&common::stress::push_packet(1, 0, b"payload")).unwrap();
+    sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 0)).unwrap();
+    assert_eq!(sink.kcp.borrow().rmt_wnd, 0, "对端窗口应已压到 0");
+
+    sink.clear();
+    sink.update(20).await.unwrap();
+    assert_eq!(sink.count_cmd(KcpCmd::Ack), 1, "零窗口时数据段的 ACK 仍须发出");
+
+    // 探针在后续轮次也照常发出，不被 ACK 挡住。
+    // 必须按虚拟时钟逐轮推进：update 被 ts_flush 节流，跳步只会执行一次 flush。
+    let mut wask = 0usize;
+    for t in (100..=8_000u64).step_by(100) {
+        sink.clear();
+        sink.update(t).await.unwrap();
+        wask += sink.count_cmd(KcpCmd::Wask);
+    }
+    assert!(wask >= 1, "探测不应因 ACK 存在而被吞掉");
 }

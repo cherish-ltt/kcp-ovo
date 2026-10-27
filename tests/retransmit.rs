@@ -96,9 +96,10 @@ async fn fast_retransmit_with_large_window() {
     assert_same(&got, &payload);
 }
 
-/// 死链阈值常量默认值应符合协议约定（100 次）
+/// 死链阈值默认值应与 C 原版一致（IKCP_DEADLINK = 20 次）
 #[test]
-fn default_dead_link_is_100() {
+fn default_dead_link_matches_ikcp() {
     let kcp = Kcp::new(1, KcpConfig::default()).unwrap();
-    assert_eq!(kcp.dead_link, 100);
+    assert_eq!(kcp.dead_link, kcp_ovo::helper::IKCP_DEADLINK);
+    assert_eq!(kcp.dead_link, 20);
 }

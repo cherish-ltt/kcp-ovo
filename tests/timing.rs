@@ -82,7 +82,11 @@ async fn sender_fully_acknowledged_after_delivery() {
     assert!(sim.a.borrow().snd_buf.is_empty(), "交付完成后 snd_buf 仍有残留");
 }
 
-/// 单个 ACK 只应确认它对应的那一段，不能顺带确认后面的段
+/// 单个 ACK 只能确认「una 之前」的段，不能凭 sn 顺带确认后面的段
+///
+/// 确认必须由 una 驱动。若按 ACK 的 sn 精确删除，一个 sn=0、una=0
+/// 的包会把一段移出未确认队列，而 una 一旦越过它就等于承认了整条前缀，
+/// 两种口径互相矛盾，会造成对端尚未收到的段被提前删除。
 #[tokio::test]
 async fn ack_is_per_segment() {
     let mut sink = Sink::new(KcpConfig::fast_mode_with_wnd(8, 32));
@@ -95,15 +99,37 @@ async fn ack_is_per_segment() {
     sink.update(20).await.unwrap();
     assert_eq!(sink.kcp.borrow().snd_buf.len(), 3, "三段都应处于在途状态");
 
-    // 只对 sn=0 回应一个 ACK
+    // 对端只收到 sn=0：ACK(una=1) 只能确认第一段
     let ack = common::stress::raw_packet(
-        RawHeader { conv: 1, cmd: KcpCmd::Ack as u8, wnd: 1024, ..RawHeader::default() },
+        RawHeader {
+            conv: 1,
+            cmd: KcpCmd::Ack as u8,
+            wnd: 1024,
+            sn: 0,
+            una: 1,
+            ..RawHeader::default()
+        },
         &[],
     );
     sink.kcp.borrow_mut().input(&ack).unwrap();
     assert_eq!(sink.kcp.borrow().snd_buf.len(), 2, "只应确认 1 段");
-    // snd_una 只由 una 字段推进，单独的 ACK 包不带 una，因此这里不变
-    assert_eq!(sink.kcp.borrow().snd_una, 0);
+    assert_eq!(sink.kcp.borrow().snd_una, 1, "una 应推进到 1");
+
+    // 伪造「确认了 sn=2 但 una 仍为 1」的包：不得越界删除后面的段
+    let fake = common::stress::raw_packet(
+        RawHeader {
+            conv: 1,
+            cmd: KcpCmd::Ack as u8,
+            wnd: 1024,
+            sn: 2,
+            una: 1,
+            ..RawHeader::default()
+        },
+        &[],
+    );
+    sink.kcp.borrow_mut().input(&fake).unwrap();
+    assert_eq!(sink.kcp.borrow().snd_buf.len(), 2, "una 未推进时，仅凭 sn 不得删除未确认段");
+    assert_eq!(sink.kcp.borrow().snd_una, 1);
 }
 
 /// 接收端按序交付后，下一个期望 SN 应严格递增
@@ -226,4 +252,69 @@ async fn check_waits_for_probe_deadline() {
     let next = sink.kcp.borrow().check(20);
     assert!(ts_probe > 20, "首次探测后应安排下一次探测时刻");
     assert!(next >= ts_probe, "check() 返回 {next}，早于探测时刻 {ts_probe}，调用方会空转");
+}
+
+/// ACK 包里的 sn 与 una 互相矛盾时，不得越过 una 删除段
+///
+/// 若既按 ACK 包序号精确删除一段、又按 una 推进确认，两条路径各自生效时，
+/// 一个「sn=3、una=1」的包会把 sn=1..3 全部移出未确认队列，
+/// 而 una=1 只代表对端收到了 sn=0 一段 —— 另外两段对端根本没收到，
+/// 却从此不再重传。
+#[tokio::test]
+async fn ack_sn_must_not_delete_beyond_una() {
+    // nocwnd 让 4 段可以一次性进入在途队列
+    let cfg = KcpConfig { nocwnd: true, ..KcpConfig::fast_mode_with_wnd(64, 128) };
+    let mut sink = Sink::new(cfg);
+    // 先让对端窗口已知，否则首轮 flush 只放行 1 段探路
+    sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 256)).unwrap();
+    let mss = sink.kcp.borrow().mss as usize;
+    sink.kcp.borrow_mut().send(&vec![0xABu8; mss * 4]).unwrap();
+    sink.update(20).await.unwrap();
+    assert_eq!(sink.kcp.borrow().snd_buf.len(), 4, "4 段都应处于在途状态");
+
+    // ACK 的 sn 指向 sn=3，但 una=1 只承认 sn=0 已被收到
+    let ack = common::stress::raw_packet(
+        RawHeader {
+            conv: 1,
+            cmd: KcpCmd::Ack as u8,
+            wnd: 1024,
+            sn: 3,
+            una: 1,
+            ..RawHeader::default()
+        },
+        &[],
+    );
+    sink.kcp.borrow_mut().input(&ack).unwrap();
+
+    let sns: Vec<u32> = sink.kcp.borrow().snd_buf.iter().map(|s| s.kcp_packet.header.sn).collect();
+    assert_eq!(sink.kcp.borrow().snd_una, 1, "una 应按包内字段推进");
+    assert_eq!(sns, vec![1, 2, 3], "只有 una 之前的段能被确认，sn=1,2 必须继续等待重传");
+    assert_eq!(sink.kcp.borrow().nsnd_buf, 3, "计数必须与队列长度一致");
+}
+
+/// una 不推进时，单独的 ACK 不应让队列凭空变短
+///
+/// 逐段确认但 una 恒为 0 的包序列在真实链路上并不少见（接收端乱序，
+/// 只有前面出现缺口时才回填 una）。修复前每收一个这样的 ACK 就少一段，
+/// 到最后 snd_buf 被清空、snd_una 却仍是 0，收发双方对不上账。
+#[tokio::test]
+async fn ack_without_una_does_not_shrink_queue() {
+    let cfg = KcpConfig { nocwnd: true, ..KcpConfig::fast_mode_with_wnd(64, 128) };
+    let mut sink = Sink::new(cfg);
+    sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 256)).unwrap();
+    let mss = sink.kcp.borrow().mss as usize;
+    sink.kcp.borrow_mut().send(&vec![0xCDu8; mss * 4]).unwrap();
+    sink.update(20).await.unwrap();
+    assert_eq!(sink.kcp.borrow().snd_buf.len(), 4);
+
+    for sn in 0..4u32 {
+        let ack = common::stress::raw_packet(
+            RawHeader { conv: 1, cmd: KcpCmd::Ack as u8, wnd: 1024, sn, ..RawHeader::default() },
+            &[],
+        );
+        sink.kcp.borrow_mut().input(&ack).unwrap();
+    }
+    assert_eq!(sink.kcp.borrow().snd_una, 0, "una 从未推进");
+    assert_eq!(sink.kcp.borrow().snd_buf.len(), 4, "una 未推进时，未确认段不得被逐一删除");
+    assert_eq!(sink.kcp.borrow().nsnd_buf, 4);
 }

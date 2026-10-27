@@ -121,9 +121,15 @@ async fn update_throttled_by_interval() {
     // 紧接着的 update 未到 interval，不应重复发送
     let n2 = solo.step(1).await.unwrap();
     assert_eq!(n2, 0, "interval 内不应再次刷新");
-    // 超过 interval 后应再次刷新（触发重传或 ACK）
+    // 窗口探测按 IKCP_PROBE_INIT 退避，interval 到期只应触发 flush，
+    // 不应额外产生探测帧；这里只断言仍未重新探测
     let n3 = solo.step(50).await.unwrap();
-    assert!(n3 >= 1, "超过 interval 后应再次刷新");
+    assert_eq!(n3, 0, "探测退避未到期时不应再发探测帧");
+    // 跨过首次探测等待后应重新发出探测
+    let wait = solo.kcp.borrow().probe_wait;
+    assert!(wait >= kcp_ovo::helper::IKCP_PROBE_INIT, "首次探测等待应不小于 IKCP_PROBE_INIT");
+    let n4 = solo.step(wait).await.unwrap();
+    assert!(n4 >= 1, "探测等待到期后应重新发出探测帧");
 }
 
 /// 单端连续 update 不应 panic，即使从未收到任何包

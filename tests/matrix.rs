@@ -8,6 +8,7 @@ mod common;
 use common::stress::{config_matrix, transfer_a_to_b, transfer_both};
 use common::{Net, Rng, Sim};
 use kcp_ovo::KcpConfig;
+use kcp_ovo::helper::KcpCmd;
 
 /// 所有配置组合在干净链路上都应完成传输
 #[tokio::test]
@@ -137,4 +138,47 @@ async fn lopsided_windows_transfer_correctly() {
     assert!(ok, "悬殊窗口未完成，{ticks} tick");
     common::assert_same(&got, &payload);
     assert!(sim.a.borrow().snd_buf.len() <= 1, "发送端在途段数超过自身窗口 1");
+}
+
+/// nodelay 必须真正影响行为，而不是一个只存不用的开关
+///
+/// C 原版用 nodelay 决定最小 RTO（30ms / 100ms）以及超时重传的退避方式。
+/// 曾经的实现只把配置抄进字段、从未读取，用户把 nodelay 从 false 改成 true
+/// 时行为完全不变，低延迟配置形同虚设。
+#[tokio::test]
+async fn nodelay_changes_min_rto() {
+    let slow =
+        kcp_ovo::core::kcp::Kcp::new(1, KcpConfig { nodelay: false, ..KcpConfig::default() })
+            .unwrap();
+    let fast = kcp_ovo::core::kcp::Kcp::new(1, KcpConfig { nodelay: true, ..KcpConfig::default() })
+        .unwrap();
+    assert!(
+        fast.rx_minrto < slow.rx_minrto,
+        "nodelay 未生效：fast={} slow={}",
+        fast.rx_minrto,
+        slow.rx_minrto
+    );
+    assert_eq!(fast.rx_minrto, kcp_ovo::helper::IKCP_RTO_NDL);
+    assert_eq!(slow.rx_minrto, kcp_ovo::helper::IKCP_RTO_MIN);
+}
+
+/// nodelay 关闭时首传要额外等待 rtomin 才重传，开启时立即按 rto 重传
+#[tokio::test]
+async fn nodelay_affects_first_retransmit_deadline() {
+    async fn first_resendts(nodelay: bool) -> u64 {
+        use common::stress::Sink;
+        let mut sink = Sink::new(KcpConfig { nodelay, ..KcpConfig::fast_mode_with_wnd(8, 32) });
+        sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 32)).unwrap();
+        sink.kcp.borrow_mut().send(&[1u8; 100]).unwrap();
+        sink.update(20).await.unwrap();
+        let seg = sink.kcp.borrow().snd_buf.front().map(|s| s.resendts);
+        seg.expect("应有在途段")
+    }
+
+    let with_nd = first_resendts(true).await;
+    let without_nd = first_resendts(false).await;
+    assert!(
+        without_nd > with_nd,
+        "非 nodelay 模式首传重传期限应更晚：nodelay={with_nd} 非nodelay={without_nd}"
+    );
 }

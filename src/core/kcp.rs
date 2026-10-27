@@ -13,8 +13,9 @@ use crate::config::KcpConfig;
 use crate::error::{IncompleteDataType, KcpError, KcpResult};
 use crate::helper::{
     IKCP_ASK_SEND, IKCP_ASK_TELL, IKCP_DEADLINK, IKCP_FASTACK_LIMIT, IKCP_OVERHEAD,
-    IKCP_PROBE_LIMIT, IKCP_RTO_DEF, IKCP_RTO_MAX, IKCP_RTO_MIN, IKCP_THRESH_INIT,
-    IKCP_THRESH_INIT_WND, IKCP_THRESH_MIN, KcpPacket, KcpPacketHeader, current_millis,
+    IKCP_PROBE_INIT, IKCP_PROBE_LIMIT, IKCP_RTO_DEF, IKCP_RTO_MAX, IKCP_RTO_MIN, IKCP_RTO_NDL,
+    IKCP_THRESH_INIT, IKCP_THRESH_INIT_WND, IKCP_THRESH_MIN, KcpPacket, KcpPacketHeader,
+    current_millis,
 };
 use crate::queue::{KcpDeque, Segment};
 
@@ -195,14 +196,13 @@ impl Kcp {
             rx_rttval: 0,
             rx_srtt: 0,
             rx_rto: IKCP_RTO_DEF,
-            rx_minrto: IKCP_RTO_MIN,
+            // nodelay 模式用更小的 RTO 下限，否则低延迟配置毫无意义
+            rx_minrto: if config.nodelay { IKCP_RTO_NDL } else { IKCP_RTO_MIN },
             snd_wnd: config.snd_wnd,
             rcv_wnd: config.rcv_wnd,
-            // 修复 BUG-6：rmt_wnd 初始化为 0（C 原版 kcp->rmt_wnd = 0）
-            // Rust 原译：config.rcv_wnd → 远端窗口错误，初始发送速率过高
+            // 对端窗口在收到第一个包之前是未知的，按 0 处理才会先探测
             rmt_wnd: 0,
-            // 修复 BUG-1：cwnd 初始化为 IKCP_THRESH_INIT（值为 2）而非 0
-            // Rust 原译：0 → 默认模式（nocwnd=false）数据永不发送
+            // cwnd 为 0 时发送准入恒不通过，默认模式下永远发不出第一段
             cwnd: IKCP_THRESH_INIT as u16,
             probe: 0,
             current: 0,
@@ -347,9 +347,7 @@ impl Kcp {
             let size = buf.len().min(self.mss as usize);
             // 流模式所有 frg=0；非流模式递减 frg 链
             let frg = if is_stream { 0 } else { (count - i - 1) as u8 };
-            // 修复 BUG-11：窗口通告使用可用窗口（rcv_wnd - nrcv_que）而非总窗口
-            // C 原版：kcp->rcv_wnd - kcp->nrcv_que
-            // Rust 原译：self.rcv_wnd（固定值）→ 分段 >128 时死锁
+            // 通告剩余空间而非总窗口，否则接收端已满时对端仍会持续超发
             let header = KcpPacketHeader::new(
                 self.conv,
                 KcpCmd::Push,
@@ -382,11 +380,11 @@ impl Kcp {
     /// # 注意
     ///
     /// 流模式下，`BytesMut::with_capacity(peeksize)` 可以一次性分配足量缓冲区，
-    /// 避免多次重新分配（BUG-9 修复）。
+    /// 一次性算出总长，避免多次重新分配。
     pub fn peeksize(&self) -> KcpResult<usize> {
         let first = self.rcv_queue.front().ok_or(KcpError::QueueEmpty)?;
         // 流模式：返回所有 segment 的总大小（recv 一次性读取全部）
-        // 修复 BUG-9：原实现只返回第一个 segment 大小，导致 BytesMut 分配过小
+        // 分片必须累加，只取首片会让上层按过小的容量分配
         if self.stream_mode {
             let total_len: usize =
                 self.rcv_queue.iter().map(|s| s.kcp_packet.header.len as usize).sum();
@@ -462,10 +460,9 @@ impl Kcp {
         // 根据命令类型处理
         match header.cmd {
             KcpCmd::Ack => {
-                // ACK命令：确认包
-                // 用 snd_nxt 做上界而不是 snd_una：第一个待确认段 sn=0 时
-                // snd_una 也是 0，若拿 snd_una 比较会把合法 ACK 判成过期。
-                // 超出 snd_nxt 的 ACK 一定是伪造或过期的，直接忽略。
+                // 用 snd_nxt 而非 snd_una 做上界：第一个待确认段 sn=0 时
+                // snd_una 也是 0，用 snd_una 比较会把合法 ACK 判成过期。
+                // 这里只做 RTT 采样，段的删除统一由 una 驱动。
                 if self.timediff_u32(self.snd_nxt, header.sn) >= 0 {
                     self.parse_ack(header.sn);
                 }
@@ -506,9 +503,10 @@ impl Kcp {
             KcpCmd::Wins => {},
         }
 
-        // 修复 BUG-7：parse_fastack 必须在 parse_una 之前调用
-        // 若先调用 parse_una 移除 sn < una 的段，剩余段 sn >= una，
-        // 则 parse_fastack 中 una > seg.sn 永假 → fastack 永不递增 → 快速重传失效
+        // parse_fastack 必须先于 parse_una：una 推进后剩余段都满足 sn >= una，
+        // parse_fastack 里 `una > seg.sn` 永假，快速重传会完全失效。
+        // 确认只由 una 驱动；若再按 ACK 包的 sn 精确删除，一个「sn=0 却携带 una=3」
+        // 的包会把对端尚未收到的段一并移出 snd_buf。
         if self.timediff_u32(header.una, self.snd_una) > 0 {
             self.parse_fastack(header.una);
             self.parse_una(header.una);
@@ -521,13 +519,10 @@ impl Kcp {
         Ok(())
     }
 
-    /// 移除 snd_buf 中所有 sn < una 的已确认段，并更新 snd_una
+    /// 移除 snd_buf 中所有 sn < una 的已确认段，并推进 snd_una
     ///
-    /// # BUG-3 修复说明
-    ///
-    /// 原实现缺少 `self.snd_una = una`，snd_una 初始化后从未更新（始终为 0），
-    /// 导致 input() 中 `timediff_u32(header.una, snd_una) > 0` 对每个包都成立，
-    /// 同时也导致 BUG-7（快速重传失效）。
+    /// snd_una 必须跟随推进，否则 input() 里 `timediff_u32(header.una, snd_una) > 0`
+    /// 对每个包都成立，
     fn parse_una(&mut self, una: u32) {
         while let Some(seg) = self.snd_buf.front() {
             if self.timediff_u32(una, seg.kcp_packet.header.sn) > 0 {
@@ -537,7 +532,7 @@ impl Kcp {
                 break;
             }
         }
-        // 修复 BUG-3：snd_una 必须跟随未被确认的最小 SN
+        // snd_una 必须跟随未被确认的最小 SN
         // 只允许单调前进：乱序或过期的 una 不能把 snd_una 拉回去，
         // 否则回绕点附近会与 snd_buf 内的段脱节。
         if self.timediff_u32(una, self.snd_una) > 0 {
@@ -548,22 +543,18 @@ impl Kcp {
         self.ts_lastack = self.current;
     }
 
-    /// 处理 ACK 确认：更新 RTT/RTO，移除 snd_buf 中被确认的段
+    /// 处理单个 ACK 的 RTT 采样
     ///
-    /// # BUG-2 修复说明
-    ///
-    /// 条件判断使用 `== 0` 而非 `>= 0`。`snd_buf` 按 SN 升序排列，
-    /// 若用 `>= 0` 则对第一个分段几乎永远成立，导致 RTT 始终使用
-    /// 第一个分段的发送时间，RTO 计算完全错误。
+    /// 只负责 RTT/RTO 估计，不推进确认、不删除 `snd_buf`；
+    /// 确认的唯一驱动者是包头携带的 `una`（见 `parse_una`）。
     fn parse_ack(&mut self, sn: u32) {
         let current = self.current;
         let mut rtt_update = None;
         for seg in self.snd_buf.iter() {
-            // 修复 BUG-2：必须精确匹配被确认的分段
+            // 必须精确匹配：snd_buf 按 SN 升序，用 `>= 0` 会让 RTT 永远取首段
             if self.timediff_u32(sn, seg.kcp_packet.header.sn) == 0 {
-                // Karn 算法：重传段的 ACK 无法区分是对首传还是重传的确认，
-                // 其 ts 仍是首传时刻，直接采样会把重传等待时间算进 RTT，
-                // 使 rttval 爆炸式增长、RTO 迅速退避到几十秒。
+                // Karn 算法：重传段的 ts 仍是首传时刻，采样会把重传等待时间
+                // 算进 RTT，使 rttval 膨胀、RTO 迅速退避到几十秒。
                 if seg.xmit == 1 {
                     let rtt = self.timediff_u64(current, seg.kcp_packet.header.ts);
                     if rtt >= 0 {
@@ -587,30 +578,12 @@ impl Kcp {
         }
         // 与 parse_una 同理：记录确认时刻，供 cwnd 增长门限使用
         self.ts_lastack = current;
-
-        // 修复 BUG-8：使用 retain 原地过滤，代替原 O(n) 弹出-重新压入模式
-        // 原实现：弹出所有段到临时 Vec -> 过滤 -> 重新压入，每次 ACK 都触发分配
-        let mut removed = false;
-        self.snd_buf.retain(|seg| {
-            if seg.kcp_packet.header.sn == sn && !removed {
-                removed = true;
-                false // 移除匹配的第一个段
-            } else {
-                true // 保留其他段
-            }
-        });
-        if removed {
-            self.nsnd_buf -= 1;
-        }
     }
 
     /// 根据 una 对所有未确认段增加快速重传计数
     ///
-    /// # BUG-7 修复说明
-    ///
-    /// 此方法必须在 `parse_una()` 之前调用。若先调用 parse_una 移除 sn < una 的段，
-    /// 剩余段 sn >= una → `una > seg.sn` 永假 → fastack 永不递增 → 快速重传完全失效。
-    /// 调用顺序在 `input()` 中保证：先 parse_fastack，后 parse_una。
+    /// 必须在 `parse_una()` 之前调用：若先移除 sn < una 的段，剩余段都满足 sn >= una，
+    /// `una > seg.sn` 永假，fastack 永不递增。调用顺序由 `input()` 保证。
     fn parse_fastack(&mut self, una: u32) {
         for seg in self.snd_buf.iter_mut() {
             if (una as i32).wrapping_sub(seg.kcp_packet.header.sn as i32) > 0 && seg.fastack < 255 {
@@ -651,7 +624,6 @@ impl Kcp {
 
     /// 发送控制帧（Wask / Ack / Wins）的快捷方法
     ///
-    /// # BUG-11 修复
     ///
     /// 窗口通告使用可用窗口（rcv_wnd - nrcv_que）而非总窗口 rcv_wnd，
     /// 与控制段 header 中 wnd 字段的设置一致。
@@ -685,7 +657,7 @@ impl Kcp {
             self.nsnd_que -= 1;
             seg.kcp_packet.header.conv = self.conv;
             seg.kcp_packet.header.cmd = KcpCmd::Push;
-            // 修复 BUG-11：使用可用窗口而非总窗口通告给对端
+            // 通告可用窗口而非总窗口
             seg.kcp_packet.header.wnd = self.rcv_wnd.saturating_sub(self.nrcv_que as u16);
             seg.kcp_packet.header.ts = self.current;
             seg.kcp_packet.header.una = self.rcv_nxt;
@@ -702,15 +674,21 @@ impl Kcp {
         // probe_due 只看本轮是否到期，与 ts_probe 的取值解耦：
         // 首次探测需要立即发出，但 ts_probe 必须同时按退避量推后，
         // 否则它在后续每轮 flush 都会再次到期，退避形同虚设。
+        // 首次等待必须从 IKCP_PROBE_INIT 起步。若取 interval（fast 模式 20ms），
+        // 退避序列会退化成几十毫秒级，长时间零窗口的连接会被 WASK 高频轰炸。
         let mut probe_due = false;
         if self.rmt_wnd == 0 {
             if self.probe_wait == 0 {
-                self.probe_wait = self.interval.max(1);
+                self.probe_wait = IKCP_PROBE_INIT;
                 self.ts_probe = self.current + self.probe_wait;
                 self.probe |= IKCP_ASK_SEND;
                 probe_due = true;
             } else if self.timediff_u64(self.current, self.ts_probe) >= 0 {
-                self.probe_wait = (self.probe_wait * 2).min(IKCP_PROBE_LIMIT);
+                // 不小于 IKCP_PROBE_INIT 后按 1.5 倍增长
+                if self.probe_wait < IKCP_PROBE_INIT {
+                    self.probe_wait = IKCP_PROBE_INIT;
+                }
+                self.probe_wait = (self.probe_wait + self.probe_wait / 2).min(IKCP_PROBE_LIMIT);
                 self.ts_probe = self.current + self.probe_wait;
                 self.probe |= IKCP_ASK_SEND;
                 probe_due = true;
@@ -723,8 +701,7 @@ impl Kcp {
         }
 
         // 收集待发送的 ACK 列表，评估是否需要窗口探测
-        // 修复 BUG-4：ACK 发送不再被 need_wask else 分支阻塞，
-        // Wask 和 ACK 是独立的两个操作（与原版 C 代码一致）
+        // ACK 与 WASK 互不阻塞：两者是独立操作
         let acks_to_send = self.acklist.clone();
         let need_wask = acks_to_send.is_empty() && probe_due && (self.probe & IKCP_ASK_SEND) != 0;
         let need_wins = (self.probe & IKCP_ASK_TELL) != 0;
@@ -746,9 +723,19 @@ impl Kcp {
         let mut sends = Vec::new();
         let mut need_update = Vec::new();
 
+        // 非 nodelay 模式下首传要额外等待 rtomin 再重传（C 原版行为）：
+        // 给 Nagle 式的聚合留出余量，避免刚发出就判定超时。
+        let rtomin = if self.nodelay { 0 } else { (self.rx_rto / 8).max(1) };
+
         for (idx, seg) in self.snd_buf.iter().enumerate() {
             if seg.xmit == 0 {
-                need_update.push((idx, 1, current.wrapping_add(seg.rto), seg.rto, false));
+                need_update.push((
+                    idx,
+                    1,
+                    current.wrapping_add(seg.rto).wrapping_add(rtomin),
+                    seg.rto,
+                    false,
+                ));
                 sends.push((
                     seg.kcp_packet.header.frg,
                     seg.kcp_packet.header.sn,
@@ -759,16 +746,26 @@ impl Kcp {
                 ));
                 continue;
             }
-            // 修复 BUG-5：两个重传条件用 else if 互斥
-            // 超时重传优先于快速重传，避免同一段被推入 sends 两次
+            // 两个重传条件必须互斥：超时重传优先，否则同一段会被推入 sends 两次
             if (current as i32).wrapping_sub(seg.resendts as i32) >= 0 {
                 if seg.xmit >= self.dead_link {
                     return Err(KcpError::IoError(
                         "Connection lost due to too many retransmissions".to_string(),
                     ));
                 }
-                let new_rto = (seg.rto * 2).min(IKCP_RTO_MAX);
-                need_update.push((idx, seg.xmit + 1, current.wrapping_add(seg.rto), new_rto, true));
+                // C 原版：nodelay 模式退避翻倍，普通模式跟随实测 RTT 取较大者
+                let new_rto = if self.nodelay {
+                    (seg.rto * 2).min(IKCP_RTO_MAX)
+                } else {
+                    seg.rto.max(self.rx_rto).min(IKCP_RTO_MAX)
+                };
+                need_update.push((
+                    idx,
+                    seg.xmit + 1,
+                    current.wrapping_add(seg.rto).wrapping_add(rtomin),
+                    new_rto,
+                    true,
+                ));
                 sends.push((
                     seg.kcp_packet.header.frg,
                     seg.kcp_packet.header.sn,
@@ -777,7 +774,6 @@ impl Kcp {
                     seg.kcp_packet.header.wnd,
                     seg.get_data(),
                 ));
-            // 修复 BUG-5：使用 else if 而非独立的 if，防止双重发送
             // fastresend == 0 表示关闭快速重传（normal_mode 的默认值）。
             // 若不判 0，`fastack >= 0` 恒真，每个在途段每轮都被当作丢包重发，
             // 并把 is_lost 置位，使 cwnd 每轮都被砸回 1。
@@ -970,7 +966,7 @@ mod tests {
             .unwrap(),
         );
         kcp.nrcv_que += 2;
-        // After BUG-9 fix: peeksize returns sum of all segment lengths (3 + 4 = 7)
+        // peeksize 返回所有分片长度之和（3 + 4 = 7）
         assert_eq!(kcp.peeksize().unwrap(), 7);
     }
 
@@ -1120,7 +1116,7 @@ mod tests {
         assert_eq!(r.lock().unwrap().recv().unwrap().to_vec(), b"Hello Stream Mode!");
     }
 
-    // ===== Bug-fix regression tests =====
+    // ===== 回归测试 =====
 
     #[test]
     fn test_parse_ack_nsnd_buf_integrity() {
@@ -1134,15 +1130,17 @@ mod tests {
         }
         assert_eq!(kcp.nsnd_buf, 5);
 
-        // Process ACK for sn=2 — removes exactly one segment
+        // parse_ack 只做 RTT 采样，不删除 snd_buf，计数必须保持不变
         kcp.parse_ack(2);
+        assert_eq!(kcp.nsnd_buf, 5, "parse_ack 不应改动未确认队列");
 
-        // nsnd_buf must reflect the remaining 4 segments
-        assert_eq!(kcp.nsnd_buf, 4);
+        // 确认推进由 una 驱动：una=3 表示 sn<3 全部确认
+        kcp.parse_una(3);
+        assert_eq!(kcp.nsnd_buf, 2);
         // Remaining segments must be in order
         let sns: Vec<u32> = kcp.snd_buf.iter().map(|s| s.kcp_packet.header.sn).collect();
-        assert_eq!(sns, vec![0, 1, 3, 4]);
-        assert_eq!(kcp.waitsnd(), 4);
+        assert_eq!(sns, vec![3, 4]);
+        assert_eq!(kcp.waitsnd(), 2);
     }
 
     #[test]
@@ -1194,7 +1192,7 @@ mod tests {
             s.current = now + i * s.interval;
             s.update(s.current).await.unwrap();
         }
-        // BUG-6 fix: receiver's rmt_wnd updated from received header.wnd
+        // 接收方的 rmt_wnd 应随包头 wnd 字段更新
         // Receiver reassembles the message
         let received = r.lock().unwrap().recv().unwrap();
         assert_eq!(received.to_vec(), msg);
@@ -1218,24 +1216,29 @@ mod tests {
 
         // 首次 flush：对端窗口未知且无历史退避，应当即到期并推进一次退避
         kcp.flush().await.unwrap();
-        let first_wait = kcp.interval.max(1);
+        // 首发间隔必须从 IKCP_PROBE_INIT 起步，而不是 interval
+        let first_wait = IKCP_PROBE_INIT;
         wnds.push((kcp.probe_wait, kcp.ts_probe));
+        assert_eq!(kcp.probe_wait, first_wait, "首次探测等待应为 IKCP_PROBE_INIT");
+        assert_eq!(kcp.ts_probe, now + first_wait);
 
         // 未到期前不推进退避
         kcp.current = now + first_wait - 1;
         kcp.flush().await.unwrap();
         assert_eq!(kcp.probe_wait, first_wait, "未到 ts_probe 前退避不应变化");
 
-        // 到期后退避翻倍，ts_probe 推后
+        // 到期后按 1.5 倍增长（C 原版语义），ts_probe 同步推后
+        let second_wait = first_wait + first_wait / 2;
         kcp.current = now + first_wait;
         kcp.flush().await.unwrap();
-        assert_eq!(kcp.probe_wait, first_wait * 2);
-        assert_eq!(kcp.ts_probe, kcp.current + first_wait * 2);
+        assert_eq!(kcp.probe_wait, second_wait);
+        assert_eq!(kcp.ts_probe, kcp.current + second_wait);
 
-        kcp.current = now + first_wait + first_wait * 2;
+        let third_wait = second_wait + second_wait / 2;
+        kcp.current = now + first_wait + second_wait;
         kcp.flush().await.unwrap();
-        assert_eq!(kcp.probe_wait, first_wait * 4);
-        assert_eq!(kcp.ts_probe, kcp.current + first_wait * 4);
+        assert_eq!(kcp.probe_wait, third_wait);
+        assert_eq!(kcp.ts_probe, kcp.current + third_wait);
 
         // 对端通告窗口后，退避状态必须清零
         kcp.rmt_wnd = 32;
@@ -1277,7 +1280,7 @@ mod tests {
         assert_eq!(r.lock().unwrap().recv().unwrap().to_vec(), msg);
     }
 
-    // ===== BUG-1: cwnd init =====
+    // ===== 拥塞窗口初值 =====
     #[test]
     fn test_cwnd_init_nonzero() {
         let kcp = Kcp::new(1, KcpConfig::default()).unwrap();
@@ -1298,7 +1301,7 @@ mod tests {
         assert_eq!(kcp.nsnd_que, 0);
     }
 
-    // ===== BUG-2: parse_ack RTT comparison =====
+    // ===== ACK 与 RTT 采样 =====
     #[test]
     fn test_parse_ack_rtt_correct() {
         let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
@@ -1337,10 +1340,12 @@ mod tests {
         let before = kcp.rx_srtt;
         kcp.parse_ack(0);
         assert_eq!(kcp.rx_srtt, before, "重传段不应更新 RTT");
+        // 确认只由 una 驱动，重传段同样只能通过 una 被移除
+        kcp.parse_una(1);
         assert_eq!(kcp.nsnd_buf, 0, "重传段仍应被正常确认移除");
     }
 
-    // ===== BUG-3: snd_una updated =====
+    // ===== 确认号推进 =====
     #[test]
     fn test_snd_una_updated() {
         let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
@@ -1362,14 +1367,14 @@ mod tests {
         assert_eq!(remaining_sn, 12);
     }
 
-    // ===== BUG-6: rmt_wnd init =====
+    // ===== 对端窗口初值 =====
     #[test]
     fn test_rmt_wnd_zero_at_init() {
         let kcp = Kcp::new(1, KcpConfig::default()).unwrap();
         assert_eq!(kcp.rmt_wnd, 0);
     }
 
-    // ===== BUG-7: fastack incremented =====
+    // ===== 快速重传计数 =====
     #[test]
     fn test_fastack_incremented() {
         let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
@@ -1396,7 +1401,7 @@ mod tests {
         assert_eq!(fastacks, vec![2, 1, 0]);
     }
 
-    // ===== BUG-4: ACK sent with Wask =====
+    // ===== ACK 与窗口探测互不阻塞 =====
     #[tokio::test]
     async fn test_ack_sent_with_wask() {
         let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
@@ -1442,7 +1447,7 @@ mod tests {
         assert!(*sent_ack.lock().unwrap(), "ACKs should still be sent");
     }
 
-    // ===== BUG-5: no duplicate retransmit =====
+    // ===== 重传不重复发送 =====
     #[test]
     fn test_no_dup_retransmit() {
         let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
@@ -1486,7 +1491,7 @@ mod tests {
         assert_eq!(sends[0], 0);
     }
 
-    // ===== BUG-8: parse_ack retain =====
+    // ===== ACK 处理的队列操作 =====
     #[test]
     fn test_parse_ack_retain() {
         let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
@@ -1499,36 +1504,30 @@ mod tests {
         }
         assert_eq!(kcp.nsnd_buf, 5);
 
-        // Process ACK for sn=1 (middle segment)
+        // 确认由 una 驱动，只按 sn 精确删除会让「sn 已确认、但后续段并未被对端收到」
+        // 的段提前离开未确认队列，这里固化新语义。
+        // ACK 包只做 RTT 采样，不改变队列
         kcp.parse_ack(1);
+        assert_eq!(kcp.nsnd_buf, 5, "parse_ack 不应删除任何段");
 
-        // Verify: nsnd_buf decremented by 1
-        assert_eq!(kcp.nsnd_buf, 4);
-        // Verify: remaining segments in order: 0, 2, 3, 4
-        let sns: Vec<u32> = kcp.snd_buf.iter().map(|s| s.kcp_packet.header.sn).collect();
-        assert_eq!(sns, vec![0, 2, 3, 4]);
-
-        // Process ACK for sn=0 (first segment)
-        kcp.parse_ack(0);
+        // una=2 表示 sn<2 全部被对端收到
+        kcp.parse_una(2);
         assert_eq!(kcp.nsnd_buf, 3);
         let sns: Vec<u32> = kcp.snd_buf.iter().map(|s| s.kcp_packet.header.sn).collect();
         assert_eq!(sns, vec![2, 3, 4]);
 
-        // Process ACK for sn=4 (last segment)
-        kcp.parse_ack(4);
-        assert_eq!(kcp.nsnd_buf, 2);
-        let sns: Vec<u32> = kcp.snd_buf.iter().map(|s| s.kcp_packet.header.sn).collect();
-        assert_eq!(sns, vec![2, 3]);
+        // una 只许前进：更小的 una 不得把已确认段复活或造成回退
+        kcp.parse_una(1);
+        assert_eq!(kcp.nsnd_buf, 3);
+        assert_eq!(kcp.snd_una, 2);
 
-        // Process ACK for a segment not in snd_buf (sn=99)
-        kcp.parse_ack(99);
-        // Nothing should be removed, nsnd_buf unchanged
-        assert_eq!(kcp.nsnd_buf, 2);
-        let sns: Vec<u32> = kcp.snd_buf.iter().map(|s| s.kcp_packet.header.sn).collect();
-        assert_eq!(sns, vec![2, 3]);
+        // 非法 una（远超 snd_nxt）也不应越界删除
+        kcp.parse_una(99);
+        assert_eq!(kcp.nsnd_buf, 0);
+        assert!(kcp.snd_buf.is_empty());
     }
 
-    // ===== BUG-9: stream peeksize sum =====
+    // ===== 分片长度累加 =====
     #[test]
     fn test_stream_peeksize_sum() {
         let mut kcp = Kcp::new(1, KcpConfig::stream_mode()).unwrap();
@@ -1560,7 +1559,7 @@ mod tests {
         assert_eq!(kcp.peeksize().unwrap(), 9);
     }
 
-    // ===== BUG-11: large message deadlock =====
+    // ===== 大消息与窗口通告 =====
     #[tokio::test]
     async fn test_no_deadlock_large_message() {
         // Use larger rcv_wnd to accommodate 219 segments (300KB / 1372)
@@ -1605,7 +1604,7 @@ mod tests {
         assert_eq!(r.lock().unwrap().nrcv_que, 0);
     }
 
-    // ===== BUG-12: ts_lastack 从未赋值，cwnd 增长门限恒真 =====
+    // ===== cwnd 增长门限 =====
     #[test]
     fn test_parse_ack_sets_ts_lastack() {
         let mut kcp = Kcp::new(1, KcpConfig::normal_mode()).unwrap();
@@ -1621,7 +1620,7 @@ mod tests {
         assert_eq!(kcp.ts_lastack, 4321, "parse_ack 后 ts_lastack 必须跟到当前时刻");
     }
 
-    // ===== BUG-4: parse_una 无条件回写，过期 una 会把 snd_una 拉回去 =====
+    // ===== 过期 una 不得回退确认号 =====
     #[test]
     fn test_parse_una_never_moves_backward() {
         let mut kcp = Kcp::new(1, KcpConfig::normal_mode()).unwrap();
@@ -1640,7 +1639,7 @@ mod tests {
         assert_eq!(kcp.snd_una, 20, "更大的 una 应继续推进");
     }
 
-    // ===== BUG-12: ts_lastack 被赋值（parse_una 侧） =====
+    // ===== parse_una 侧的确认时刻 =====
     #[test]
     fn test_parse_una_sets_ts_lastack() {
         let mut kcp = Kcp::new(1, KcpConfig::normal_mode()).unwrap();
@@ -1649,7 +1648,7 @@ mod tests {
         assert_eq!(kcp.ts_lastack, 777, "parse_una 后 ts_lastack 必须跟到当前时刻");
     }
 
-    // ===== BUG-13: ssthresh 初值等于 cwnd 初值，慢启动被跳过 =====
+    // ===== 慢启动与 ssthresh 初值 =====
     #[test]
     fn test_ssthresh_init_enables_slow_start() {
         let kcp = Kcp::new(1, KcpConfig::normal_mode()).unwrap();
@@ -1661,7 +1660,7 @@ mod tests {
         );
     }
 
-    // ===== BUG-14: fastresend=0 被当作阈值 0，每轮都误判丢包 =====
+    // ===== fastresend 关闭快速重传 =====
     #[tokio::test]
     async fn test_fastresend_zero_does_not_trigger_fast_retransmit() {
         let mut kcp = Kcp::new(1, KcpConfig::normal_mode()).unwrap();

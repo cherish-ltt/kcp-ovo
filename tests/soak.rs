@@ -242,7 +242,10 @@ async fn ack_storm_keeps_state_consistent() {
         sink.update(20 + round * 20).await.unwrap();
         let in_flight: Vec<u32> =
             sink.kcp.borrow().snd_buf.iter().map(|s| s.kcp_packet.header.sn).collect();
-        // 每个在途 SN 重复确认 50 次，模拟 ACK 风暴
+        // 每个在途 SN 重复确认 50 次，模拟 ACK 风暴。
+        // 确认只由 una 驱动（与 C 原版一致），因此风暴中的每个 ACK 都要带上
+        // 「对端已连续收到的位置」= 该 sn + 1，否则风暴不会推进任何确认，
+        // 这与真实实现里接收端回填 una = rcv_nxt 的行为对应。
         for _ in 0..50 {
             for sn in &in_flight {
                 let pkt = common::stress::raw_packet(
@@ -251,6 +254,7 @@ async fn ack_storm_keeps_state_consistent() {
                         cmd: KcpCmd::Ack as u8,
                         wnd: 512,
                         sn: *sn,
+                        una: sn.wrapping_add(1),
                         ..common::stress::RawHeader::default()
                     },
                     &[],
@@ -265,4 +269,62 @@ async fn ack_storm_keeps_state_consistent() {
     assert_eq!(sink.kcp.borrow().nsnd_buf, 0, "全部确认后仍残留未确认段");
     assert_eq!(sink.kcp.borrow().snd_buf.len(), 0);
     assert_eq!(sink.kcp.borrow().waitsnd(), 0);
+}
+
+/// 回绕点上双向同时传输，接收窗口恰好跨越 u32::MAX
+///
+/// 既有用例把 rcv_nxt 设在回绕点附近，但两端都是从同一位置出发、窗口内也没有
+/// 大量乱序段同时压住回绕点。这里让两个方向同时跨过 u32::MAX，
+/// 且窗口边界本身落在回绕点两侧，验证窗口比较、乱序缓存与交付都按 wrapping 语义工作。
+#[tokio::test]
+async fn wraparound_with_bidirectional_window_span() {
+    use common::stress::transfer_both;
+
+    let mut rng = Rng::new(0xB001_0B01);
+    for start in [u32::MAX - 2, u32::MAX - 1, u32::MAX] {
+        let net = Net::loss(0.08).with_delay(6).with_jitter(3).with_reorder(0.15, 0.05);
+        let cfg = KcpConfig { snd_wnd: 16, rcv_wnd: 32, ..KcpConfig::stream_mode() };
+        let mut sim = Sim::new(cfg, net, 0xB001_0B00);
+        sim.a.borrow_mut().snd_nxt = start;
+        sim.a.borrow_mut().snd_una = start;
+        sim.b.borrow_mut().rcv_nxt = start;
+        // 反方向也跨同一个回绕点，验证两端独立推进互不干扰
+        sim.b.borrow_mut().snd_nxt = start;
+        sim.b.borrow_mut().snd_una = start;
+        sim.a.borrow_mut().rcv_nxt = start;
+
+        let mss = sim.a.borrow().mss as usize;
+        let a_payload = rng.bytes(mss * 24);
+        let b_payload = rng.bytes(mss * 24);
+        let (ok, got_b, got_a, ticks) =
+            transfer_both(&mut sim, &a_payload, &b_payload, 2_000_000).await;
+        assert!(ok, "起点 {start} 双向回绕失败，{ticks} tick");
+        assert_same(&got_b, &a_payload);
+        assert_same(&got_a, &b_payload);
+        assert_eq!(sim.a.borrow().waitsnd(), 0, "A 端应全部确认");
+        assert_eq!(sim.b.borrow().waitsnd(), 0, "B 端应全部确认");
+    }
+}
+
+/// 回绕点后立刻重传乱序段：旧段与回绕后的新段必须被正确区分
+///
+/// 回绕点附近最容易出现的错误是比较号把「回绕后的大序号」当成过期段。
+/// 这里人为制造一次丢包与乱序，让回绕两侧的段同时滞留在 rcv_buf。
+#[tokio::test]
+async fn wraparound_mixed_with_retransmission() {
+    let start = u32::MAX - 1;
+    let net = Net::loss(0.2).with_delay(8).with_reorder(0.25, 0.1);
+    let cfg = KcpConfig { snd_wnd: 8, rcv_wnd: 32, ..KcpConfig::stream_mode() };
+    let mut sim = Sim::new(cfg, net, 0xB001_0C00);
+    sim.a.borrow_mut().snd_nxt = start;
+    sim.a.borrow_mut().snd_una = start;
+    sim.b.borrow_mut().rcv_nxt = start;
+
+    let mut rng = Rng::new(0xB001_0C01);
+    let mss = sim.a.borrow().mss as usize;
+    let payload = rng.bytes(mss * 32);
+    let (ok, got, ticks) = transfer_a_to_b(&mut sim, &payload, 3_000_000).await;
+    assert!(ok, "回绕 + 乱序 + 丢包未收敛，{ticks} tick");
+    assert_same(&got, &payload);
+    assert_eq!(sim.b.borrow().nrcv_buf, 0, "交付完成后不应残留乱序缓存");
 }
