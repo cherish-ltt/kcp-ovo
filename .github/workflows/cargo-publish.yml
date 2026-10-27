@@ -1,14 +1,18 @@
 name: Publish to crates.io
 
-# 触发：GitHub Release 发布后（Release 工作流已先完成 ci 校验并成功创建 Release）
-# 行为：检出该 Release 对应标签的提交并发布到 crates.io，保证发布顺序为
-#       ci → release → cargo publish。
+# 触发：
+#   workflow_call     —— 由 Release 工作流在 Release 创建成功后调用，
+#                        保证 ci 校验 → Release → cargo publish 的顺序
+#   workflow_dispatch —— 发布失败后手动重试，无需重新打标签
 #
-# 注意：crates.io 的可信发布不接受 workflow_run 触发，只支持 push / release /
-#       workflow_dispatch，因此这里用 release: published 承接上游。
+# 为什么用 workflow_call 而不是事件串接：
+#   crates.io 的可信发布只接受 push / release / workflow_dispatch 事件，
+#   明确拒绝 workflow_run；而 Release 由 GITHUB_TOKEN 创建时不会触发
+#   release: published 事件。workflow_call 与调用方共享同一次 push 事件，
+#   发布动作仍归属本文件，满足可信发布对工作流文件与环境的要求。
 on:
-  release:
-    types: [published]
+  workflow_call:
+  workflow_dispatch:
 
 jobs:
   publish:
@@ -22,8 +26,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.release.tag_name }}
       - uses: dtolnay/rust-toolchain@1.99.1
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
