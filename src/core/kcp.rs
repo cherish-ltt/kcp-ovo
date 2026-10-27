@@ -13,8 +13,8 @@ use crate::config::KcpConfig;
 use crate::error::{IncompleteDataType, KcpError, KcpResult};
 use crate::helper::{
     IKCP_ASK_SEND, IKCP_ASK_TELL, IKCP_DEADLINK, IKCP_FASTACK_LIMIT, IKCP_OVERHEAD,
-    IKCP_PROBE_LIMIT, IKCP_RTO_DEF, IKCP_RTO_MAX, IKCP_RTO_MIN, IKCP_THRESH_INIT, IKCP_THRESH_MIN,
-    KcpPacket, KcpPacketHeader, current_millis,
+    IKCP_PROBE_LIMIT, IKCP_RTO_DEF, IKCP_RTO_MAX, IKCP_RTO_MIN, IKCP_THRESH_INIT,
+    IKCP_THRESH_INIT_WND, IKCP_THRESH_MIN, KcpPacket, KcpPacketHeader, current_millis,
 };
 use crate::queue::{KcpDeque, Segment};
 
@@ -191,7 +191,7 @@ impl Kcp {
             rcv_nxt: 0,
             ts_recent: 0,
             ts_lastack: 0,
-            ssthresh: IKCP_THRESH_INIT,
+            ssthresh: IKCP_THRESH_INIT_WND,
             rx_rttval: 0,
             rx_srtt: 0,
             rx_rto: IKCP_RTO_DEF,
@@ -543,6 +543,9 @@ impl Kcp {
         if self.timediff_u32(una, self.snd_una) > 0 {
             self.snd_una = una;
         }
+        // 拥塞窗口每收到一次确认最多增长一次（见 flush 尾部），
+        // 记录最近确认时刻作为门限，否则该门限恒真、cwnd 每轮都涨。
+        self.ts_lastack = self.current;
     }
 
     /// 处理 ACK 确认：更新 RTT/RTO，移除 snd_buf 中被确认的段
@@ -582,6 +585,8 @@ impl Kcp {
                 .max(self.rx_minrto)
                 .min(IKCP_RTO_MAX);
         }
+        // 与 parse_una 同理：记录确认时刻，供 cwnd 增长门限使用
+        self.ts_lastack = current;
 
         // 修复 BUG-8：使用 retain 原地过滤，代替原 O(n) 弹出-重新压入模式
         // 原实现：弹出所有段到临时 Vec -> 过滤 -> 重新压入，每次 ACK 都触发分配
@@ -773,7 +778,10 @@ impl Kcp {
                     seg.get_data(),
                 ));
             // 修复 BUG-5：使用 else if 而非独立的 if，防止双重发送
-            } else if seg.fastack >= self.fastresend as u32 {
+            // fastresend == 0 表示关闭快速重传（normal_mode 的默认值）。
+            // 若不判 0，`fastack >= 0` 恒真，每个在途段每轮都被当作丢包重发，
+            // 并把 is_lost 置位，使 cwnd 每轮都被砸回 1。
+            } else if self.fastresend > 0 && seg.fastack >= self.fastresend as u32 {
                 if seg.xmit >= self.dead_link {
                     return Err(KcpError::IoError(
                         "Connection lost due to too many retransmissions".to_string(),
@@ -1595,5 +1603,89 @@ mod tests {
         assert_eq!(received.len(), data_size, "All data should be received");
         assert_eq!(received.to_vec(), msg);
         assert_eq!(r.lock().unwrap().nrcv_que, 0);
+    }
+
+    // ===== BUG-12: ts_lastack 从未赋值，cwnd 增长门限恒真 =====
+    #[test]
+    fn test_parse_ack_sets_ts_lastack() {
+        let mut kcp = Kcp::new(1, KcpConfig::normal_mode()).unwrap();
+        let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 100, 0, 0, 10);
+        let mut seg = Segment::new_with_header_and_data(header, &[0u8; 10]).unwrap();
+        seg.xmit = 1;
+        kcp.snd_buf.push_back(seg);
+        kcp.nsnd_buf += 1;
+        kcp.current = 4321;
+
+        assert_eq!(kcp.ts_lastack, 0, "初始 ts_lastack 应为 0");
+        kcp.parse_ack(0);
+        assert_eq!(kcp.ts_lastack, 4321, "parse_ack 后 ts_lastack 必须跟到当前时刻");
+    }
+
+    // ===== BUG-4: parse_una 无条件回写，过期 una 会把 snd_una 拉回去 =====
+    #[test]
+    fn test_parse_una_never_moves_backward() {
+        let mut kcp = Kcp::new(1, KcpConfig::normal_mode()).unwrap();
+        kcp.current = 100;
+        kcp.parse_una(10);
+        assert_eq!(kcp.snd_una, 10, "una=10 应推进 snd_una");
+
+        // 乱序迟到的小 una 不得回退
+        for stale in [5u32, 3, 0] {
+            kcp.parse_una(stale);
+            assert_eq!(kcp.snd_una, 10, "过期 una={stale} 把 snd_una 拉回到了 {}", kcp.snd_una);
+        }
+
+        // 更大的 una 仍可继续推进
+        kcp.parse_una(20);
+        assert_eq!(kcp.snd_una, 20, "更大的 una 应继续推进");
+    }
+
+    // ===== BUG-12: ts_lastack 被赋值（parse_una 侧） =====
+    #[test]
+    fn test_parse_una_sets_ts_lastack() {
+        let mut kcp = Kcp::new(1, KcpConfig::normal_mode()).unwrap();
+        kcp.current = 777;
+        kcp.parse_una(5);
+        assert_eq!(kcp.ts_lastack, 777, "parse_una 后 ts_lastack 必须跟到当前时刻");
+    }
+
+    // ===== BUG-13: ssthresh 初值等于 cwnd 初值，慢启动被跳过 =====
+    #[test]
+    fn test_ssthresh_init_enables_slow_start() {
+        let kcp = Kcp::new(1, KcpConfig::normal_mode()).unwrap();
+        assert!(
+            kcp.ssthresh > kcp.cwnd as u32,
+            "ssthresh({}) 必须大于 cwnd({})，否则 `cwnd < ssthresh` 永不成立",
+            kcp.ssthresh,
+            kcp.cwnd
+        );
+    }
+
+    // ===== BUG-14: fastresend=0 被当作阈值 0，每轮都误判丢包 =====
+    #[tokio::test]
+    async fn test_fastresend_zero_does_not_trigger_fast_retransmit() {
+        let mut kcp = Kcp::new(1, KcpConfig::normal_mode()).unwrap();
+        assert_eq!(kcp.fastresend, 0, "normal_mode 的 fastresend 应为 0");
+        kcp.current = 1000;
+        kcp.rmt_wnd = 64;
+        kcp.peer_seen = true;
+        kcp.set_output(|data| Box::pin(async move { Ok(data.len()) }));
+
+        // 手工放一个已发送、fastack 已超阈值的段
+        let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 64, 900, 0, 0, 10);
+        let mut seg = Segment::new_with_header_and_data(header, &[0u8; 10]).unwrap();
+        seg.xmit = 1;
+        seg.fastack = 9;
+        seg.resendts = 10_000;
+        seg.rto = 200;
+        kcp.snd_buf.push_back(seg);
+        kcp.nsnd_buf += 1;
+
+        kcp.flush().await.unwrap();
+
+        // fastresend=0 时必须原样保留，不能被"快速重传"改写
+        let seg = kcp.snd_buf.front().expect("段不应被移除");
+        assert_eq!(seg.xmit, 1, "fastresend=0 时不应触发重传");
+        assert_eq!(seg.fastack, 9, "fastack 不应被重置");
     }
 }
