@@ -196,6 +196,48 @@ async fn conv_binds_on_control_frame_first() {
     assert_same(&kcp.recv().unwrap(), b"after-wins");
 }
 
+/// 流模式下 peeksize 汇总全部可读段，recv 一次性取走并清空队列
+///
+/// 上层按 peeksize 预分配缓冲，若两者不一致会截断或越界拷贝。
+#[tokio::test]
+async fn stream_peeksize_matches_single_recv() {
+    let mut kcp = kcp_ovo::core::kcp::Kcp::new(1, KcpConfig::stream_mode()).unwrap();
+    let mut expected = 0usize;
+    for sn in 0..3u32 {
+        let payload = [0x41u8 + sn as u8; 100];
+        expected += payload.len();
+        kcp.input(&make_data_packet(1, sn, &payload)).unwrap();
+    }
+    assert_eq!(kcp.peeksize().unwrap(), expected, "流模式 peeksize 应汇总全部可读段");
+
+    let got = kcp.recv().unwrap();
+    assert_eq!(got.len(), expected, "recv 长度必须与 peeksize 一致");
+    assert_eq!(got[0], 0x41, "应按到达顺序拼接");
+    assert_eq!(got[expected - 1], 0x43);
+    assert!(kcp.peeksize().is_err(), "一次 recv 后队列应清空");
+}
+
+/// 消息模式的分片链未到齐时 peeksize 报不完整，到齐后长度正确
+#[tokio::test]
+async fn message_peeksize_waits_for_full_frag_chain() {
+    let mut kcp = kcp_ovo::core::kcp::Kcp::new(1, KcpConfig::fast_mode_with_wnd(16, 64)).unwrap();
+    let mut first = make_data_packet(1, 0, &[1u8; 100]);
+    first[5] = 2; // frg=2，表示后面还有两片
+
+    kcp.input(&first).unwrap();
+    assert!(kcp.peeksize().is_err(), "分片链未到齐时 peeksize 应报不完整");
+    assert_eq!(kcp.nrcv_que, 1, "已到的分片应保留在队列里");
+
+    for (sn, frg) in [(1u32, 1u8), (2, 0)] {
+        let payload = [2u8; 100];
+        let mut frag = make_data_packet(1, sn, &payload);
+        frag[5] = frg;
+        kcp.input(&frag).unwrap();
+    }
+    assert_eq!(kcp.peeksize().unwrap(), 300, "分片到齐后应返回整条消息长度");
+    assert_eq!(kcp.recv().unwrap().len(), 300);
+}
+
 /// 损坏/截断的输入包返回错误而不是 panic
 #[test]
 fn truncated_input_returns_error() {
