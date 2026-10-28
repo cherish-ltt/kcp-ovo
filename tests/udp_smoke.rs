@@ -133,6 +133,57 @@ async fn udp_smoke_closed_stream_rejects_io() {
     assert!(matches!(err, KcpError::IoError(_)));
 }
 
+/// 一个客户端突然消失后，listener 仍能正常服务新客户端
+///
+/// 客户端被直接 drop 属于真实世界最常见的中断形态（进程被杀、网络切换），
+/// 此时服务端对应的连接任务应自行收敛，而不是拖垮整个 listener。
+#[tokio::test]
+async fn udp_smoke_peer_vanishes_listener_still_serves() {
+    let (mut listener, addr) = bind_listener().await;
+
+    {
+        let mut doomed = connect(addr).await;
+        timeout(SHORT, doomed.send(b"before-vanish")).await.unwrap().unwrap();
+        let (got, _) = timeout(SHORT, listener.recv()).await.unwrap().unwrap();
+        assert_same(&got, b"before-vanish");
+    }
+
+    // 上面的客户端在此处被 drop，对端没有任何关闭通知
+    let mut fresh = connect(addr).await;
+    let payload = b"after-vanish".to_vec();
+    timeout(SHORT, fresh.send(&payload)).await.unwrap().unwrap();
+    let (got, _) = timeout(SHORT, listener.recv()).await.unwrap().unwrap();
+    assert_same(&got, &payload);
+}
+
+/// 关闭其中一个客户端不影响已建立的其它连接
+#[tokio::test]
+async fn udp_smoke_closing_one_client_isolates_others() {
+    let (mut listener, addr) = bind_listener().await;
+    let mut keep = connect(addr).await;
+    let mut doomed = connect(addr).await;
+
+    timeout(SHORT, keep.send(b"from-keep")).await.unwrap().unwrap();
+    timeout(SHORT, doomed.send(b"from-doomed")).await.unwrap().unwrap();
+
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let (data, peer) = timeout(SHORT, listener.recv()).await.unwrap().unwrap();
+        seen.push((String::from_utf8_lossy(&data).to_string(), peer));
+    }
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(seen[0].0, "from-doomed");
+    assert_eq!(seen[1].0, "from-keep");
+
+    doomed.close().unwrap();
+    drop(doomed);
+
+    timeout(SHORT, keep.send(b"still-alive")).await.unwrap().unwrap();
+    let (got, peer) = timeout(SHORT, listener.recv()).await.unwrap().unwrap();
+    assert_same(&got, b"still-alive");
+    assert_eq!(peer, seen[1].1, "存活客户端应仍映射到原来的源地址");
+}
+
 /// 未建立连接的地址发送应报错而不是挂起
 #[tokio::test]
 async fn udp_smoke_send_to_unknown_peer_errors() {

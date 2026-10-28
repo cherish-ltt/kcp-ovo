@@ -159,6 +159,43 @@ async fn server_learns_conv_from_first_packet() {
     assert!(kcp.recv().is_err());
 }
 
+/// conv=0 的会话一经首包绑定就固定下来，后续异 conv 包既不生效也不报错
+///
+/// 绑定本身是 `KcpListener` 分发新连接所依赖的机制，这里固化它的边界：
+/// 一旦锁定，换 conv 的重放包无法接管会话，也不会污染已建立的收发状态。
+#[tokio::test]
+async fn conv_binding_is_sticky_after_first_packet() {
+    let mut kcp = kcp_ovo::core::kcp::Kcp::new(0, KcpConfig::stream_mode()).unwrap();
+    kcp.input(&make_data_packet(0xAAAA_0001, 0, b"legit")).unwrap();
+    assert_eq!(kcp.conv, 0xAAAA_0001);
+
+    // 换 conv 的包在绑定之后到达：不应改变会话归属
+    for sn in 1..4u32 {
+        assert!(
+            kcp.input(&make_data_packet(0xBBBB_0002, sn, b"other")).is_ok(),
+            "异 conv 包应被静默丢弃"
+        );
+    }
+    assert_eq!(kcp.conv, 0xAAAA_0001, "首包绑定的 conv 不得被后续包改写");
+    assert_same(&kcp.recv().unwrap(), b"legit");
+    assert!(kcp.recv().is_err(), "异 conv 包的数据不得进入接收队列");
+}
+
+/// 首包是控制帧也应参与 conv 绑定，随后同 conv 的数据包正常接收
+#[tokio::test]
+async fn conv_binds_on_control_frame_first() {
+    let mut kcp = kcp_ovo::core::kcp::Kcp::new(0, KcpConfig::stream_mode()).unwrap();
+    let mut wins = vec![0u8; 28];
+    wins[0..4].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+    wins[4] = KcpCmd::Wins as u8;
+    wins[6..8].copy_from_slice(&64u16.to_be_bytes());
+    kcp.input(&wins).unwrap();
+    assert_eq!(kcp.conv, 0x1234_5678, "控制帧同样应触发 conv 绑定");
+
+    kcp.input(&make_data_packet(0x1234_5678, 0, b"after-wins")).unwrap();
+    assert_same(&kcp.recv().unwrap(), b"after-wins");
+}
+
 /// 损坏/截断的输入包返回错误而不是 panic
 #[test]
 fn truncated_input_returns_error() {
