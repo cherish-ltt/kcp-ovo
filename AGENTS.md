@@ -386,6 +386,7 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-25 | `flush` 每轮按整个窗口放行新段，不扣除在途段 | 流控 | **在途量随 flush 次数无界增长，远超对端接收窗口，引发整片丢弃与重传风暴；对端未响应时每轮再塞一段探路** | `kcp.rs::flush` 的准入额度 |
 | BUG-26 | 同轮有 ACK 待发时探测让路 | 窗口探测 | `IKCP_ASK_SEND` 长期挂起，`check()` 持续返回 `current`，零窗口期间调用方全速空转 | `kcp.rs::flush` 的 `need_wask` |
 | BUG-27 | 构造期不校验 `mtu` 与收发窗口 | 配置校验 | `mtu < 28` 下溢 panic、`mtu == 28` 时 `mss = 0` 触发除零 panic、窗口为 0 的连接永久不可用 | `kcp.rs` 构造函数 |
+| BUG-28 | `check()` 在零窗口时无条件返回 `ts_probe` | 时序 | 零窗口时 `snd_buf` 仍有在途段等待重传，其期限远早于 5000ms 的探测时刻；调用方按返回值调度会睡过重传期限，连接被拖到探测退避的粒度 | `kcp.rs::check` 的零窗口分支 |
 
 其中 BUG-9、BUG-10、BUG-18、BUG-19、BUG-24、BUG-25、BUG-27 属于「线上会永久卡死、
 panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-26 属于「不丢数据但
@@ -474,6 +475,7 @@ panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-2
 | BUG-21 | `nodelay_affects_first_retransmit_deadline` | `tests/matrix.rs` |
 | BUG-22 | `default_dead_link_matches_ikcp` | `tests/retransmit.rs` |
 | BUG-23 | `probe_backoff_starts_at_probe_init` | `tests/window.rs` |
+| BUG-28 | `check_prefers_retransmit_deadline_over_probe` | `tests/timing.rs` |
 
 #### 三、维护规则
 

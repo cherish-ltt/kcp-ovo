@@ -254,6 +254,42 @@ async fn check_waits_for_probe_deadline() {
     assert!(next >= ts_probe, "check() 返回 {next}，早于探测时刻 {ts_probe}，调用方会空转");
 }
 
+/// 零窗口且有在途段时，check() 必须返回重传期限而不是探测时刻
+///
+/// 零窗口常常正是发送方自己塞满对端造成的，此时 snd_buf 里的段仍在等 ACK，
+/// 其 resendts 远早于 ts_probe（默认 5000ms）。若 check() 无条件返回 ts_probe，
+/// 按返回值调度的调用方会睡过重传期限，把连接拖到探测退避的粒度上。
+#[tokio::test]
+async fn check_prefers_retransmit_deadline_over_probe() {
+    let mut sim = Sim::asymmetric(
+        KcpConfig::fast_mode_with_wnd(32, 8),
+        KcpConfig::fast_mode_with_wnd(32, 8),
+        Net::loss(0.0).with_delay(5),
+        0xC4_0001,
+    );
+    let mss = sim.a.borrow().mss as usize;
+    sim.a.borrow_mut().send(&vec![3u8; mss * 40]).unwrap();
+
+    let mut observed = false;
+    let mut worst_wait = 0u64;
+    for _ in 0..2_000 {
+        sim.tick().await.unwrap();
+        {
+            let kcp = sim.a.borrow();
+            if kcp.rmt_wnd == 0 && kcp.nsnd_buf > 0 {
+                observed = true;
+                worst_wait = worst_wait.max(kcp.check(sim.now).saturating_sub(sim.now));
+            }
+        }
+        let _ = sim.take_b();
+    }
+    assert!(observed, "用例前提未成立：未出现「零窗口 + 有在途段」的状态");
+    assert!(
+        worst_wait < 5_000,
+        "零窗口有在途段时 check() 让调用方等了 {worst_wait}ms，会漏掉重传期限"
+    );
+}
+
 /// ACK 包里的 sn 与 una 互相矛盾时，不得越过 una 删除段
 ///
 /// 若既按 ACK 包序号精确删除一段、又按 una 推进确认，两条路径各自生效时，

@@ -911,7 +911,11 @@ impl Kcp {
         }
         // 等待窗口探测时，下次唤醒应落在 ts_probe 而非定期 flush，
         // 否则调用方会按 flush 间隔空转，探测退避失去意义。
-        if self.rmt_wnd == 0 && self.ts_probe > 0 {
+        //
+        // 但这只适用于「没有在途段待重传」的情形：零窗口往往正是由窗口内的
+        // 段塞满对端造成的，此时 snd_buf 里段的 resendts 通常早于 ts_probe，
+        // 直接返回 ts_probe 会让调用方睡过重传期限，连接被拖慢到探测退避的粒度。
+        if self.rmt_wnd == 0 && self.ts_probe > 0 && self.nsnd_buf == 0 {
             return self.ts_probe;
         }
         if self.timediff_u64(ts_flush, current) > 0 { ts_flush } else { current }
