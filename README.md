@@ -395,6 +395,7 @@ cargo test test_stream_mode
 | `property.rs` | 属性测试：任意字节/头部/配置不崩且账本自洽、随机链路（含小接收窗口）字节精确、双向同时传输 |
 | `torture.rs` | 极端链路叠加：成簇丢包、延迟尖刺不引发重传风暴、路径 MTU 黑洞上报死链、双向同时断网、回绕叠加断网、100 连接、零窗口探测有界 |
 | `udp_chaos.rs` | 真实 UDP 混沌：8 客户端消息边界、垃圾报文轰炸后仍可服务、静默客户端不拖累他人、40KB 大消息 |
+| `smoke.rs` | 秒级冒烟：五种预设配置各送一条消息、配置矩阵全互连、空输入与退化配置、未知对端只放行一段探路、控制帧往返、同刻重复 update 不重发 |
 
 ```bash
 # 只跑黑盒测试
@@ -402,6 +403,9 @@ cargo test --test fuzz_transfer --test malformed --test matrix --test timing --t
 
 # 新增的强化场景
 cargo test --test adversarial --test property --test torture --test udp_chaos
+
+# 秒级冒烟（改动后的第一道反馈）
+cargo test --test smoke
 
 # 覆盖率（需先安装 cargo-llvm-cov）
 cargo llvm-cov --workspace --all-features --summary-only

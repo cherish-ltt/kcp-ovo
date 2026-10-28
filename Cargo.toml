@@ -113,6 +113,10 @@ path = "tests/torture.rs"
 name = "udp_chaos"
 path = "tests/udp_chaos.rs"
 
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+
 [[bench]]
 name = "kcp-transfer"
 path = "benches/kcp-transfer.rs"
