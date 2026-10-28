@@ -261,14 +261,11 @@ async fn check_waits_for_probe_deadline() {
 /// 按返回值调度的调用方会睡过重传期限，把连接拖到探测退避的粒度上。
 #[tokio::test]
 async fn check_prefers_retransmit_deadline_over_probe() {
-    let mut sim = Sim::asymmetric(
-        KcpConfig::fast_mode_with_wnd(32, 8),
-        KcpConfig::fast_mode_with_wnd(32, 8),
-        Net::loss(0.0).with_delay(5),
-        0xC4_0001,
-    );
+    // 分片数控制在 rcv_wnd 以内，避免触发「消息模式分片数超过接收窗口」的协议阻塞
+    let cfg = KcpConfig::fast_mode_with_wnd(32, 8);
+    let mut sim = Sim::asymmetric(cfg.clone(), cfg, Net::loss(0.0).with_delay(5), 0xC4_0001);
     let mss = sim.a.borrow().mss as usize;
-    sim.a.borrow_mut().send(&vec![3u8; mss * 40]).unwrap();
+    sim.a.borrow_mut().send(&vec![3u8; mss * 5]).unwrap();
 
     let mut observed = false;
     let mut worst_wait = 0u64;
