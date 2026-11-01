@@ -69,7 +69,7 @@ Stream 的发送接口成功表示数据已进入本地队列，并非对端已�
 
 ```toml
 [dependencies]
-kcp-ovo = "0.4"
+kcp-ovo = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -271,13 +271,13 @@ src/
 
 ```toml
 # 默认配置（包含Stream API）
-kcp-ovo = "0.4"
+kcp-ovo = "0.5"
 
 # 仅使用底层API
-kcp-ovo = { version = "0.4", default-features = false }
+kcp-ovo = { version = "0.5", default-features = false }
 
 # 显式启用Stream API
-kcp-ovo = { version = "0.4", features = ["stream"] }
+kcp-ovo = { version = "0.5", features = ["stream"] }
 ```
 
 ## 🧪 测试

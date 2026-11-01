@@ -467,13 +467,13 @@ error[E0433]: failed to resolve: use of undeclared crate or module `stream`
 
 ```toml
 [dependencies]
-kcp-ovo = { version = "0.1", features = ["stream"] }
+kcp-ovo = { version = "0.5", features = ["stream"] }
 ```
 
 或使用默认配置:
 ```toml
 [dependencies]
-kcp-ovo = "0.1"  # stream已默认启用
+kcp-ovo = "0.5"  # stream已默认启用
 ```
 
 ### 问题2: 链接错误
