@@ -4,6 +4,7 @@
 //! 包含流模式（Stream Mode）支持：流模式下所有分片 frg=0，
 //! 接收端按 sn 顺序连续拼接字节交付，无消息边界，不受 255 分片限制。
 
+use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -136,7 +137,8 @@ pub struct Kcp {
 
     // ACK
     /// ACK 列表（待发送的确认序列号）
-    acklist: Vec<u32>,
+    acklist: VecDeque<u32>,
+    acknowledged: HashSet<u32>,
     /// ACK 列表容量（预留）
     #[allow(dead_code)]
     ackblock: usize,
@@ -240,7 +242,8 @@ impl Kcp {
             rcv_queue: KcpDeque::new(),
             snd_buf: KcpDeque::new(),
             rcv_buf: KcpDeque::new(),
-            acklist: Vec::with_capacity(16),
+            acklist: VecDeque::with_capacity(16),
+            acknowledged: HashSet::new(),
             ackblock: 16,
             user_data: None,
             buffer: vec![0u8; (mtu as usize + IKCP_OVERHEAD) * 3],
@@ -481,7 +484,7 @@ impl Kcp {
     /// 输入处理：解析并处理从底层网络收到的数据包
     ///
     /// 根据命令类型（Push / Ack / Wask / Wins）分别处理，
-    /// 将有序数据段移入 rcv_queue 供 recv 读取。
+    /// 将有序数据段移入 rcv_queue 供 recv 读取。每次输入必须恰好包含一个数据包。
     pub fn input(&mut self, data: &[u8]) -> KcpResult<()> {
         if data.len() < IKCP_OVERHEAD {
             return Err(KcpError::IncompleteData(IncompleteDataType::Header));
@@ -489,6 +492,12 @@ impl Kcp {
         let mut buf = Bytes::copy_from_slice(data);
         // 解析头部
         let (header, buf) = KcpPacketHeader::from_bytes(&mut buf)?;
+        if buf.len() < header.len as usize {
+            return Err(KcpError::IncompleteData(IncompleteDataType::Payload));
+        }
+        if buf.len() > header.len as usize {
+            return Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr));
+        }
 
         // 验证conv是否匹配
         if self.conv == 0 {
@@ -504,11 +513,14 @@ impl Kcp {
         // 根据命令类型处理
         match header.cmd {
             KcpCmd::Ack => {
-                // 用 snd_nxt 而非 snd_una 做上界：第一个待确认段 sn=0 时
-                // snd_una 也是 0，用 snd_una 比较会把合法 ACK 判成过期。
-                // 这里只做 RTT 采样，段的删除统一由 una 驱动。
-                if self.timediff_u32(self.snd_nxt, header.sn) >= 0 {
+                if self
+                    .snd_buf
+                    .iter()
+                    .any(|seg| seg.kcp_packet.header.sn == header.sn && seg.xmit > 0)
+                    && self.acknowledged.insert(header.sn)
+                {
                     self.parse_ack(header.sn);
+                    self.parse_fastack(header.sn);
                 }
                 if let Some(ref writelog) = self.writelog {
                     writelog(&format!("input ack: sn={}", header.sn), self);
@@ -521,15 +533,8 @@ impl Kcp {
                 {
                     return Ok(());
                 }
-                // 落在接收窗口内但在 rcv_nxt 之前的段不能直接丢弃：它要么是重复段，
-                // 要么对应一个丢失的 ACK。两种情况下发送方都还挂着重传，
-                // 若这里静默吞掉，ACK 丢失就会演变成永久死锁。
-                // 已入 rcv_queue 的段仍按重复处理不再回 ACK。
+                self.acklist.push_back(header.sn);
                 if self.timediff_u32(header.sn, self.rcv_nxt) < 0 {
-                    if self.rcv_queue.iter().any(|s| s.kcp_packet.header.sn == header.sn) {
-                        return Ok(());
-                    }
-                    self.acklist.push(header.sn);
                     return Ok(());
                 }
                 for seg in self.rcv_buf.iter() {
@@ -537,8 +542,7 @@ impl Kcp {
                         return Ok(());
                     }
                 }
-                // 重传段一律重新排队 ACK，保证 ACK 丢失后能被下一次重传修复。
-                self.acklist.push(header.sn);
+
                 let newseg = Segment::new_with_header_and_data(header, &buf)?;
                 self.parse_data(newseg);
                 self.move_rcv_buf_to_queue();
@@ -547,8 +551,6 @@ impl Kcp {
             KcpCmd::Wins => {},
         }
 
-        // parse_fastack 必须先于 parse_una：una 推进后剩余段都满足 sn >= una，
-        // parse_fastack 里 `una > seg.sn` 永假，快速重传会完全失效。
         // 确认只由 una 驱动；若再按 ACK 包的 sn 精确删除，一个「sn=0 却携带 una=3」
         // 的包会把对端尚未收到的段一并移出 snd_buf。
         //
@@ -558,8 +560,19 @@ impl Kcp {
         if self.timediff_u32(header.una, self.snd_una) > 0
             && self.timediff_u32(self.snd_nxt, header.una) >= 0
         {
-            self.parse_fastack(header.una);
             self.parse_una(header.una);
+            let increase = if (self.cwnd as u32) < self.ssthresh {
+                self.mss as u64
+            } else {
+                (self.mss as u64 / u64::from(self.cwnd.max(1))).max(1)
+            };
+            let incr = u64::from(self.incr) + increase;
+            if incr >= u64::from(self.mss) {
+                self.cwnd = self.cwnd.saturating_add(1);
+                self.incr = (incr - u64::from(self.mss)) as u32;
+            } else {
+                self.incr = incr as u32;
+            }
         }
         if self.timediff_u64(self.current, header.ts) >= 10000
             || self.timediff_u64(header.ts, self.ts_recent) >= 10000
@@ -576,6 +589,7 @@ impl Kcp {
     fn parse_una(&mut self, una: u32) {
         while let Some(seg) = self.snd_buf.front() {
             if self.timediff_u32(una, seg.kcp_packet.header.sn) > 0 {
+                self.acknowledged.remove(&seg.kcp_packet.header.sn);
                 self.snd_buf.pop_front();
                 self.nsnd_buf -= 1;
             } else {
@@ -588,8 +602,6 @@ impl Kcp {
         if self.timediff_u32(una, self.snd_una) > 0 {
             self.snd_una = una;
         }
-        // 拥塞窗口每收到一次确认最多增长一次（见 flush 尾部），
-        // 记录最近确认时刻作为门限，否则该门限恒真、cwnd 每轮都涨。
         self.ts_lastack = self.current;
     }
 
@@ -612,7 +624,10 @@ impl Kcp {
                             Some((rtt, rtt / 2))
                         } else {
                             let delta = rtt - self.rx_srtt;
-                            Some((self.rx_srtt + delta / 8, self.rx_rttval + delta.abs() / 4))
+                            Some((
+                                self.rx_srtt + delta / 8,
+                                self.rx_rttval + (delta.abs() - self.rx_rttval) / 4,
+                            ))
                         };
                     }
                 }
@@ -626,17 +641,18 @@ impl Kcp {
                 .max(self.rx_minrto)
                 .min(IKCP_RTO_MAX);
         }
-        // 与 parse_una 同理：记录确认时刻，供 cwnd 增长门限使用
         self.ts_lastack = current;
     }
 
-    /// 根据 una 对所有未确认段增加快速重传计数
-    ///
-    /// 必须在 `parse_una()` 之前调用：若先移除 sn < una 的段，剩余段都满足 sn >= una，
-    /// `una > seg.sn` 永假，fastack 永不递增。调用顺序由 `input()` 保证。
-    fn parse_fastack(&mut self, una: u32) {
+    /// 根据更高的 ACK 序列号增加前序段的快速重传计数。
+    fn parse_fastack(&mut self, sn: u32) {
         for seg in self.snd_buf.iter_mut() {
-            if (una as i32).wrapping_sub(seg.kcp_packet.header.sn as i32) > 0 && seg.fastack < 255 {
+            if self.acknowledged.contains(&seg.kcp_packet.header.sn) {
+                seg.fastack = 0;
+            } else if (sn as i32).wrapping_sub(seg.kcp_packet.header.sn as i32) > 0
+                && seg.xmit > 0
+                && seg.fastack < 255
+            {
                 seg.fastack += 1;
             }
         }
@@ -721,18 +737,15 @@ impl Kcp {
         }
 
         // 对端窗口未知时按退避间隔重发窗口探测；已知时清空退避。
-        // probe_due 只看本轮是否到期，与 ts_probe 的取值解耦：
         // 首次探测需要立即发出，但 ts_probe 必须同时按退避量推后，
         // 否则它在后续每轮 flush 都会再次到期，退避形同虚设。
         // 首次等待必须从 IKCP_PROBE_INIT 起步。若取 interval（fast 模式 20ms），
         // 退避序列会退化成几十毫秒级，长时间零窗口的连接会被 WASK 高频轰炸。
-        let mut probe_due = false;
         if self.rmt_wnd == 0 {
             if self.probe_wait == 0 {
                 self.probe_wait = IKCP_PROBE_INIT;
                 self.ts_probe = self.current + self.probe_wait;
                 self.probe |= IKCP_ASK_SEND;
-                probe_due = true;
             } else if self.timediff_u64(self.current, self.ts_probe) >= 0 {
                 // 不小于 IKCP_PROBE_INIT 后按 1.5 倍增长
                 if self.probe_wait < IKCP_PROBE_INIT {
@@ -741,7 +754,6 @@ impl Kcp {
                 self.probe_wait = (self.probe_wait + self.probe_wait / 2).min(IKCP_PROBE_LIMIT);
                 self.ts_probe = self.current + self.probe_wait;
                 self.probe |= IKCP_ASK_SEND;
-                probe_due = true;
             }
         } else {
             // 对端窗口已知后必须清空探测退避，否则重新进入 rmt_wnd==0 时
@@ -754,17 +766,16 @@ impl Kcp {
         // 探测不能因为本轮恰好有 ACK 要发就让路：一旦让路，ASK_SEND 会挂在
         // probe 里，check() 于是持续返回 current，调用方按此立即 update 又被
         // ts_flush 节流，形成零窗口期间的全速空转。
-        let acks_to_send = self.acklist.clone();
-        let need_wask = probe_due && (self.probe & IKCP_ASK_SEND) != 0;
+        let need_wask = (self.probe & IKCP_ASK_SEND) != 0;
         let need_wins = (self.probe & IKCP_ASK_TELL) != 0;
-        self.acklist.clear();
 
         if need_wask {
             self.send_control(KcpCmd::Wask, 0).await?;
             self.probe &= !IKCP_ASK_SEND;
         }
-        for sn in acks_to_send {
+        while let Some(&sn) = self.acklist.front() {
             self.send_control(KcpCmd::Ack, sn).await?;
+            self.acklist.pop_front();
         }
         if need_wins {
             self.send_control(KcpCmd::Wins, 0).await?;
@@ -847,7 +858,9 @@ impl Kcp {
             }
         }
 
-        for (frg, sn, ts, una, wnd, data) in sends {
+        for ((frg, sn, ts, una, wnd, data), (idx, xmit, resendts, rto, is_lost)) in
+            sends.into_iter().zip(need_update)
+        {
             self.send_packet(KcpPacket::new_with_data(
                 KcpPacketHeader::new(
                     self.conv,
@@ -862,45 +875,30 @@ impl Kcp {
                 data,
             ))
             .await?;
-        }
-
-        for (idx, xmit, resendts, rto, is_lost) in need_update {
             if let Some(seg) = self.snd_buf.get_mut(idx) {
                 seg.xmit = xmit;
                 seg.resendts = resendts;
                 seg.rto = rto;
                 if is_lost {
+                    seg.fastack = 0;
+                }
+                if is_lost && !lost {
                     lost = true;
+                    self.ssthresh = (self.cwnd as u32 / 2).max(IKCP_THRESH_MIN);
+                    self.cwnd = 1;
+                    self.incr = 0;
                 }
             }
         }
 
-        // 拥塞控制：丢包则收缩窗口，否则按慢启动/拥塞避免递增
-        if lost {
-            self.ssthresh = (self.cwnd as u32 / 2).max(IKCP_THRESH_MIN);
-            self.cwnd = 1;
-            self.incr = 0;
-        } else if self.timediff_u64(current, self.ts_lastack) >= 0 {
-            if (self.cwnd as u32) < self.ssthresh {
-                self.incr += self.mss;
-            } else if self.mss > 0 {
-                self.incr += self.mss * self.mss / (self.cwnd as u32);
-            }
-            if self.incr >= self.mss {
-                self.cwnd += 1;
-                self.incr -= self.mss;
-            }
-        }
         Ok(())
     }
 
     /// 统一的发送接口（处理 output 回调的借用问题）
     async fn send_packet(&mut self, pkt: KcpPacket) -> KcpResult<()> {
         let data = pkt.to_bytes()?;
-        let output = self.output.take().ok_or(KcpError::OutputNotSet)?;
-        let result = output(data).await;
-        self.output = Some(output);
-        result?;
+        let output = self.output.as_ref().ok_or(KcpError::OutputNotSet)?;
+        output(data).await?;
         self.xmit = self.xmit.wrapping_add(1);
         Ok(())
     }
@@ -912,8 +910,15 @@ impl Kcp {
             self.updated = true;
             self.ts_flush = self.current;
         }
-        if self.timediff_u64(self.current, self.ts_flush) >= 0 {
-            self.ts_flush = self.current.wrapping_add(self.interval);
+        let flush_due = self.timediff_u64(self.current, self.ts_flush) >= 0;
+        let retransmit_due = self
+            .snd_buf
+            .iter()
+            .any(|seg| seg.xmit == 0 || self.timediff_u64(self.current, seg.resendts) >= 0);
+        if flush_due || retransmit_due || self.probe & IKCP_ASK_SEND != 0 {
+            if flush_due {
+                self.ts_flush = self.current.wrapping_add(self.interval);
+            }
             self.flush().await?;
         }
         Ok(())
@@ -944,7 +949,12 @@ impl Kcp {
         // 但这只适用于「没有在途段待重传」的情形：零窗口往往正是由窗口内的
         // 段塞满对端造成的，此时 snd_buf 里段的 resendts 通常早于 ts_probe，
         // 直接返回 ts_probe 会让调用方睡过重传期限，连接被拖慢到探测退避的粒度。
-        if self.rmt_wnd == 0 && self.ts_probe > 0 && self.nsnd_buf == 0 {
+        if self.rmt_wnd == 0
+            && self.ts_probe > 0
+            && self.nsnd_buf == 0
+            && self.acklist.is_empty()
+            && self.probe == 0
+        {
             return self.ts_probe;
         }
         if self.timediff_u64(ts_flush, current) > 0 { ts_flush } else { current }
@@ -1443,15 +1453,18 @@ mod tests {
         }
         kcp.snd_una = 0;
 
-        // Simulate input with una=1: all seg with sn<1 get fastack incremented
-        // (seg with sn=0 gets fastack+1 since 1 > 0)
+        // All segments were sent and are eligible for fast retransmission.
+        for seg in kcp.snd_buf.iter_mut() {
+            seg.xmit = 1;
+        }
+        // ACK sn=1 increments the counter of sn=0.
         let una = 1u32;
         kcp.parse_fastack(una);
 
         let fastacks: Vec<u32> = kcp.snd_buf.iter().map(|s| s.fastack).collect();
         assert_eq!(fastacks, vec![1, 0, 0]);
 
-        // Second fastack with una=2: seg sn=0,1 get fastack+1
+        // ACK sn=2 increments the counters of sn=0 and sn=1.
         kcp.parse_fastack(2);
         let fastacks: Vec<u32> = kcp.snd_buf.iter().map(|s| s.fastack).collect();
         assert_eq!(fastacks, vec![2, 1, 0]);
@@ -1489,8 +1502,8 @@ mod tests {
         assert!(!*sent_ack.lock().unwrap(), "此时还没有待确认的 ACK");
 
         // Add acks to acklist (simulating input coming in) and set probe for Wask
-        kcp.acklist.push(42);
-        kcp.acklist.push(99);
+        kcp.acklist.push_back(42);
+        kcp.acklist.push_back(99);
         // Also ensure probe is set and timing condition met
         kcp.probe |= IKCP_ASK_SEND;
         kcp.ts_probe = now - 1000; // past due
