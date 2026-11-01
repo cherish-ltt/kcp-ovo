@@ -10,6 +10,36 @@ use common::{Net, Rng, Sim, assert_same};
 use kcp_ovo::KcpConfig;
 use kcp_ovo::helper::KcpCmd;
 
+#[tokio::test]
+async fn check_deadline_executes_due_retransmission() {
+    let mut sink = Sink::new(KcpConfig::default());
+    sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 128)).unwrap();
+    sink.kcp.borrow_mut().send(b"data").unwrap();
+    for now in [0, 100, 200] {
+        sink.update(now).await.unwrap();
+    }
+    let next = sink.kcp.borrow().check(200);
+    assert_eq!(next, 225);
+    assert_eq!(sink.count_cmd(KcpCmd::Push), 1);
+    sink.update(next - 1).await.unwrap();
+    assert_eq!(sink.count_cmd(KcpCmd::Push), 1);
+    sink.update(next).await.unwrap();
+    assert_eq!(sink.count_cmd(KcpCmd::Push), 2);
+    assert_eq!(sink.kcp.borrow().snd_buf.front().unwrap().xmit, 2);
+    assert!(sink.kcp.borrow().check(next) > next);
+}
+
+#[tokio::test]
+async fn pending_ack_is_not_delayed_until_zero_window_probe() {
+    let mut sink = Sink::new(KcpConfig::stream_mode());
+    sink.update(20).await.unwrap();
+    sink.kcp.borrow_mut().input(&push_packet(1, 0, b"x")).unwrap();
+    let next = sink.kcp.borrow().check(20);
+    assert_eq!(next, 40);
+    sink.update(next).await.unwrap();
+    assert_eq!(sink.count_cmd(KcpCmd::Ack), 1);
+}
+
 /// ACK 丢失后，发送方重传同一段，接收方必须补回 ACK
 ///
 /// 这是最容易被忽略的一条：接收方已经在 rcv_queue 里有了该段，

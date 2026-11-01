@@ -883,8 +883,15 @@ impl Kcp {
             self.updated = true;
             self.ts_flush = self.current;
         }
-        if self.timediff_u64(self.current, self.ts_flush) >= 0 {
-            self.ts_flush = self.current.wrapping_add(self.interval);
+        let flush_due = self.timediff_u64(self.current, self.ts_flush) >= 0;
+        let retransmit_due = self
+            .snd_buf
+            .iter()
+            .any(|seg| seg.xmit > 0 && self.timediff_u64(self.current, seg.resendts) >= 0);
+        if flush_due || retransmit_due {
+            if flush_due {
+                self.ts_flush = self.current.wrapping_add(self.interval);
+            }
             self.flush().await?;
         }
         Ok(())
@@ -915,7 +922,12 @@ impl Kcp {
         // 但这只适用于「没有在途段待重传」的情形：零窗口往往正是由窗口内的
         // 段塞满对端造成的，此时 snd_buf 里段的 resendts 通常早于 ts_probe，
         // 直接返回 ts_probe 会让调用方睡过重传期限，连接被拖慢到探测退避的粒度。
-        if self.rmt_wnd == 0 && self.ts_probe > 0 && self.nsnd_buf == 0 {
+        if self.rmt_wnd == 0
+            && self.ts_probe > 0
+            && self.nsnd_buf == 0
+            && self.acklist.is_empty()
+            && self.probe == 0
+        {
             return self.ts_probe;
         }
         if self.timediff_u64(ts_flush, current) > 0 { ts_flush } else { current }
