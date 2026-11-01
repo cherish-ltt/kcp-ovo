@@ -385,10 +385,10 @@ cargo test test_stream_mode
 | `api_contract.rs` | 公开 API 契约与错误类型 |
 | `retransmit.rs` | 重传与死链判定 |
 | `fuzz_transfer.rs` | 随机链路下 9 条协议不变式（字节精确、消息边界、窗口上限、断链恢复） |
-| `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、未知命令、WASK/WINS 洪水、伪造 conv、畸形分片恢复 |
+| `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、长度不符、未知命令、WASK/WINS 洪水、伪造 conv、畸形分片恢复 |
 | `matrix.rs` | 配置组合矩阵：MTU × 窗口 × interval × fastresend × nodelay × 流模式；nodelay 语义（最小 RTO、首传重传期限） |
-| `timing.rs` | ACK 语义与时序：重复段补 ACK、逐段确认、乱序缺口、探测退避、ACK 的 sn/una 一致性与越界确认 |
-| `congestion.rs` | 拥塞窗口：慢启动节奏、AIMD 收缩、`fastresend=0` 开关、三模式吞吐 |
+| `timing.rs` | ACK 语义与时序：未读取和乱序重复段补 ACK、取消安全、乱序缺口、快速重传、探测退避、调度期限、确认边界与 RTT 方差收敛 |
+| `congestion.rs` | 拥塞窗口：确认驱动增长、空闲与上界、慢启动、AIMD 收缩、`fastresend=0` 开关、三模式吞吐 |
 | `soak.rs` | 规模与长跑：1MB~4MB 大流量、1000 轮长会话、SN 回绕（含双向跨回绕点、回绕叠加重传）、恶劣网络收敛、队列有界 |
 | `outage.rs` | 断网与恢复：黑洞期补发、多次闪断、双向恢复、长断网不静默丢数据 |
 | `multiclient.rs` | 多客户端并发：20~50 连接并发、部分断网隔离、混合丢包率、conv 不串台 |

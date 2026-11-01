@@ -135,7 +135,8 @@ impl KcpPacket {
             return Err(KcpError::IncompleteData(IncompleteDataType::Payload));
         }
 
-        Ok(Self { header, data: Bytes::copy_from_slice(data) })
+        let len = header.len as usize;
+        Ok(Self { header, data: Bytes::copy_from_slice(&data[..len]) })
     }
 
     /// 从字节数组解析完整数据包
