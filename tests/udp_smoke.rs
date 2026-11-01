@@ -21,6 +21,7 @@ async fn bind_listener() -> (KcpListener, SocketAddr) {
     let config = StreamConfig {
         update_interval: Duration::from_millis(5),
         connect_timeout: Duration::from_secs(2),
+        ..Default::default()
     };
     let listener = KcpListener::bind_with_config("127.0.0.1:0", config).await.unwrap();
     let addr = listener.local_addr();
@@ -31,6 +32,7 @@ async fn connect(addr: SocketAddr) -> KcpStream {
     let config = StreamConfig {
         update_interval: Duration::from_millis(5),
         connect_timeout: Duration::from_secs(2),
+        ..Default::default()
     };
     KcpStream::connect_with_config(addr, config).await.unwrap()
 }
@@ -218,6 +220,7 @@ async fn udp_smoke_custom_config_roundtrip() {
     let config = StreamConfig {
         update_interval: Duration::from_millis(2),
         connect_timeout: Duration::from_millis(500),
+        ..Default::default()
     };
     let mut listener = KcpListener::bind_with_config("127.0.0.1:0", config.clone()).await.unwrap();
     let addr = listener.local_addr();

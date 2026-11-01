@@ -12,6 +12,56 @@ use kcp_ovo::stream::{KcpListener, KcpStream, StreamConfig};
 use tokio::time::timeout;
 
 #[tokio::test]
+async fn listener_rejects_invalid_session_limits() {
+    for config in [
+        StreamConfig { max_sessions: 0, ..Default::default() },
+        StreamConfig { session_idle_timeout: Duration::ZERO, ..Default::default() },
+    ] {
+        assert!(KcpListener::bind_with_config("127.0.0.1:0", config).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn listener_limits_and_reclaims_sessions() {
+    let config = StreamConfig {
+        max_sessions: 1,
+        session_idle_timeout: Duration::from_millis(300),
+        ..Default::default()
+    };
+    let mut listener = KcpListener::bind_with_config("127.0.0.1:0", config).await.unwrap();
+    let peer1 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer2 = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr();
+    let mut invalid_peers = Vec::new();
+    for i in 0..40 {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut data = common::stress::push_packet(1, 0, b"x");
+        match i % 3 {
+            0 => data.truncate(1),
+            1 => data[4] = 255,
+            _ => data[27] = 2,
+        }
+        peer.send_to(&data, addr).await.unwrap();
+        invalid_peers.push(peer);
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    peer1.send_to(b"x", addr).await.unwrap();
+    peer2.send_to(&common::stress::push_packet(2, 0, b"first"), addr).await.unwrap();
+    let (_, accepted) = timeout(Duration::from_secs(2), listener.recv()).await.unwrap().unwrap();
+    assert_eq!(accepted, peer2.local_addr().unwrap());
+    assert!(listener.send_to(b"x", peer1.local_addr().unwrap()).await.is_err());
+
+    peer1.send_to(&common::stress::push_packet(1, 0, b"blocked"), addr).await.unwrap();
+    assert!(timeout(Duration::from_millis(100), listener.recv()).await.is_err());
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    peer1.send_to(&common::stress::push_packet(1, 0, b"after"), addr).await.unwrap();
+    let (data, accepted) = timeout(Duration::from_secs(2), listener.recv()).await.unwrap().unwrap();
+    assert_eq!(accepted, peer1.local_addr().unwrap());
+    assert_eq!(data, b"after");
+    assert!(listener.send_to(b"x", peer2.local_addr().unwrap()).await.is_err());
+}
+
+#[tokio::test]
 async fn oversized_messages_are_rejected_before_enqueue() {
     let mut listener = KcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut stream = KcpStream::connect(listener.local_addr()).await.unwrap();
@@ -342,6 +392,7 @@ async fn custom_stream_config_works() {
         StreamConfig {
             update_interval: Duration::from_millis(5),
             connect_timeout: Duration::from_secs(3),
+            ..Default::default()
         },
     )
     .await
@@ -361,6 +412,7 @@ async fn custom_stream_config_works() {
         StreamConfig {
             update_interval: Duration::from_millis(5),
             connect_timeout: Duration::from_secs(3),
+            ..Default::default()
         },
     )
     .await

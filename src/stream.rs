@@ -31,11 +31,11 @@ use log::{debug, error, warn};
 use tokio::net::{ToSocketAddrs, UdpSocket, lookup_host};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, timeout};
+use tokio::time::{Instant, interval, timeout};
 
 use crate::core::kcp::Kcp;
 use crate::error::IncompleteDataType;
-use crate::helper::{IKCP_OVERHEAD, current_millis, generate_conv};
+use crate::helper::{IKCP_OVERHEAD, KcpPacketHeader, current_millis, generate_conv};
 use crate::{KcpConfig, KcpError, KcpResult};
 use std::io::{self};
 use std::net::SocketAddr;
@@ -57,11 +57,20 @@ pub struct StreamConfig {
     pub update_interval: Duration,
     /// 连接超时时间
     pub connect_timeout: Duration,
+    /// 监听器最多同时保留的会话数。
+    pub max_sessions: usize,
+    /// 监听器回收未收到有效报文的会话的间隔。
+    pub session_idle_timeout: Duration,
 }
 
 impl Default for StreamConfig {
     fn default() -> Self {
-        Self { update_interval: Duration::from_millis(10), connect_timeout: Duration::from_secs(5) }
+        Self {
+            update_interval: Duration::from_millis(10),
+            connect_timeout: Duration::from_secs(5),
+            max_sessions: 1024,
+            session_idle_timeout: Duration::from_secs(300),
+        }
     }
 }
 
@@ -311,6 +320,9 @@ pub struct Clinet {
     data_tx: Sender<Vec<u8>>,
     /// send-msg
     send_tx: Sender<Vec<u8>>,
+    conv: u32,
+    id: u64,
+    last_active: Instant,
 }
 
 impl Drop for Clinet {
@@ -380,6 +392,9 @@ impl KcpListener {
         addr: A,
         config: StreamConfig,
     ) -> KcpResult<Self> {
+        if config.max_sessions == 0 || config.session_idle_timeout.is_zero() {
+            return Err(KcpError::InvalidConfig("session limits must be non-zero".to_string()));
+        }
         let socket = UdpSocket::bind(addr).await.map_err(|e| KcpError::IoError(e.to_string()))?;
         let local_addr = socket.local_addr().map_err(|e| KcpError::IoError(e.to_string()))?;
 
@@ -388,12 +403,16 @@ impl KcpListener {
         let cleanup = ClientCleanup(clients.clone());
         // 设置output回调
         let socket = Arc::new(socket);
-        let (udp_tx, mut udp_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_SIZE);
+        let (udp_tx, mut udp_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, u64)>(CHANNEL_SIZE);
         let (recv_tx, recv_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_SIZE);
         let timeout_druation = Duration::from_millis(100);
+        let max_sessions = config.max_sessions;
+        let idle_timeout = config.session_idle_timeout;
         let main_handle: JoinHandle<()> = tokio::spawn(async move {
             let _cleanup = cleanup;
             let mut buf = vec![0; BUFFER_SIZE];
+            let mut next_id = 0u64;
+            let mut cleanup_interval = interval(idle_timeout.min(Duration::from_secs(1)));
             let clients_clone = clients_clone.clone();
             let udp_tx_clone = udp_tx.clone();
             let recv_tx_clone = recv_tx.clone();
@@ -401,11 +420,23 @@ impl KcpListener {
                 let udp_tx_clone = udp_tx_clone.clone();
                 let recv_tx_clone = recv_tx_clone.clone();
                 tokio::select! {
+                    _ = cleanup_interval.tick() => {
+                        clients_clone.retain(|_, client| {
+                            !client.main_handle.is_finished() && client.last_active.elapsed() < idle_timeout
+                        });
+                    }
                     result = udp_rx.recv() => {
                         match result {
-                            Some((data, addr)) => {
-                                if let Err(e) = timeout(timeout_druation, socket.send_to(&data, addr)).await {
-                                    error!("socket.send_to err: {}", e);
+                            Some((data, addr, id)) => {
+                                if !clients_clone.get(&addr).is_some_and(|client| client.id == id) {
+                                    continue;
+                                }
+                                match timeout(timeout_druation, socket.send_to(&data, addr)).await {
+                                    Ok(Ok(_)) => {},
+                                    result => {
+                                        error!("socket.send_to err: {:?}", result);
+                                        clients_clone.remove_if(&addr, |_, client| client.id == id);
+                                    },
                                 }
                             }
                             None => warn!("udp_rx.recv none"),
@@ -414,8 +445,13 @@ impl KcpListener {
                     result = socket.recv_from(&mut buf) => {
                         match result {
                             Ok((size, addr)) => {
-                                match clients_clone.get(&addr) {
-                                    Some(client) => {
+                                let mut packet = Bytes::copy_from_slice(&buf[..size]);
+                                let Ok((header, payload)) = KcpPacketHeader::from_bytes(&mut packet) else { continue };
+                                if payload.len() != header.len as usize { continue; }
+                                match clients_clone.get_mut(&addr) {
+                                    Some(mut client) => {
+                                        if client.conv != header.conv { continue; }
+                                        client.last_active = Instant::now();
                                         let data = Bytes::copy_from_slice(&buf[..size]).to_vec();
                                         let sender = client.data_tx.clone();
                                         if let Err(e) = sender.try_send(data) {
@@ -423,6 +459,9 @@ impl KcpListener {
                                         }
                                     }
                                     None => {
+                                        if clients_clone.len() >= max_sessions { continue; }
+                                        let id = next_id;
+                                        next_id = next_id.wrapping_add(1);
                                         // 新链接进入
                                         let Ok(mut kcp) = Kcp::new(0, KcpConfig::fast_mode()) else {
                                             error!("Kcp create failed");
@@ -435,7 +474,7 @@ impl KcpListener {
                                             let udp_tx_clone = udp_tx_clone.clone();
                                             async move {
                                                 let len = data.len();
-                                                udp_tx_clone.send((data.to_vec(),addr))
+                                                udp_tx_clone.send((data.to_vec(),addr,id))
                                                     .await
                                                     .map_err(|_e| KcpError::IoError("send data fail".to_string()))?;
                                                 Ok(len)
@@ -465,6 +504,7 @@ impl KcpListener {
                                                     _ = interval.tick() => {
                                                         if let Err(e) = kcp.update(current_millis()).await {
                                                             error!("kcp update err:{}", e);
+                                                            break;
                                                         }
                                                     }
                                                     result = data_rx.recv() => {
@@ -506,6 +546,9 @@ impl KcpListener {
                                                 main_handle,
                                                 data_tx,
                                                 send_tx,
+                                                conv: header.conv,
+                                                id,
+                                                last_active: Instant::now(),
                                             },
                                         );
                                     }
@@ -543,17 +586,16 @@ impl KcpListener {
         if self.closed {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Listener closed").into());
         }
-        match self.clients.get(&addr) {
-            Some(client) => {
-                validate_send_size(data.len())?;
-                client
-                    .send_tx
-                    .send(data.to_vec())
-                    .await
-                    .map_err(|e| KcpError::IoError(format!("listener send_to err: {}", e)))?;
-            },
-            None => return Err(KcpError::IoError("listener send_to err: None".to_string())),
-        }
+        let sender = self
+            .clients
+            .get(&addr)
+            .map(|client| client.send_tx.clone())
+            .ok_or_else(|| KcpError::IoError("listener send_to err: None".to_string()))?;
+        validate_send_size(data.len())?;
+        sender
+            .send(data.to_vec())
+            .await
+            .map_err(|e| KcpError::IoError(format!("listener send_to err: {}", e)))?;
         Ok(())
     }
 
