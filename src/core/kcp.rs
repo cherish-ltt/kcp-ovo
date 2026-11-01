@@ -393,7 +393,8 @@ impl Kcp {
     ///
     /// # 返回
     ///
-    /// 返回下一个可读字节数；队列为空返回 `QueueEmpty`；等分片返回 `PayloadWaitForFrg`
+    /// 返回下一个可读字节数；队列为空返回 `QueueEmpty`；等分片返回 `PayloadWaitForFrg`；
+    /// 分片链损坏返回 `PayloadErr`，不修改队列。
     ///
     /// # 注意
     ///
@@ -411,18 +412,22 @@ impl Kcp {
         if first.kcp_packet.header.frg == 0 {
             return Ok(first.kcp_packet.header.len as usize);
         }
-        // 先转 usize 再加一：frg 是 u8，frg=255 时 u8 加法会溢出
-        if self.nrcv_que < first.kcp_packet.header.frg as usize + 1 {
-            return Err(KcpError::IncompleteData(IncompleteDataType::PayloadWaitForFrg));
+        if first.kcp_packet.header.frg == u8::MAX {
+            return Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr));
         }
         let mut length = 0usize;
+        let mut expected = first.kcp_packet.header.frg;
         for seg in self.rcv_queue.iter() {
-            length += seg.kcp_packet.header.len as usize;
-            if seg.kcp_packet.header.frg == 0 {
-                break;
+            if seg.kcp_packet.header.frg != expected {
+                return Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr));
             }
+            length += seg.kcp_packet.header.len as usize;
+            if expected == 0 {
+                return Ok(length);
+            }
+            expected -= 1;
         }
-        Ok(length)
+        Err(KcpError::IncompleteData(IncompleteDataType::PayloadWaitForFrg))
     }
 
     /// 接收数据
@@ -432,9 +437,30 @@ impl Kcp {
     ///
     /// # 返回
     ///
-    /// 返回接收到的完整 `Bytes` 数据；队列为空返回 `QueueEmpty`
+    /// 返回接收到的完整 `Bytes` 数据；队列为空返回 `QueueEmpty`。
+    /// 分片链损坏时返回 `PayloadErr` 并丢弃损坏前缀，保留第一个不匹配的段。
     pub fn recv(&mut self) -> KcpResult<Bytes> {
-        let peeksize = self.peeksize()?;
+        let peeksize = match self.peeksize() {
+            Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr)) => {
+                let mut expected = self.rcv_queue.front().unwrap().kcp_packet.header.frg;
+                if expected == u8::MAX {
+                    self.rcv_queue.pop_front();
+                    self.nrcv_que -= 1;
+                } else {
+                    while let Some(seg) = self.rcv_queue.front() {
+                        if seg.kcp_packet.header.frg != expected {
+                            break;
+                        }
+                        self.rcv_queue.pop_front();
+                        self.nrcv_que -= 1;
+                        expected = expected.saturating_sub(1);
+                    }
+                }
+                self.move_rcv_buf_and_probe();
+                return Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr));
+            },
+            result => result?,
+        };
         let mut buf = BytesMut::with_capacity(peeksize);
         // 流模式读取所有 segment，非流模式读取到 frg==0
         while let Some(seg) = self.rcv_queue.pop_front() {

@@ -11,6 +11,64 @@ use kcp_ovo::KcpConfig;
 use kcp_ovo::error::KcpErrorKind;
 use kcp_ovo::helper::KcpCmd;
 
+#[test]
+fn malformed_fragment_chain_reports_error_and_preserves_next_message() {
+    use kcp_ovo::error::{IncompleteDataType, KcpError};
+
+    for chain in [[1u8, 1], [2, 0], [3, 1], [255, 1]] {
+        let sink = Sink::new(KcpConfig::fast_mode());
+        for (sn, frg) in chain.into_iter().enumerate() {
+            let mut packet = push_packet(1, sn as u32, b"x");
+            packet[5] = frg;
+            sink.kcp.borrow_mut().input(&packet).unwrap();
+        }
+        assert_eq!(
+            sink.kcp.borrow().peeksize(),
+            Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr))
+        );
+        assert_eq!(
+            sink.kcp.borrow_mut().recv(),
+            Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr))
+        );
+        if chain[1] != 0 {
+            let mut packet = push_packet(1, 2, b"y");
+            packet[5] = chain[1] - 1;
+            sink.kcp.borrow_mut().input(&packet).unwrap();
+        }
+        let expected: &[u8] = if chain[1] == 0 { b"x" } else { b"xy" };
+        assert_eq!(&sink.kcp.borrow_mut().recv().unwrap()[..], expected);
+    }
+}
+
+#[test]
+fn impossible_fragment_count_does_not_block_following_message() {
+    use kcp_ovo::error::{IncompleteDataType, KcpError};
+
+    let sink = Sink::new(KcpConfig::fast_mode());
+    let mut packet = push_packet(1, 0, b"x");
+    packet[5] = u8::MAX;
+    sink.kcp.borrow_mut().input(&packet).unwrap();
+    assert_eq!(
+        sink.kcp.borrow_mut().recv(),
+        Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr))
+    );
+    sink.kcp.borrow_mut().input(&push_packet(1, 1, b"ok")).unwrap();
+    assert_eq!(&sink.kcp.borrow_mut().recv().unwrap()[..], b"ok");
+}
+
+#[test]
+fn maximum_fragment_chain_survives_reordering_and_sequence_wrap() {
+    let sink = Sink::new(KcpConfig { rcv_wnd: 256, ..KcpConfig::fast_mode() });
+    sink.kcp.borrow_mut().rcv_nxt = u32::MAX - 1;
+    for i in std::iter::once(1u32).chain(std::iter::once(0)).chain(2..255) {
+        let mut packet = push_packet(1, (u32::MAX - 1).wrapping_add(i), &[i as u8]);
+        packet[5] = (254 - i) as u8;
+        sink.kcp.borrow_mut().input(&packet).unwrap();
+    }
+    let received = sink.kcp.borrow_mut().recv().unwrap();
+    assert_eq!(&received[..], &(0..255u8).collect::<Vec<_>>());
+}
+
 #[tokio::test]
 async fn mismatched_payload_lengths_leave_connection_unchanged() {
     for cfg in [KcpConfig::fast_mode(), KcpConfig::stream_mode()] {
@@ -35,7 +93,6 @@ async fn mismatched_payload_lengths_leave_connection_unchanged() {
         assert_eq!(sink.count_cmd(KcpCmd::Ack), 0);
     }
 }
-
 /// 任意长度的随机字节都不得让 input 崩溃
 #[tokio::test]
 async fn random_bytes_never_panic() {
