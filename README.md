@@ -262,6 +262,8 @@ cargo doc --open
 | `low-level-api` | 底层API演示 | `cargo run --example low-level-api` |
 | `file-transfer` | 文件传输示例 | `cargo run --example file-transfer -- [send\|recv] <file>` |
 
+文件传输示例使用双方相同版本的应用协议，按块等待确认；接收端先写入目标目录的临时文件，完整接收后重命名到目标路径。目标已存在时的替换行为取决于操作系统；操作失败会返回错误。传输中断或确认超时会报错，接收端提交文件后的确认失败不代表文件未写入。
+
 更多示例请查看 [examples/](examples/) 目录。
 
 ## 🏗️ 模块结构

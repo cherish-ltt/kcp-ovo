@@ -392,6 +392,7 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-36 | Stream 接收通道满时阻塞协议任务 | 背压 | 停止发送、确认和定时更新，可能造成双向死锁 | `stream.rs` 客户端任务 |
 | BUG-37 | close/Drop 不取消后台及会话任务 | 生命周期 | 关闭后仍收发、端口与任务泄漏 | `stream.rs` 的 close/Drop |
 | BUG-38 | Stream 发送超大消息只记录后台错误 | 应用投递 | 调用方收到成功但消息被丢弃 | `kcp.rs::validate_send_size`、`stream.rs` 发送入口 |
+| BUG-40 | 文件示例先截断目标再解析元数据，且发送端等待不存在的回复 | 文件安全 | 畸形输入破坏原文件或使发送端无限等待 | `examples/file-transfer.rs` |
 
 其中 BUG-9、BUG-10、BUG-18、BUG-19、BUG-24、BUG-25、BUG-27 属于「线上会永久卡死、
 panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-26 属于「不丢数据但
@@ -486,6 +487,7 @@ panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-2
 | BUG-34 | `malformed_fragment_chain_reports_error_and_preserves_next_message` | `tests/malformed.rs` |
 | BUG-35/36 | `listener_delivers_all_messages_released_by_gap`、`client_delivers_all_messages_released_by_gap`、`client_backpressure_keeps_protocol_progress_and_drains_messages` | `tests/stream_api.rs` |
 | BUG-38 | `oversized_messages_are_rejected_before_enqueue` | `tests/stream_api.rs` |
+| BUG-40 | `file_roundtrips_and_invalid_input_preserves_destination` | `examples/file-transfer.rs` |
 
 #### 三、维护规则
 
