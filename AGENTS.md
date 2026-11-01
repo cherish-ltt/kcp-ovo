@@ -394,6 +394,8 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-38 | Stream 发送超大消息只记录后台错误 | 应用投递 | 调用方收到成功但消息被丢弃 | `kcp.rs::validate_send_size`、`stream.rs` 发送入口 |
 | BUG-40 | 文件示例先截断目标再解析元数据，且发送端等待不存在的回复 | 文件安全 | 畸形输入破坏原文件或使发送端无限等待 | `examples/file-transfer.rs` |
 | BUG-39 | 监听器无效首包创建会话且无数量和空闲限制 | 资源管理 | 外部来源可持续累积会话和任务 | `stream.rs` 的监听器准入和清理 |
+| BUG-44 | 客户端固定使用 IPv4 socket | 地址族 | 无法连接 IPv6 地址 | `stream.rs::connect_with_config` |
+| BUG-43 | 零更新间隔触发任务 panic，任务退出后连接状态仍正常 | 生命周期 | 配置错误和后台故障被隐藏 | `stream.rs` 构造及连接状态 |
 | BUG-33 | 报文实际载荷超出声明长度 | 输入解析 | 声明范围外的字节被交付给应用 | `kcp.rs::input` 与 `packet.rs::from_header_and_data` |
 | BUG-31 | 接收队列和乱序缓冲中的重复段不补 ACK | 确认语义 | 首个 ACK 丢失后，发送方需等待应用读取才能恢复 | `kcp.rs::input` 的 Push 分支 |
 | BUG-30 | `check()` 返回的重传期限早于定期刷新 | 时序 | 到期调用 `update()` 不重传，事件循环在同一时刻自旋 | `kcp.rs::update` 与 `check` |
@@ -500,6 +502,8 @@ panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-2
 | BUG-38 | `oversized_messages_are_rejected_before_enqueue` | `tests/stream_api.rs` |
 | BUG-40 | `file_roundtrips_and_invalid_input_preserves_destination` | `examples/file-transfer.rs` |
 | BUG-39 | `listener_limits_and_reclaims_sessions` | `tests/stream_api.rs` |
+| BUG-44 | `loopback_address_families_and_hostname` | `tests/stream_api.rs` |
+| BUG-43 | `zero_update_interval_is_rejected`、`stopped_worker_reports_disconnection` | `tests/stream_api.rs`、`src/stream.rs` |
 | BUG-33 | `mismatched_payload_lengths_leave_connection_unchanged` | `tests/malformed.rs` |
 | BUG-30 | `check_deadline_executes_due_retransmission`、`pending_ack_is_not_delayed_until_zero_window_probe` | `tests/timing.rs` |
 | BUG-32 | `cancelled_output_retains_callback_and_pending_ack`、`cancelled_batch_keeps_successful_segment_state` | `tests/timing.rs` |

@@ -125,11 +125,15 @@ impl KcpStream {
         addr: A,
         config: StreamConfig,
     ) -> KcpResult<Self> {
+        if config.update_interval.is_zero() {
+            return Err(KcpError::InvalidConfig("update_interval must be non-zero".to_string()));
+        }
         // 解析地址
         let remote = lookup_host(addr).await?.next().ok_or(KcpError::NoAddress)?;
 
         // 创建UDP socket
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let local = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let socket = UdpSocket::bind(local).await?;
         socket.connect(remote).await?;
         // 生成唯一的conv(客户端生成，需服务端确认)
         let conv = generate_conv();
@@ -229,7 +233,7 @@ impl KcpStream {
     /// stream.send(b"Hello")?;
     /// ```
     pub async fn send(&mut self, data: &[u8]) -> KcpResult<()> {
-        if !self.connected {
+        if !self.is_connected() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
         validate_send_size(data.len())?;
@@ -253,20 +257,20 @@ impl KcpStream {
     ///
     /// 返回接收到的Vec<u8>
     pub async fn recv(&mut self) -> KcpResult<Vec<u8>> {
-        if !self.connected {
+        if !self.is_connected() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
 
         // 接收数据
         match self.data_receiver.recv().await {
             Some(data) => Ok(data),
-            None => Ok(Vec::new()),
+            None => Err(KcpError::IoError("stream worker stopped".to_string())),
         }
     }
 
     /// 尝试发送数据（非阻塞）
     pub fn try_send(&mut self, data: &[u8]) -> KcpResult<()> {
-        if !self.connected {
+        if !self.is_connected() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
         validate_send_size(data.len())?;
@@ -277,7 +281,7 @@ impl KcpStream {
 
     /// 尝试接收数据（非阻塞）
     pub fn try_recv(&mut self) -> KcpResult<Vec<u8>> {
-        if !self.connected {
+        if !self.is_connected() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
         self.data_receiver
@@ -287,7 +291,7 @@ impl KcpStream {
 
     /// 检查连接状态
     pub fn is_connected(&self) -> bool {
-        self.connected
+        self.connected && !self.main_handle.is_finished()
     }
 
     /// 获取远程地址
@@ -392,6 +396,9 @@ impl KcpListener {
         addr: A,
         config: StreamConfig,
     ) -> KcpResult<Self> {
+        if config.update_interval.is_zero() {
+            return Err(KcpError::InvalidConfig("update_interval must be non-zero".to_string()));
+        }
         if config.max_sessions == 0 || config.session_idle_timeout.is_zero() {
             return Err(KcpError::InvalidConfig("session limits must be non-zero".to_string()));
         }
@@ -623,6 +630,30 @@ mod test {
     use tokio::time::sleep;
 
     use super::*;
+
+    #[tokio::test]
+    async fn stopped_worker_reports_disconnection() {
+        let mut waiting = KcpStream::connect("127.0.0.1:9").await.unwrap();
+        let abort = waiting.main_handle.abort_handle();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            abort.abort();
+        });
+        assert!(timeout(Duration::from_secs(1), waiting.recv()).await.unwrap().is_err());
+
+        let mut stream = KcpStream::connect("127.0.0.1:9").await.unwrap();
+        stream.main_handle.abort();
+        timeout(Duration::from_secs(1), async {
+            while !stream.main_handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!stream.is_connected());
+        assert!(stream.recv().await.is_err());
+        assert!(stream.send(b"x").await.is_err());
+    }
 
     #[tokio::test(start_paused = false)]
     async fn test_stream() {
