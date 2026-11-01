@@ -4,6 +4,7 @@
 //! 包含流模式（Stream Mode）支持：流模式下所有分片 frg=0，
 //! 接收端按 sn 顺序连续拼接字节交付，无消息边界，不受 255 分片限制。
 
+use std::collections::HashSet;
 use std::pin::Pin;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -137,6 +138,7 @@ pub struct Kcp {
     // ACK
     /// ACK 列表（待发送的确认序列号）
     acklist: Vec<u32>,
+    acknowledged: HashSet<u32>,
     /// ACK 列表容量（预留）
     #[allow(dead_code)]
     ackblock: usize,
@@ -241,6 +243,7 @@ impl Kcp {
             snd_buf: KcpDeque::new(),
             rcv_buf: KcpDeque::new(),
             acklist: Vec::with_capacity(16),
+            acknowledged: HashSet::new(),
             ackblock: 16,
             user_data: None,
             buffer: vec![0u8; (mtu as usize + IKCP_OVERHEAD) * 3],
@@ -475,11 +478,14 @@ impl Kcp {
         // 根据命令类型处理
         match header.cmd {
             KcpCmd::Ack => {
-                // 用 snd_nxt 而非 snd_una 做上界：第一个待确认段 sn=0 时
-                // snd_una 也是 0，用 snd_una 比较会把合法 ACK 判成过期。
-                // 这里只做 RTT 采样，段的删除统一由 una 驱动。
-                if self.timediff_u32(self.snd_nxt, header.sn) >= 0 {
+                if self
+                    .snd_buf
+                    .iter()
+                    .any(|seg| seg.kcp_packet.header.sn == header.sn && seg.xmit > 0)
+                    && self.acknowledged.insert(header.sn)
+                {
                     self.parse_ack(header.sn);
+                    self.parse_fastack(header.sn);
                 }
                 if let Some(ref writelog) = self.writelog {
                     writelog(&format!("input ack: sn={}", header.sn), self);
@@ -518,8 +524,6 @@ impl Kcp {
             KcpCmd::Wins => {},
         }
 
-        // parse_fastack 必须先于 parse_una：una 推进后剩余段都满足 sn >= una，
-        // parse_fastack 里 `una > seg.sn` 永假，快速重传会完全失效。
         // 确认只由 una 驱动；若再按 ACK 包的 sn 精确删除，一个「sn=0 却携带 una=3」
         // 的包会把对端尚未收到的段一并移出 snd_buf。
         //
@@ -529,7 +533,6 @@ impl Kcp {
         if self.timediff_u32(header.una, self.snd_una) > 0
             && self.timediff_u32(self.snd_nxt, header.una) >= 0
         {
-            self.parse_fastack(header.una);
             self.parse_una(header.una);
             let increase = if (self.cwnd as u32) < self.ssthresh {
                 self.mss as u64
@@ -559,6 +562,7 @@ impl Kcp {
     fn parse_una(&mut self, una: u32) {
         while let Some(seg) = self.snd_buf.front() {
             if self.timediff_u32(una, seg.kcp_packet.header.sn) > 0 {
+                self.acknowledged.remove(&seg.kcp_packet.header.sn);
                 self.snd_buf.pop_front();
                 self.nsnd_buf -= 1;
             } else {
@@ -613,13 +617,15 @@ impl Kcp {
         self.ts_lastack = current;
     }
 
-    /// 根据 una 对所有未确认段增加快速重传计数
-    ///
-    /// 必须在 `parse_una()` 之前调用：若先移除 sn < una 的段，剩余段都满足 sn >= una，
-    /// `una > seg.sn` 永假，fastack 永不递增。调用顺序由 `input()` 保证。
-    fn parse_fastack(&mut self, una: u32) {
+    /// 根据更高的 ACK 序列号增加前序段的快速重传计数。
+    fn parse_fastack(&mut self, sn: u32) {
         for seg in self.snd_buf.iter_mut() {
-            if (una as i32).wrapping_sub(seg.kcp_packet.header.sn as i32) > 0 && seg.fastack < 255 {
+            if self.acknowledged.contains(&seg.kcp_packet.header.sn) {
+                seg.fastack = 0;
+            } else if (sn as i32).wrapping_sub(seg.kcp_packet.header.sn as i32) > 0
+                && seg.xmit > 0
+                && seg.fastack < 255
+            {
                 seg.fastack += 1;
             }
         }
@@ -853,6 +859,7 @@ impl Kcp {
                 seg.resendts = resendts;
                 seg.rto = rto;
                 if is_lost {
+                    seg.fastack = 0;
                     lost = true;
                 }
             }
@@ -1416,15 +1423,18 @@ mod tests {
         }
         kcp.snd_una = 0;
 
-        // Simulate input with una=1: all seg with sn<1 get fastack incremented
-        // (seg with sn=0 gets fastack+1 since 1 > 0)
+        // All segments were sent and are eligible for fast retransmission.
+        for seg in kcp.snd_buf.iter_mut() {
+            seg.xmit = 1;
+        }
+        // ACK sn=1 increments the counter of sn=0.
         let una = 1u32;
         kcp.parse_fastack(una);
 
         let fastacks: Vec<u32> = kcp.snd_buf.iter().map(|s| s.fastack).collect();
         assert_eq!(fastacks, vec![1, 0, 0]);
 
-        // Second fastack with una=2: seg sn=0,1 get fastack+1
+        // ACK sn=2 increments the counters of sn=0 and sn=1.
         kcp.parse_fastack(2);
         let fastacks: Vec<u32> = kcp.snd_buf.iter().map(|s| s.fastack).collect();
         assert_eq!(fastacks, vec![2, 1, 0]);
