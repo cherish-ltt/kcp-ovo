@@ -383,7 +383,7 @@ cargo test test_stream_mode
 | `api_contract.rs` | 公开 API 契约与错误类型 |
 | `retransmit.rs` | 重传与死链判定 |
 | `fuzz_transfer.rs` | 随机链路下 9 条协议不变式（字节精确、消息边界、窗口上限、断链恢复） |
-| `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、未知命令、WASK/WINS 洪水、伪造 conv、恶意 frg 链 |
+| `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、未知命令、WASK/WINS 洪水、伪造 conv、畸形分片恢复 |
 | `matrix.rs` | 配置组合矩阵：MTU × 窗口 × interval × fastresend × nodelay × 流模式；nodelay 语义（最小 RTO、首传重传期限） |
 | `timing.rs` | ACK 语义与时序：重复段补 ACK、逐段确认、乱序缺口、探测退避、ACK 的 sn/una 一致性与越界确认 |
 | `congestion.rs` | 拥塞窗口：慢启动节奏、AIMD 收缩、`fastresend=0` 开关、三模式吞吐 |
