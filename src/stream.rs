@@ -2,28 +2,10 @@
 //!
 //! 本模块提供了类似TCP的Stream API，自动处理UDP数据包收发和KCP更新。
 //!
-//! # 特性
+//! 使用异步 `send` / `recv` 交换消息；服务端通过 `recv` / `send_to`
+//! 按来源地址收发。该 API 不实现标准 `Read` / `Write`，也不提供 `accept`。
 //!
-//! - 自动处理KCP更新
-//! - 类似TCP的send/recv接口
-//! - 实现了std::io::Read和std::io::Write trait
-//! - 支持非阻塞操作
-//!
-//! # 示例
-//!
-//! ```ignore
-//! use kcp_ovo::stream::KcpStream;
-//!
-//! // 连接到远程服务器
-//! let mut stream = KcpStream::connect("127.0.0.1:8888")?;
-//!
-//! // 发送数据
-//! stream.send(b"Hello, KCP!")?;
-//!
-//! // 接收数据
-//! let bytes = stream.recv()?;
-//! println!("Received: {:?}", &bytes[..len]);
-//! ```
+//! 完整客户端和服务端见仓库中的 `examples/echo-client.rs` 与 `examples/echo-server.rs`。
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -104,8 +86,11 @@ impl KcpStream {
     ///
     /// # 示例
     ///
-    /// ```ignore
-    /// let stream = KcpStream::connect("127.0.0.1:8888")?;
+    /// ```no_run
+    /// # async fn example() -> kcp_ovo::KcpResult<()> {
+    /// let stream = kcp_ovo::stream::KcpStream::connect("127.0.0.1:8888").await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> KcpResult<Self> {
         Self::connect_with_config(addr, StreamConfig::default()).await
@@ -375,8 +360,11 @@ impl KcpListener {
     ///
     /// # 示例
     ///
-    /// ```ignore
-    /// let listener = KcpListener::bind("0.0.0.0:8888")?;
+    /// ```no_run
+    /// # async fn example() -> kcp_ovo::KcpResult<()> {
+    /// let listener = kcp_ovo::stream::KcpListener::bind("0.0.0.0:8888").await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn bind<A: ToSocketAddrs>(addr: A) -> KcpResult<Self> {
         Self::bind_with_config(addr, StreamConfig::default()).await

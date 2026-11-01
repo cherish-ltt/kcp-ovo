@@ -11,6 +11,16 @@ use kcp_ovo::error::KcpErrorKind;
 use kcp_ovo::stream::{KcpListener, KcpStream, StreamConfig};
 use tokio::time::timeout;
 
+#[test]
+fn readme_echo_examples_match_compiled_sources() {
+    let readme = include_str!("../README.md");
+    for source in
+        [include_str!("../examples/echo-server.rs"), include_str!("../examples/echo-client.rs")]
+    {
+        assert!(readme.contains(&format!("```rust\n{}\n```", source.trim_end())));
+    }
+}
+
 #[tokio::test]
 async fn zero_update_interval_is_rejected() {
     let config = StreamConfig { update_interval: Duration::ZERO, ..Default::default() };

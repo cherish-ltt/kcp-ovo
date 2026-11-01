@@ -13,22 +13,8 @@
 //!
 //! ## 快速开始
 //!
-//! ```ignore
-//! use kcp_ovo::{Kcp, KcpConfig};
-//!
-//! // 创建KCP实例
-//! let mut kcp = Kcp::new(0x11223344, KcpConfig::default())?;
-//!
-//! // 设置输出回调
-//! kcp.set_output(|data, kcp| {
-//!     // 通过UDP发送数据
-//!     udp_socket.send_to(data, remote_addr)?;
-//!     Ok(data.len())
-//! });
-//!
-//! // 发送数据
-//! kcp.send(b"Hello, KCP!")?;
-//! ```
+//! 高层异步消息 API 的完整示例见仓库 `examples/echo-server.rs` 和
+//! `examples/echo-client.rs`。底层控制块位于 `kcp_ovo::core::kcp::Kcp`。
 
 // 使用mimalloc作为全局内存分配器
 use mimalloc::MiMalloc;

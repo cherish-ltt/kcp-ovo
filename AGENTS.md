@@ -566,3 +566,7 @@ ci 校验  →  GitHub Release  →  cargo publish
 发布新版本时按顺序做三件事：改 `Cargo.toml` 与 `Cargo.lock` 的版本号、
 补 `.version/RELEASE-<tag>.md`、打标签并推送。版本说明面向使用者，
 写「变了什么、需要注意什么」，不复述提交清单。
+
+### 10.6 文档示例一致性
+
+README 的 Echo 代码与 `examples/echo-server.rs`、`examples/echo-client.rs` 保持一致；`readme_echo_examples_match_compiled_sources` 检查内容，CI 编译示例。修改示例时同步更新 README。
