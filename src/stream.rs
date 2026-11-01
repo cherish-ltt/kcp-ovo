@@ -29,11 +29,12 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use log::{debug, error, warn};
 use tokio::net::{ToSocketAddrs, UdpSocket, lookup_host};
-use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, timeout};
 
 use crate::core::kcp::Kcp;
+use crate::error::IncompleteDataType;
 use crate::helper::{current_millis, generate_conv};
 use crate::{KcpConfig, KcpError, KcpResult};
 use std::io::{self};
@@ -142,7 +143,24 @@ impl KcpStream {
             let mut interval = interval(config.update_interval);
             let mut buf = vec![0; BUFFER_SIZE];
             loop {
+                let readable = match kcp.peeksize() {
+                    Ok(_) => true,
+                    Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr)) => {
+                        if let Err(e) = kcp.recv() {
+                            error!("kcp recv err:{}", e);
+                        }
+                        continue;
+                    },
+                    Err(_) => false,
+                };
                 tokio::select! {
+                    permit = recv_tx.reserve(), if readable => {
+                        let Ok(permit) = permit else { break };
+                        match kcp.recv() {
+                            Ok(bytes) => { permit.send(bytes.to_vec()); }
+                            Err(e) => error!("kcp recv err:{}", e),
+                        }
+                    }
                     _ = interval.tick() => {
                         if let Err(e) = kcp.update(current_millis()).await {
                             error!("kcp update err:{}", e);
@@ -153,14 +171,6 @@ impl KcpStream {
                             Ok(size) => {
                                 if let Err(e) = kcp.input(&buf[..size]) {
                                     error!("kcp input err:{}", e);
-                                }
-                                match kcp.recv() {
-                                    Ok(bytes) => {
-                                        if let Err(e) = recv_tx.send(bytes.to_vec()).await {
-                                            error!("recv_tx send err:{}", e);
-                                        }
-                                    }
-                                    Err(e) => error!("kcp recv err:{}", e),
                                 }
                             }
                             Err(e) => error!("socket err:{}", e),
@@ -294,7 +304,7 @@ pub struct KcpListener {
     /// 配置
     config: StreamConfig,
     /// recv-msg
-    recv_rx: UnboundedReceiver<(Vec<u8>, SocketAddr)>,
+    recv_rx: Receiver<(Vec<u8>, SocketAddr)>,
     /// 实际绑定的本地地址（绑定 0 端口时用于获取系统分配的端口）
     local_addr: SocketAddr,
 }
@@ -341,7 +351,7 @@ impl KcpListener {
         // 设置output回调
         let socket = Arc::new(socket);
         let (udp_tx, mut udp_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_SIZE);
-        let (recv_tx, recv_rx) = mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
+        let (recv_tx, recv_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_SIZE);
         let timeout_druation = Duration::from_millis(100);
         let main_handle: JoinHandle<()> = tokio::spawn(async move {
             let mut buf = vec![0; BUFFER_SIZE];
@@ -369,9 +379,9 @@ impl KcpListener {
                                     Some(client) => {
                                         let data = Bytes::copy_from_slice(&buf[..size]).to_vec();
                                         let sender = client.data_tx.clone();
-                                        tokio::spawn(async move {
-                                            let _ = sender.send(data).await;
-                                        });
+                                        if let Err(e) = sender.try_send(data) {
+                                            warn!("listener packet queue: {}", e);
+                                        }
                                     }
                                     None => {
                                         // 新链接进入
@@ -395,7 +405,24 @@ impl KcpListener {
                                         let main_handle = tokio::spawn(async move {
                                             let mut interval = interval(config.update_interval);
                                             loop{
+                                                let readable = match kcp.peeksize() {
+                                                    Ok(_) => true,
+                                                    Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr)) => {
+                                                        if let Err(e) = kcp.recv() {
+                                                            error!("listener kcp recv err:{}", e);
+                                                        }
+                                                        continue;
+                                                    }
+                                                    Err(_) => false,
+                                                };
                                                 tokio::select! {
+                                                    permit = recv_tx_clone.reserve(), if readable => {
+                                                        let Ok(permit) = permit else { break };
+                                                        match kcp.recv() {
+                                                            Ok(bytes) => { permit.send((bytes.to_vec(), addr)); }
+                                                            Err(e) => error!("listener kcp recv err:{}", e),
+                                                        }
+                                                    }
                                                     _ = interval.tick() => {
                                                         if let Err(e) = kcp.update(current_millis()).await {
                                                             error!("kcp update err:{}", e);
@@ -407,14 +434,6 @@ impl KcpListener {
                                                                 match kcp.input(&data) {
                                                                     Ok(_) => debug!("listener kcp input data success"),
                                                                     Err(e) => error!("listener kcp input data err:{}", e),
-                                                                }
-                                                                match kcp.recv() {
-                                                                    Ok(bytes) => {
-                                                                        if let Err(e) = recv_tx_clone.send((bytes.to_vec(),addr)) {
-                                                                            error!("recv_tx send err:{}", e);
-                                                                        }
-                                                                    }
-                                                                    Err(e) => {warn!("kcp recv failed: {}", e)}
                                                                 }
                                                             }
                                                             None => warn!("listener data_rx.recv none"),
@@ -437,9 +456,9 @@ impl KcpListener {
 
                                         let data = Bytes::copy_from_slice(&buf[..size]).to_vec();
                                         let sender = data_tx.clone();
-                                        tokio::spawn(async move {
-                                            let _ = sender.send(data).await;
-                                        });
+                                        if let Err(e) = sender.try_send(data) {
+                                            warn!("listener packet queue: {}", e);
+                                        }
 
                                         clients_clone.insert(
                                             addr,

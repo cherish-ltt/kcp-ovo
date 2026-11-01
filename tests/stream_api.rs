@@ -11,6 +11,127 @@ use kcp_ovo::error::KcpErrorKind;
 use kcp_ovo::stream::{KcpListener, KcpStream, StreamConfig};
 use tokio::time::timeout;
 
+async fn wait_ack(socket: &tokio::net::UdpSocket, sn: u32) {
+    let mut buf = [0u8; 1500];
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let (size, _) = socket.recv_from(&mut buf).await.unwrap();
+            if size >= 28
+                && buf[4] == u8::from(kcp_ovo::KcpCmd::Ack)
+                && u32::from_be_bytes(buf[16..20].try_into().unwrap()) == sn
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn listener_delivers_all_messages_released_by_gap() {
+    let mut listener = KcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    peer.send_to(&common::stress::push_packet(1, 1, b"b"), listener.local_addr()).await.unwrap();
+    wait_ack(&peer, 1).await;
+    peer.send_to(&common::stress::push_packet(1, 0, b"a"), listener.local_addr()).await.unwrap();
+    for expected in [b"a", b"b"] {
+        let (got, _) = timeout(Duration::from_secs(3), listener.recv()).await.unwrap().unwrap();
+        assert_eq!(&got, expected);
+    }
+}
+
+#[tokio::test]
+async fn client_delivers_all_messages_released_by_gap() {
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut stream = KcpStream::connect(peer.local_addr().unwrap()).await.unwrap();
+    let mut buf = [0u8; 1500];
+    let (_, addr) =
+        timeout(Duration::from_secs(3), peer.recv_from(&mut buf)).await.unwrap().unwrap();
+    let conv = u32::from_be_bytes(buf[..4].try_into().unwrap());
+    peer.send_to(&common::stress::push_packet(conv, 1, b"b"), addr).await.unwrap();
+    wait_ack(&peer, 1).await;
+    peer.send_to(&common::stress::push_packet(conv, 0, b"a"), addr).await.unwrap();
+    for expected in [b"a", b"b"] {
+        let got = timeout(Duration::from_secs(3), stream.recv()).await.unwrap().unwrap();
+        assert_eq!(&got, expected);
+    }
+}
+
+#[tokio::test]
+async fn listener_recovers_after_invalid_fragment() {
+    let mut listener = KcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut invalid = common::stress::push_packet(1, 0, b"bad");
+    invalid[5] = u8::MAX;
+    peer.send_to(&invalid, listener.local_addr()).await.unwrap();
+    wait_ack(&peer, 0).await;
+    peer.send_to(&common::stress::push_packet(1, 1, b"ok"), listener.local_addr()).await.unwrap();
+    let (got, _) = timeout(Duration::from_secs(3), listener.recv()).await.unwrap().unwrap();
+    assert_eq!(got, b"ok");
+}
+
+#[tokio::test]
+async fn client_backpressure_keeps_protocol_progress_and_drains_messages() {
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut stream = KcpStream::connect(peer.local_addr().unwrap()).await.unwrap();
+    let mut buf = [0u8; 1500];
+    let (_, addr) =
+        timeout(Duration::from_secs(3), peer.recv_from(&mut buf)).await.unwrap().unwrap();
+    let conv = u32::from_be_bytes(buf[..4].try_into().unwrap());
+    for sn in 0..65 {
+        peer.send_to(&common::stress::push_packet(conv, sn, &[sn as u8]), addr).await.unwrap();
+        wait_ack(&peer, sn).await;
+    }
+    for _ in 0..65 {
+        timeout(Duration::from_secs(3), stream.send(b"request")).await.unwrap().unwrap();
+    }
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let (size, _) = peer.recv_from(&mut buf).await.unwrap();
+            if size >= 28 && buf[4] == u8::from(kcp_ovo::KcpCmd::Push) {
+                assert_eq!(&buf[28..size], b"request");
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    for expected in 0..65u8 {
+        let got = timeout(Duration::from_secs(3), stream.recv()).await.unwrap().unwrap();
+        assert_eq!(got, [expected]);
+    }
+}
+
+#[tokio::test]
+async fn listener_backpressure_keeps_protocol_progress_and_drains_messages() {
+    let mut listener = KcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for sn in 0..65 {
+        peer.send_to(&common::stress::push_packet(1, sn, &[sn as u8]), listener.local_addr())
+            .await
+            .unwrap();
+        wait_ack(&peer, sn).await;
+    }
+    listener.send_to(b"reply", peer.local_addr().unwrap()).await.unwrap();
+    let mut buf = [0u8; 1500];
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let (size, _) = peer.recv_from(&mut buf).await.unwrap();
+            if size >= 28 && buf[4] == u8::from(kcp_ovo::KcpCmd::Push) {
+                assert_eq!(&buf[28..size], b"reply");
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    for expected in 0..65u8 {
+        let (got, _) = timeout(Duration::from_secs(3), listener.recv()).await.unwrap().unwrap();
+        assert_eq!(got, [expected]);
+    }
+}
+
 /// 在随机端口上起一个回显服务，返回监听地址
 async fn spawn_echo_server(rounds: usize) -> String {
     let listener = KcpListener::bind("127.0.0.1:0").await.unwrap();

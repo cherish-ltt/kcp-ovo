@@ -379,7 +379,7 @@ cargo test test_stream_mode
 | `lossy.rs` | 丢包、乱序、重复下的可靠性 |
 | `window.rs` | 收发窗口、零窗口、窗口通告、探测起步与退避上限、探测不挤占 ACK、长期零窗口后恢复 |
 | `lifecycle.rs` | 创建、更新、关闭、死链 |
-| `stream_api.rs` | `KcpStream` / `KcpListener` 接口 |
+| `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付与接收背压 |
 | `api_contract.rs` | 公开 API 契约与错误类型 |
 | `retransmit.rs` | 重传与死链判定 |
 | `fuzz_transfer.rs` | 随机链路下 9 条协议不变式（字节精确、消息边界、窗口上限、断链恢复） |
