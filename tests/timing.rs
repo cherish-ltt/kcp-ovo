@@ -10,6 +10,44 @@ use common::{Net, Rng, Sim, assert_same};
 use kcp_ovo::KcpConfig;
 use kcp_ovo::helper::KcpCmd;
 
+#[tokio::test]
+async fn bounded_rtt_jitter_and_spike_decay() {
+    let mut sink = Sink::new(KcpConfig::fast_mode());
+    sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 128)).unwrap();
+    let mut baseline = 0;
+    let mut spike = 0;
+    for n in 0..2101u32 {
+        let start = u64::from(n) * 1000;
+        sink.kcp.borrow_mut().send(b"x").unwrap();
+        sink.update(start).await.unwrap();
+        let sample = if n == 2000 { 200 } else { 100 + u64::from(n % 2) * 10 };
+        let mut kcp = sink.kcp.borrow_mut();
+        kcp.current = start + sample;
+        let ack = common::stress::raw_packet(
+            RawHeader {
+                conv: 1,
+                cmd: KcpCmd::Ack as u8,
+                wnd: 128,
+                sn: n,
+                una: n + 1,
+                ..RawHeader::default()
+            },
+            &[],
+        );
+        kcp.input(&ack).unwrap();
+        if n == 1999 {
+            baseline = kcp.rx_rto;
+        }
+        if n == 2000 {
+            spike = kcp.rx_rto;
+        }
+    }
+    let recovered = sink.kcp.borrow().rx_rto;
+    assert!(baseline < 500, "bounded jitter inflated RTO to {baseline}");
+    assert!(spike > baseline, "spike did not raise RTO");
+    assert!(recovered < spike && recovered < 500, "RTO did not recover: {recovered}");
+}
+
 /// ACK 丢失后，发送方重传同一段，接收方必须补回 ACK
 ///
 /// 这是最容易被忽略的一条：接收方已经在 rcv_queue 里有了该段，
