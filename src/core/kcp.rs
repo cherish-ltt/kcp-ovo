@@ -4,7 +4,7 @@
 //! 包含流模式（Stream Mode）支持：流模式下所有分片 frg=0，
 //! 接收端按 sn 顺序连续拼接字节交付，无消息边界，不受 255 分片限制。
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -137,7 +137,7 @@ pub struct Kcp {
 
     // ACK
     /// ACK 列表（待发送的确认序列号）
-    acklist: Vec<u32>,
+    acklist: VecDeque<u32>,
     acknowledged: HashSet<u32>,
     /// ACK 列表容量（预留）
     #[allow(dead_code)]
@@ -242,7 +242,7 @@ impl Kcp {
             rcv_queue: KcpDeque::new(),
             snd_buf: KcpDeque::new(),
             rcv_buf: KcpDeque::new(),
-            acklist: Vec::with_capacity(16),
+            acklist: VecDeque::with_capacity(16),
             acknowledged: HashSet::new(),
             ackblock: 16,
             user_data: None,
@@ -506,7 +506,7 @@ impl Kcp {
                     if self.rcv_queue.iter().any(|s| s.kcp_packet.header.sn == header.sn) {
                         return Ok(());
                     }
-                    self.acklist.push(header.sn);
+                    self.acklist.push_back(header.sn);
                     return Ok(());
                 }
                 for seg in self.rcv_buf.iter() {
@@ -515,7 +515,7 @@ impl Kcp {
                     }
                 }
                 // 重传段一律重新排队 ACK，保证 ACK 丢失后能被下一次重传修复。
-                self.acklist.push(header.sn);
+                self.acklist.push_back(header.sn);
                 let newseg = Segment::new_with_header_and_data(header, &buf)?;
                 self.parse_data(newseg);
                 self.move_rcv_buf_to_queue();
@@ -710,18 +710,15 @@ impl Kcp {
         }
 
         // 对端窗口未知时按退避间隔重发窗口探测；已知时清空退避。
-        // probe_due 只看本轮是否到期，与 ts_probe 的取值解耦：
         // 首次探测需要立即发出，但 ts_probe 必须同时按退避量推后，
         // 否则它在后续每轮 flush 都会再次到期，退避形同虚设。
         // 首次等待必须从 IKCP_PROBE_INIT 起步。若取 interval（fast 模式 20ms），
         // 退避序列会退化成几十毫秒级，长时间零窗口的连接会被 WASK 高频轰炸。
-        let mut probe_due = false;
         if self.rmt_wnd == 0 {
             if self.probe_wait == 0 {
                 self.probe_wait = IKCP_PROBE_INIT;
                 self.ts_probe = self.current + self.probe_wait;
                 self.probe |= IKCP_ASK_SEND;
-                probe_due = true;
             } else if self.timediff_u64(self.current, self.ts_probe) >= 0 {
                 // 不小于 IKCP_PROBE_INIT 后按 1.5 倍增长
                 if self.probe_wait < IKCP_PROBE_INIT {
@@ -730,7 +727,6 @@ impl Kcp {
                 self.probe_wait = (self.probe_wait + self.probe_wait / 2).min(IKCP_PROBE_LIMIT);
                 self.ts_probe = self.current + self.probe_wait;
                 self.probe |= IKCP_ASK_SEND;
-                probe_due = true;
             }
         } else {
             // 对端窗口已知后必须清空探测退避，否则重新进入 rmt_wnd==0 时
@@ -743,17 +739,16 @@ impl Kcp {
         // 探测不能因为本轮恰好有 ACK 要发就让路：一旦让路，ASK_SEND 会挂在
         // probe 里，check() 于是持续返回 current，调用方按此立即 update 又被
         // ts_flush 节流，形成零窗口期间的全速空转。
-        let acks_to_send = self.acklist.clone();
-        let need_wask = probe_due && (self.probe & IKCP_ASK_SEND) != 0;
+        let need_wask = (self.probe & IKCP_ASK_SEND) != 0;
         let need_wins = (self.probe & IKCP_ASK_TELL) != 0;
-        self.acklist.clear();
 
         if need_wask {
             self.send_control(KcpCmd::Wask, 0).await?;
             self.probe &= !IKCP_ASK_SEND;
         }
-        for sn in acks_to_send {
+        while let Some(&sn) = self.acklist.front() {
             self.send_control(KcpCmd::Ack, sn).await?;
+            self.acklist.pop_front();
         }
         if need_wins {
             self.send_control(KcpCmd::Wins, 0).await?;
@@ -836,7 +831,9 @@ impl Kcp {
             }
         }
 
-        for (frg, sn, ts, una, wnd, data) in sends {
+        for ((frg, sn, ts, una, wnd, data), (idx, xmit, resendts, rto, is_lost)) in
+            sends.into_iter().zip(need_update)
+        {
             self.send_packet(KcpPacket::new_with_data(
                 KcpPacketHeader::new(
                     self.conv,
@@ -851,36 +848,30 @@ impl Kcp {
                 data,
             ))
             .await?;
-        }
-
-        for (idx, xmit, resendts, rto, is_lost) in need_update {
             if let Some(seg) = self.snd_buf.get_mut(idx) {
                 seg.xmit = xmit;
                 seg.resendts = resendts;
                 seg.rto = rto;
                 if is_lost {
                     seg.fastack = 0;
+                }
+                if is_lost && !lost {
                     lost = true;
+                    self.ssthresh = (self.cwnd as u32 / 2).max(IKCP_THRESH_MIN);
+                    self.cwnd = 1;
+                    self.incr = 0;
                 }
             }
         }
 
-        // 拥塞控制：丢包则收缩窗口
-        if lost {
-            self.ssthresh = (self.cwnd as u32 / 2).max(IKCP_THRESH_MIN);
-            self.cwnd = 1;
-            self.incr = 0;
-        }
         Ok(())
     }
 
     /// 统一的发送接口（处理 output 回调的借用问题）
     async fn send_packet(&mut self, pkt: KcpPacket) -> KcpResult<()> {
         let data = pkt.to_bytes()?;
-        let output = self.output.take().ok_or(KcpError::OutputNotSet)?;
-        let result = output(data).await;
-        self.output = Some(output);
-        result?;
+        let output = self.output.as_ref().ok_or(KcpError::OutputNotSet)?;
+        output(data).await?;
         self.xmit = self.xmit.wrapping_add(1);
         Ok(())
     }
@@ -896,8 +887,8 @@ impl Kcp {
         let retransmit_due = self
             .snd_buf
             .iter()
-            .any(|seg| seg.xmit > 0 && self.timediff_u64(self.current, seg.resendts) >= 0);
-        if flush_due || retransmit_due {
+            .any(|seg| seg.xmit == 0 || self.timediff_u64(self.current, seg.resendts) >= 0);
+        if flush_due || retransmit_due || self.probe & IKCP_ASK_SEND != 0 {
             if flush_due {
                 self.ts_flush = self.current.wrapping_add(self.interval);
             }
@@ -1484,8 +1475,8 @@ mod tests {
         assert!(!*sent_ack.lock().unwrap(), "此时还没有待确认的 ACK");
 
         // Add acks to acklist (simulating input coming in) and set probe for Wask
-        kcp.acklist.push(42);
-        kcp.acklist.push(99);
+        kcp.acklist.push_back(42);
+        kcp.acklist.push_back(99);
         // Also ensure probe is set and timing condition met
         kcp.probe |= IKCP_ASK_SEND;
         kcp.ts_probe = now - 1000; // past due

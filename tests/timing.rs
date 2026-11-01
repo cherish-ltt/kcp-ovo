@@ -41,6 +41,117 @@ async fn pending_ack_is_not_delayed_until_zero_window_probe() {
 }
 
 #[tokio::test]
+async fn cancelled_output_retains_callback_and_pending_ack() {
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::Poll;
+
+    let mut kcp = kcp_ovo::core::kcp::Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+    let ready = Arc::new(AtomicBool::new(false));
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let gate = ready.clone();
+    let output = emitted.clone();
+    kcp.set_output(move |data| {
+        let gate = gate.clone();
+        let output = output.clone();
+        async move {
+            poll_fn(|_| if gate.load(Ordering::SeqCst) { Poll::Ready(()) } else { Poll::Pending })
+                .await;
+            output.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
+    });
+    kcp.input(&push_packet(1, 0, b"received")).unwrap();
+    kcp.send(b"sent").unwrap();
+    let mut update = Box::pin(kcp.update(0));
+    poll_fn(|cx| {
+        assert!(update.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(update);
+    ready.store(true, Ordering::SeqCst);
+    kcp.update(20).await.unwrap();
+    let packets = emitted.lock().unwrap();
+    assert!(packets.iter().any(|p| common::parse_cmd(p) == Some(KcpCmd::Ack)));
+    assert!(packets.iter().any(|p| common::parse_cmd(p) == Some(KcpCmd::Push)));
+}
+
+#[tokio::test]
+async fn cancelled_batch_keeps_successful_segment_state() {
+    use std::future::{Future, poll_fn};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::Poll;
+
+    let mut kcp = kcp_ovo::core::kcp::Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(AtomicBool::new(false));
+    let count = calls.clone();
+    let gate = ready.clone();
+    kcp.set_output(move |data| {
+        let call = count.fetch_add(1, Ordering::SeqCst);
+        let gate = gate.clone();
+        async move {
+            poll_fn(|_| {
+                if call != 1 || gate.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            Ok(data.len())
+        }
+    });
+    kcp.input(&common::stress::control_packet(1, KcpCmd::Wins, 128)).unwrap();
+    kcp.send(b"a").unwrap();
+    kcp.send(b"b").unwrap();
+    let mut update = Box::pin(kcp.update(0));
+    poll_fn(|cx| {
+        assert!(update.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(update);
+    assert_eq!(kcp.snd_buf.front().unwrap().xmit, 1);
+    assert_eq!(kcp.snd_buf.back().unwrap().xmit, 0);
+    ready.store(true, Ordering::SeqCst);
+    let next = kcp.check(0);
+    assert_eq!(next, 0);
+    kcp.update(next).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(kcp.snd_buf.back().unwrap().xmit, 1);
+}
+
+#[tokio::test]
+async fn failed_probe_is_retried_on_next_check() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut kcp = kcp_ovo::core::kcp::Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    kcp.set_output(move |data| {
+        let call = count.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if call == 0 {
+                Err(kcp_ovo::KcpError::IoError("output failed".into()))
+            } else {
+                Ok(data.len())
+            }
+        }
+    });
+    assert!(kcp.update(0).await.is_err());
+    let next = kcp.check(0);
+    assert_eq!(next, 0);
+    kcp.update(next).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(kcp.check(next) > next);
+}
+
+#[tokio::test]
 async fn distinct_reordered_acks_trigger_fast_retransmit_before_rto() {
     for start_sn in [0u32, u32::MAX - 1] {
         for fastresend in [0, 1, 2] {
