@@ -393,6 +393,8 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-37 | close/Drop 不取消后台及会话任务 | 生命周期 | 关闭后仍收发、端口与任务泄漏 | `stream.rs` 的 close/Drop |
 | BUG-38 | Stream 发送超大消息只记录后台错误 | 应用投递 | 调用方收到成功但消息被丢弃 | `kcp.rs::validate_send_size`、`stream.rs` 发送入口 |
 | BUG-39 | 监听器无效首包创建会话且无数量和空闲限制 | 资源管理 | 外部来源可持续累积会话和任务 | `stream.rs` 的监听器准入和清理 |
+| BUG-40 | 客户端固定使用 IPv4 socket | 地址族 | 无法连接 IPv6 地址 | `stream.rs::connect_with_config` |
+| BUG-43 | 零更新间隔触发任务 panic，任务退出后连接状态仍正常 | 生命周期 | 配置错误和后台故障被隐藏 | `stream.rs` 构造及连接状态 |
 
 其中 BUG-9、BUG-10、BUG-18、BUG-19、BUG-24、BUG-25、BUG-27 属于「线上会永久卡死、
 panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-26 属于「不丢数据但
@@ -488,6 +490,8 @@ panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-2
 | BUG-35/36 | `listener_delivers_all_messages_released_by_gap`、`client_delivers_all_messages_released_by_gap`、`client_backpressure_keeps_protocol_progress_and_drains_messages` | `tests/stream_api.rs` |
 | BUG-38 | `oversized_messages_are_rejected_before_enqueue` | `tests/stream_api.rs` |
 | BUG-39 | `listener_limits_and_reclaims_sessions` | `tests/stream_api.rs` |
+| BUG-40 | `loopback_address_families_and_hostname` | `tests/stream_api.rs` |
+| BUG-43 | `zero_update_interval_is_rejected`、`stopped_worker_reports_disconnection` | `tests/stream_api.rs`、`src/stream.rs` |
 
 #### 三、维护规则
 

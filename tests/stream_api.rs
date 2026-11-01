@@ -12,6 +12,64 @@ use kcp_ovo::stream::{KcpListener, KcpStream, StreamConfig};
 use tokio::time::timeout;
 
 #[tokio::test]
+async fn zero_update_interval_is_rejected() {
+    let config = StreamConfig { update_interval: Duration::ZERO, ..Default::default() };
+    assert_eq!(
+        KcpListener::bind_with_config("127.0.0.1:0", config.clone()).await.err().unwrap().kind(),
+        KcpErrorKind::InvalidConfig
+    );
+    assert_eq!(
+        KcpStream::connect_with_config("127.0.0.1:9", config).await.err().unwrap().kind(),
+        KcpErrorKind::InvalidConfig
+    );
+    let config = StreamConfig { update_interval: Duration::from_nanos(1), ..Default::default() };
+    let listener = KcpListener::bind_with_config("127.0.0.1:0", config.clone()).await.unwrap();
+    let _stream = KcpStream::connect_with_config(listener.local_addr(), config).await.unwrap();
+}
+
+#[tokio::test]
+async fn loopback_address_families_and_hostname() {
+    for host in ["127.0.0.1", "::1"] {
+        let addr = format!("[{host}]:0");
+        let addr = if host == "127.0.0.1" { "127.0.0.1:0" } else { &addr };
+        let mut listener = match KcpListener::bind(addr).await {
+            Ok(listener) => listener,
+            Err(e) if host == "::1" && tokio::net::UdpSocket::bind("[::1]:0").await.is_err() => {
+                eprintln!("IPv6 loopback unavailable: {e}");
+                continue;
+            },
+            Err(e) => panic!("listener bind failed: {e}"),
+        };
+        let mut stream = KcpStream::connect(listener.local_addr()).await.unwrap();
+        stream.send(b"request").await.unwrap();
+        let (data, peer) = timeout(Duration::from_secs(3), listener.recv()).await.unwrap().unwrap();
+        assert_eq!(data, b"request");
+        listener.send_to(b"reply", peer).await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(3), stream.recv()).await.unwrap().unwrap(),
+            b"reply"
+        );
+    }
+    let first = tokio::net::lookup_host("localhost:9").await.unwrap().next().unwrap();
+    let bind = if first.is_ipv4() { "127.0.0.1:0" } else { "[::1]:0" };
+    let mut listener = match KcpListener::bind(bind).await {
+        Ok(listener) => listener,
+        Err(e) if first.is_ipv6() && tokio::net::UdpSocket::bind("[::1]:0").await.is_err() => {
+            eprintln!("IPv6 loopback unavailable for localhost: {e}");
+            return;
+        },
+        Err(e) => panic!("hostname listener bind failed: {e}"),
+    };
+    let mut stream =
+        KcpStream::connect(format!("localhost:{}", listener.local_addr().port())).await.unwrap();
+    stream.send(b"hostname").await.unwrap();
+    let (data, peer) = timeout(Duration::from_secs(3), listener.recv()).await.unwrap().unwrap();
+    assert_eq!(data, b"hostname");
+    listener.send_to(b"reply", peer).await.unwrap();
+    assert_eq!(timeout(Duration::from_secs(3), stream.recv()).await.unwrap().unwrap(), b"reply");
+}
+
+#[tokio::test]
 async fn listener_rejects_invalid_session_limits() {
     for config in [
         StreamConfig { max_sessions: 0, ..Default::default() },

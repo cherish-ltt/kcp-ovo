@@ -61,7 +61,7 @@
 
 Stream 的发送接口成功表示数据已进入本地队列，并非对端已收到。消息超过 255 个分片时会立即返回错误；接收端窗口小于消息分片数时，消息可能无法完成接收。
 
-监听器默认最多保留 1024 个会话，并在 300 秒未收到有效报文后回收会话；可通过 `StreamConfig` 的 `max_sessions` 和 `session_idle_timeout` 调整，两者必须大于零。会话被回收后，空闲客户端需要重新连接。使用 `StreamConfig` 结构体字面量时，请通过 `..Default::default()` 填充未指定的字段。
+监听器默认最多保留 1024 个会话，并在 300 秒未收到有效报文后回收会话；可通过 `StreamConfig` 的 `max_sessions` 和 `session_idle_timeout` 调整，两者必须大于零，`update_interval` 也必须大于零。会话被回收后，空闲客户端需要重新连接。客户端按解析出的第一个地址选择 IPv4 或 IPv6，不会自动尝试后续地址。使用 `StreamConfig` 结构体字面量时，请通过 `..Default::default()` 填充未指定的字段。
 
 ### 安装
 
@@ -385,7 +385,7 @@ cargo test test_stream_mode
 | `lossy.rs` | 丢包、乱序、重复下的可靠性 |
 | `window.rs` | 收发窗口、零窗口、窗口通告、探测起步与退避上限、探测不挤占 ACK、长期零窗口后恢复 |
 | `lifecycle.rs` | 创建、更新、关闭、死链 |
-| `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付、接收背压与关闭资源回收 |
+| `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付、接收背压、地址族、配置校验与关闭资源回收 |
 | `api_contract.rs` | 公开 API 契约与错误类型 |
 | `retransmit.rs` | 重传与死链判定 |
 | `fuzz_transfer.rs` | 随机链路下 9 条协议不变式（字节精确、消息边界、窗口上限、断链恢复） |
