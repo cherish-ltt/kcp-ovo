@@ -391,6 +391,7 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-35 | Stream 每个 UDP 包只交付一条消息 | 应用投递 | 乱序恢复后剩余消息滞留，直到收到下一包 | `stream.rs` 的接收循环 |
 | BUG-36 | Stream 接收通道满时阻塞协议任务 | 背压 | 停止发送、确认和定时更新，可能造成双向死锁 | `stream.rs` 客户端任务 |
 | BUG-37 | close/Drop 不取消后台及会话任务 | 生命周期 | 关闭后仍收发、端口与任务泄漏 | `stream.rs` 的 close/Drop |
+| BUG-38 | Stream 发送超大消息只记录后台错误 | 应用投递 | 调用方收到成功但消息被丢弃 | `kcp.rs::validate_send_size`、`stream.rs` 发送入口 |
 | BUG-33 | 报文实际载荷超出声明长度 | 输入解析 | 声明范围外的字节被交付给应用 | `kcp.rs::input` 与 `packet.rs::from_header_and_data` |
 | BUG-31 | 接收队列和乱序缓冲中的重复段不补 ACK | 确认语义 | 首个 ACK 丢失后，发送方需等待应用读取才能恢复 | `kcp.rs::input` 的 Push 分支 |
 | BUG-30 | `check()` 返回的重传期限早于定期刷新 | 时序 | 到期调用 `update()` 不重传，事件循环在同一时刻自旋 | `kcp.rs::update` 与 `check` |
@@ -494,6 +495,7 @@ panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-2
 | BUG-28 | `check_prefers_retransmit_deadline_over_probe` | `tests/timing.rs` |
 | BUG-34 | `malformed_fragment_chain_reports_error_and_preserves_next_message` | `tests/malformed.rs` |
 | BUG-35/36 | `listener_delivers_all_messages_released_by_gap`、`client_delivers_all_messages_released_by_gap`、`client_backpressure_keeps_protocol_progress_and_drains_messages` | `tests/stream_api.rs` |
+| BUG-38 | `oversized_messages_are_rejected_before_enqueue` | `tests/stream_api.rs` |
 | BUG-33 | `mismatched_payload_lengths_leave_connection_unchanged` | `tests/malformed.rs` |
 | BUG-30 | `check_deadline_executes_due_retransmission`、`pending_ack_is_not_delayed_until_zero_window_probe` | `tests/timing.rs` |
 | BUG-32 | `cancelled_output_retains_callback_and_pending_ack`、`cancelled_batch_keeps_successful_segment_state` | `tests/timing.rs` |

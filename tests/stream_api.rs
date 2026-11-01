@@ -12,6 +12,28 @@ use kcp_ovo::stream::{KcpListener, KcpStream, StreamConfig};
 use tokio::time::timeout;
 
 #[tokio::test]
+async fn oversized_messages_are_rejected_before_enqueue() {
+    let mut listener = KcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut stream = KcpStream::connect(listener.local_addr()).await.unwrap();
+    let max = 1372 * 255;
+    let oversized = vec![42; max + 1];
+    assert_eq!(stream.send(&oversized).await.unwrap_err().kind(), KcpErrorKind::InvalidConfig);
+    assert_eq!(stream.try_send(&oversized).unwrap_err().kind(), KcpErrorKind::InvalidConfig);
+    stream.send(b"marker").await.unwrap();
+    let (message, peer) = timeout(Duration::from_secs(3), listener.recv()).await.unwrap().unwrap();
+    assert_eq!(message, b"marker");
+    assert_eq!(
+        listener.send_to(&oversized, peer).await.unwrap_err().kind(),
+        KcpErrorKind::InvalidConfig
+    );
+    listener.send_to(b"reply", peer).await.unwrap();
+    assert_eq!(timeout(Duration::from_secs(3), stream.recv()).await.unwrap().unwrap(), b"reply");
+    assert!(stream.send(&[]).await.is_ok());
+    assert!(stream.try_send(&vec![42; max]).is_ok());
+    assert!(listener.send_to(&vec![42; max], peer).await.is_ok());
+}
+
+#[tokio::test]
 async fn closed_stream_rejects_try_operations() {
     let mut listener = KcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut stream = KcpStream::connect(listener.local_addr()).await.unwrap();

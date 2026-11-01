@@ -35,7 +35,7 @@ use tokio::time::{interval, timeout};
 
 use crate::core::kcp::Kcp;
 use crate::error::IncompleteDataType;
-use crate::helper::{current_millis, generate_conv};
+use crate::helper::{IKCP_OVERHEAD, current_millis, generate_conv};
 use crate::{KcpConfig, KcpError, KcpResult};
 use std::io::{self};
 use std::net::SocketAddr;
@@ -44,6 +44,11 @@ use std::time::Duration;
 
 pub const CHANNEL_SIZE: usize = 64;
 pub const BUFFER_SIZE: usize = u16::MAX as usize;
+
+fn validate_send_size(len: usize) -> KcpResult<()> {
+    let config = KcpConfig::fast_mode();
+    Kcp::validate_send_size(len, config.mtu as usize - IKCP_OVERHEAD, config.stream_mode)
+}
 
 /// Stream配置
 #[derive(Debug, Clone)]
@@ -218,6 +223,7 @@ impl KcpStream {
         if !self.connected {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
+        validate_send_size(data.len())?;
 
         // 发送数据（放入队列）
         if let Err(e) = self.data_sender.send(data.into()).await {
@@ -254,6 +260,7 @@ impl KcpStream {
         if !self.connected {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
+        validate_send_size(data.len())?;
         self.data_sender
             .try_send(data.into())
             .map_err(|e| KcpError::IoError(format!("stream try send err:{}", e)))
@@ -538,6 +545,7 @@ impl KcpListener {
         }
         match self.clients.get(&addr) {
             Some(client) => {
+                validate_send_size(data.len())?;
                 client
                     .send_tx
                     .send(data.to_vec())
