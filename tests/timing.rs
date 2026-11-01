@@ -57,6 +57,261 @@ async fn lost_ack_recovers_before_application_reads() {
     assert!(receiver.kcp.borrow_mut().recv().is_err());
 }
 
+#[tokio::test]
+async fn check_deadline_executes_due_retransmission() {
+    let mut sink = Sink::new(KcpConfig::default());
+    sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 128)).unwrap();
+    sink.kcp.borrow_mut().send(b"data").unwrap();
+    for now in [0, 100, 200] {
+        sink.update(now).await.unwrap();
+    }
+    let next = sink.kcp.borrow().check(200);
+    assert_eq!(next, 225);
+    assert_eq!(sink.count_cmd(KcpCmd::Push), 1);
+    sink.update(next - 1).await.unwrap();
+    assert_eq!(sink.count_cmd(KcpCmd::Push), 1);
+    sink.update(next).await.unwrap();
+    assert_eq!(sink.count_cmd(KcpCmd::Push), 2);
+    assert_eq!(sink.kcp.borrow().snd_buf.front().unwrap().xmit, 2);
+    assert!(sink.kcp.borrow().check(next) > next);
+}
+
+#[tokio::test]
+async fn pending_ack_is_not_delayed_until_zero_window_probe() {
+    let mut sink = Sink::new(KcpConfig::stream_mode());
+    sink.update(20).await.unwrap();
+    sink.kcp.borrow_mut().input(&push_packet(1, 0, b"x")).unwrap();
+    let next = sink.kcp.borrow().check(20);
+    assert_eq!(next, 40);
+    sink.update(next).await.unwrap();
+    assert_eq!(sink.count_cmd(KcpCmd::Ack), 1);
+}
+
+#[tokio::test]
+async fn cancelled_output_retains_callback_and_pending_ack() {
+    use std::future::{Future, poll_fn};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::Poll;
+
+    let mut kcp = kcp_ovo::core::kcp::Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+    let ready = Arc::new(AtomicBool::new(false));
+    let emitted = Arc::new(Mutex::new(Vec::new()));
+    let gate = ready.clone();
+    let output = emitted.clone();
+    kcp.set_output(move |data| {
+        let gate = gate.clone();
+        let output = output.clone();
+        async move {
+            poll_fn(|_| if gate.load(Ordering::SeqCst) { Poll::Ready(()) } else { Poll::Pending })
+                .await;
+            output.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
+    });
+    kcp.input(&push_packet(1, 0, b"received")).unwrap();
+    kcp.send(b"sent").unwrap();
+    let mut update = Box::pin(kcp.update(0));
+    poll_fn(|cx| {
+        assert!(update.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(update);
+    ready.store(true, Ordering::SeqCst);
+    kcp.update(20).await.unwrap();
+    let packets = emitted.lock().unwrap();
+    assert!(packets.iter().any(|p| common::parse_cmd(p) == Some(KcpCmd::Ack)));
+    assert!(packets.iter().any(|p| common::parse_cmd(p) == Some(KcpCmd::Push)));
+}
+
+#[tokio::test]
+async fn cancelled_batch_keeps_successful_segment_state() {
+    use std::future::{Future, poll_fn};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::Poll;
+
+    let mut kcp = kcp_ovo::core::kcp::Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ready = Arc::new(AtomicBool::new(false));
+    let count = calls.clone();
+    let gate = ready.clone();
+    kcp.set_output(move |data| {
+        let call = count.fetch_add(1, Ordering::SeqCst);
+        let gate = gate.clone();
+        async move {
+            poll_fn(|_| {
+                if call != 1 || gate.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            Ok(data.len())
+        }
+    });
+    kcp.input(&common::stress::control_packet(1, KcpCmd::Wins, 128)).unwrap();
+    kcp.send(b"a").unwrap();
+    kcp.send(b"b").unwrap();
+    let mut update = Box::pin(kcp.update(0));
+    poll_fn(|cx| {
+        assert!(update.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(update);
+    assert_eq!(kcp.snd_buf.front().unwrap().xmit, 1);
+    assert_eq!(kcp.snd_buf.back().unwrap().xmit, 0);
+    ready.store(true, Ordering::SeqCst);
+    let next = kcp.check(0);
+    assert_eq!(next, 0);
+    kcp.update(next).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(kcp.snd_buf.back().unwrap().xmit, 1);
+}
+
+#[tokio::test]
+async fn failed_probe_is_retried_on_next_check() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut kcp = kcp_ovo::core::kcp::Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    kcp.set_output(move |data| {
+        let call = count.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if call == 0 {
+                Err(kcp_ovo::KcpError::IoError("output failed".into()))
+            } else {
+                Ok(data.len())
+            }
+        }
+    });
+    assert!(kcp.update(0).await.is_err());
+    let next = kcp.check(0);
+    assert_eq!(next, 0);
+    kcp.update(next).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(kcp.check(next) > next);
+}
+
+#[tokio::test]
+async fn distinct_reordered_acks_trigger_fast_retransmit_before_rto() {
+    for start_sn in [0u32, u32::MAX - 1] {
+        for fastresend in [0, 1, 2] {
+            let mut config = KcpConfig::fast_mode();
+            config.fastresend = fastresend;
+            let mut sender = Sink::new(config.clone());
+            let mut receiver = Sink::new(config);
+            sender.kcp.borrow_mut().snd_nxt = start_sn;
+            sender.kcp.borrow_mut().snd_una = start_sn;
+            receiver.kcp.borrow_mut().rcv_nxt = start_sn;
+            sender
+                .kcp
+                .borrow_mut()
+                .input(&common::stress::control_packet(1, KcpCmd::Wins, 128))
+                .unwrap();
+            for _ in 0..4 {
+                sender.kcp.borrow_mut().send(b"x").unwrap();
+            }
+            sender.update(0).await.unwrap();
+            let sent = sender.emitted();
+            assert_eq!(sent.len(), 4);
+            sender.clear();
+            for packet in sent.iter().skip(1) {
+                receiver.kcp.borrow_mut().input(packet).unwrap();
+            }
+            receiver.update(20).await.unwrap();
+            let acks = receiver.emitted();
+            assert_eq!(acks.len(), 3);
+            for _ in 0..3 {
+                sender.kcp.borrow_mut().input(&acks[0]).unwrap();
+            }
+            sender.update(40).await.unwrap();
+            if fastresend == 1 {
+                let retransmitted = sender.emitted();
+                assert_eq!(retransmitted.len(), 1);
+                assert_eq!(
+                    u32::from_be_bytes(retransmitted[0][16..20].try_into().unwrap()),
+                    start_sn
+                );
+                continue;
+            }
+            assert_eq!(sender.count_cmd(KcpCmd::Push), 0, "duplicate ACK triggered retransmit");
+            for ack in acks.iter().skip(1) {
+                sender.kcp.borrow_mut().input(ack).unwrap();
+            }
+            sender.update(60).await.unwrap();
+            let retransmitted = sender.emitted();
+            if fastresend == 0 {
+                assert!(retransmitted.is_empty());
+            } else {
+                assert_eq!(retransmitted.len(), 1);
+                assert_eq!(
+                    u32::from_be_bytes(retransmitted[0][16..20].try_into().unwrap()),
+                    start_sn
+                );
+                assert_eq!(sender.kcp.borrow().waitsnd(), 4);
+                sender.clear();
+                sender.update(80).await.unwrap();
+                assert_eq!(
+                    sender.count_cmd(KcpCmd::Push),
+                    0,
+                    "fast retransmit repeated without new ACK"
+                );
+                receiver.kcp.borrow_mut().input(&retransmitted[0]).unwrap();
+                receiver.clear();
+                receiver.update(100).await.unwrap();
+                for ack in receiver.emitted() {
+                    sender.kcp.borrow_mut().input(&ack).unwrap();
+                }
+                assert_eq!(sender.kcp.borrow().waitsnd(), 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn bounded_rtt_jitter_and_spike_decay() {
+    let mut sink = Sink::new(KcpConfig::fast_mode());
+    sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 128)).unwrap();
+    let mut baseline = 0;
+    let mut spike = 0;
+    for n in 0..2101u32 {
+        let start = u64::from(n) * 1000;
+        sink.kcp.borrow_mut().send(b"x").unwrap();
+        sink.update(start).await.unwrap();
+        let sample = if n == 2000 { 200 } else { 100 + u64::from(n % 2) * 10 };
+        let mut kcp = sink.kcp.borrow_mut();
+        kcp.current = start + sample;
+        let ack = common::stress::raw_packet(
+            RawHeader {
+                conv: 1,
+                cmd: KcpCmd::Ack as u8,
+                wnd: 128,
+                sn: n,
+                una: n + 1,
+                ..RawHeader::default()
+            },
+            &[],
+        );
+        kcp.input(&ack).unwrap();
+        if n == 1999 {
+            baseline = kcp.rx_rto;
+        }
+        if n == 2000 {
+            spike = kcp.rx_rto;
+        }
+    }
+    let recovered = sink.kcp.borrow().rx_rto;
+    assert!(baseline < 500, "bounded jitter inflated RTO to {baseline}");
+    assert!(spike > baseline, "spike did not raise RTO");
+    assert!(recovered < spike && recovered < 500, "RTO did not recover: {recovered}");
+}
+
 /// ACK 丢失后，发送方重传同一段，接收方必须补回 ACK
 ///
 /// 这是最容易被忽略的一条：接收方已经在 rcv_queue 里有了该段，
