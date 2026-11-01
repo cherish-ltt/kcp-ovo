@@ -11,6 +11,82 @@ use kcp_ovo::KcpConfig;
 use kcp_ovo::helper::KcpCmd;
 
 #[tokio::test]
+async fn distinct_reordered_acks_trigger_fast_retransmit_before_rto() {
+    for start_sn in [0u32, u32::MAX - 1] {
+        for fastresend in [0, 1, 2] {
+            let mut config = KcpConfig::fast_mode();
+            config.fastresend = fastresend;
+            let mut sender = Sink::new(config.clone());
+            let mut receiver = Sink::new(config);
+            sender.kcp.borrow_mut().snd_nxt = start_sn;
+            sender.kcp.borrow_mut().snd_una = start_sn;
+            receiver.kcp.borrow_mut().rcv_nxt = start_sn;
+            sender
+                .kcp
+                .borrow_mut()
+                .input(&common::stress::control_packet(1, KcpCmd::Wins, 128))
+                .unwrap();
+            for _ in 0..4 {
+                sender.kcp.borrow_mut().send(b"x").unwrap();
+            }
+            sender.update(0).await.unwrap();
+            let sent = sender.emitted();
+            assert_eq!(sent.len(), 4);
+            sender.clear();
+            for packet in sent.iter().skip(1) {
+                receiver.kcp.borrow_mut().input(packet).unwrap();
+            }
+            receiver.update(20).await.unwrap();
+            let acks = receiver.emitted();
+            assert_eq!(acks.len(), 3);
+            for _ in 0..3 {
+                sender.kcp.borrow_mut().input(&acks[0]).unwrap();
+            }
+            sender.update(40).await.unwrap();
+            if fastresend == 1 {
+                let retransmitted = sender.emitted();
+                assert_eq!(retransmitted.len(), 1);
+                assert_eq!(
+                    u32::from_be_bytes(retransmitted[0][16..20].try_into().unwrap()),
+                    start_sn
+                );
+                continue;
+            }
+            assert_eq!(sender.count_cmd(KcpCmd::Push), 0, "duplicate ACK triggered retransmit");
+            for ack in acks.iter().skip(1) {
+                sender.kcp.borrow_mut().input(ack).unwrap();
+            }
+            sender.update(60).await.unwrap();
+            let retransmitted = sender.emitted();
+            if fastresend == 0 {
+                assert!(retransmitted.is_empty());
+            } else {
+                assert_eq!(retransmitted.len(), 1);
+                assert_eq!(
+                    u32::from_be_bytes(retransmitted[0][16..20].try_into().unwrap()),
+                    start_sn
+                );
+                assert_eq!(sender.kcp.borrow().waitsnd(), 4);
+                sender.clear();
+                sender.update(80).await.unwrap();
+                assert_eq!(
+                    sender.count_cmd(KcpCmd::Push),
+                    0,
+                    "fast retransmit repeated without new ACK"
+                );
+                receiver.kcp.borrow_mut().input(&retransmitted[0]).unwrap();
+                receiver.clear();
+                receiver.update(100).await.unwrap();
+                for ack in receiver.emitted() {
+                    sender.kcp.borrow_mut().input(&ack).unwrap();
+                }
+                assert_eq!(sender.kcp.borrow().waitsnd(), 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn bounded_rtt_jitter_and_spike_decay() {
     let mut sink = Sink::new(KcpConfig::fast_mode());
     sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 128)).unwrap();

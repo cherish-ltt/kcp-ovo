@@ -365,7 +365,7 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-4 | `parse_una` 无条件回写 `snd_una` | 确认推进 | 乱序/过期 una 把它拉回去，与 `snd_buf` 脱节 | `kcp.rs::parse_una` |
 | BUG-5 | 超时重传与快速重传是两个独立 `if` | 重传 | 同一段被重发两次，重复占用带宽 | `kcp.rs::flush` |
 | BUG-6 | `rmt_wnd` 初值非 0 | 发送准入 | 首包前就按「对端窗口已满」停发 | `kcp.rs` 构造函数 |
-| BUG-7 | `parse_fastack` 晚于 `parse_una` | 快速重传 | `una > seg.sn` 永假，快速重传完全失效 | `kcp.rs::input` |
+| BUG-7 | `parse_fastack` 晚于 `parse_una` | 快速重传 | 快速重传完全失效 | `kcp.rs::input`（现按去重后的 ACK 序列号计数） |
 | BUG-8 | ACK 处理用弹出-重压模式 | 性能 | 每次 ACK 触发一次分配，长连接下抖动明显 | `kcp.rs::parse_ack` |
 | BUG-9 | 重复 Push 段不回 ACK | 协议不变式 | **ACK 丢失后收发双方永久不对账，传输卡死** | `kcp.rs::input` 的 `Push` 分支 |
 | BUG-10 | ACK 判重上界用 `snd_una` | 协议不变式 | **首段（sn=0）永远无法被确认** | `kcp.rs::input` 的 `Ack` 分支 |
@@ -388,6 +388,7 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-27 | 构造期不校验 `mtu` 与收发窗口 | 配置校验 | `mtu < 28` 下溢 panic、`mtu == 28` 时 `mss = 0` 触发除零 panic、窗口为 0 的连接永久不可用 | `kcp.rs` 构造函数 |
 | BUG-28 | `check()` 在零窗口时无条件返回 `ts_probe` | 时序 | 零窗口时 `snd_buf` 仍有在途段等待重传，其期限远早于 5000ms 的探测时刻；调用方按返回值调度会睡过重传期限，连接被拖到探测退避的粒度 | `kcp.rs::check` 的零窗口分支 |
 | BUG-41 | RTT 方差只累加不衰减 | 重传时序 | 有界抖动下 RTO 持续增长 | `kcp.rs::parse_ack` |
+| BUG-42 | 快速重传按累计 una 而非较高 ACK 计数 | 重传时序 | 乱序 ACK 无法提前恢复丢失的段 | `kcp.rs::input`、`parse_fastack` |
 | BUG-29 | 空闲刷新驱动拥塞窗口增长 | 拥塞控制 | 无确认时窗口持续增长，最终整数溢出 | `kcp.rs::input` 的确认推进分支 |
 
 其中 BUG-9、BUG-10、BUG-18、BUG-19、BUG-24、BUG-25、BUG-27 属于「线上会永久卡死、
@@ -442,6 +443,7 @@ panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-2
 | BUG-17 | `queues_stay_bounded_over_time` | `tests/soak.rs:181` |
 | BUG-17 | `hostile_network_still_converges` | `tests/soak.rs:126` |
 | BUG-41 | `bounded_rtt_jitter_and_spike_decay` | `tests/timing.rs` |
+| BUG-42 | `distinct_reordered_acks_trigger_fast_retransmit_before_rto` | `tests/timing.rs` |
 | BUG-12/13/14 | `loss_halves_ssthresh_and_resets_cwnd` | `tests/congestion.rs:121` |
 | BUG-12/13/14 | `modes_have_comparable_throughput` | `tests/congestion.rs:178` |
 | BUG-8 | `bulk_transfer_one_megabyte` | `tests/soak.rs:18` |
