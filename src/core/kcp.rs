@@ -492,15 +492,8 @@ impl Kcp {
                 {
                     return Ok(());
                 }
-                // 落在接收窗口内但在 rcv_nxt 之前的段不能直接丢弃：它要么是重复段，
-                // 要么对应一个丢失的 ACK。两种情况下发送方都还挂着重传，
-                // 若这里静默吞掉，ACK 丢失就会演变成永久死锁。
-                // 已入 rcv_queue 的段仍按重复处理不再回 ACK。
+                self.acklist.push(header.sn);
                 if self.timediff_u32(header.sn, self.rcv_nxt) < 0 {
-                    if self.rcv_queue.iter().any(|s| s.kcp_packet.header.sn == header.sn) {
-                        return Ok(());
-                    }
-                    self.acklist.push(header.sn);
                     return Ok(());
                 }
                 for seg in self.rcv_buf.iter() {
@@ -508,8 +501,6 @@ impl Kcp {
                         return Ok(());
                     }
                 }
-                // 重传段一律重新排队 ACK，保证 ACK 丢失后能被下一次重传修复。
-                self.acklist.push(header.sn);
                 let newseg = Segment::new_with_header_and_data(header, &buf)?;
                 self.parse_data(newseg);
                 self.move_rcv_buf_to_queue();
