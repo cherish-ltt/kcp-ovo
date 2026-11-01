@@ -11,6 +11,53 @@ use kcp_ovo::KcpConfig;
 use kcp_ovo::helper::KcpCmd;
 
 #[tokio::test]
+async fn unread_and_out_of_order_duplicates_are_acknowledged() {
+    let mut sink = Sink::new(KcpConfig::fast_mode());
+    let first = push_packet(1, 0, b"a");
+    let later = push_packet(1, 2, b"c");
+    sink.kcp.borrow_mut().input(&first).unwrap();
+    sink.kcp.borrow_mut().input(&later).unwrap();
+    sink.update(0).await.unwrap();
+    assert_eq!(sink.count_cmd(KcpCmd::Ack), 2);
+    sink.clear();
+    for _ in 0..3 {
+        sink.kcp.borrow_mut().input(&first).unwrap();
+        sink.kcp.borrow_mut().input(&later).unwrap();
+    }
+    sink.update(20).await.unwrap();
+    assert_eq!(sink.count_cmd(KcpCmd::Ack), 6);
+    assert_eq!(sink.kcp.borrow().nrcv_que, 1);
+    assert_eq!(sink.kcp.borrow().nrcv_buf, 1);
+    assert_eq!(&sink.kcp.borrow_mut().recv().unwrap()[..], b"a");
+    sink.kcp.borrow_mut().input(&push_packet(1, 1, b"b")).unwrap();
+    assert_eq!(&sink.kcp.borrow_mut().recv().unwrap()[..], b"b");
+    assert_eq!(&sink.kcp.borrow_mut().recv().unwrap()[..], b"c");
+    assert!(sink.kcp.borrow_mut().recv().is_err());
+}
+
+#[tokio::test]
+async fn lost_ack_recovers_before_application_reads() {
+    let mut sender = Sink::new(KcpConfig::fast_mode());
+    let mut receiver = Sink::new(KcpConfig::fast_mode());
+    sender.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 128)).unwrap();
+    sender.kcp.borrow_mut().send(b"a").unwrap();
+    sender.update(0).await.unwrap();
+    receiver.kcp.borrow_mut().input(&sender.emitted()[0]).unwrap();
+    receiver.update(0).await.unwrap();
+    receiver.clear();
+    sender.clear();
+    sender.update(200).await.unwrap();
+    assert_eq!(sender.count_cmd(KcpCmd::Push), 1);
+    receiver.kcp.borrow_mut().input(&sender.emitted()[0]).unwrap();
+    receiver.update(200).await.unwrap();
+    assert_eq!(receiver.count_cmd(KcpCmd::Ack), 1);
+    sender.kcp.borrow_mut().input(&receiver.emitted()[0]).unwrap();
+    assert_eq!(sender.kcp.borrow().waitsnd(), 0);
+    assert_eq!(&receiver.kcp.borrow_mut().recv().unwrap()[..], b"a");
+    assert!(receiver.kcp.borrow_mut().recv().is_err());
+}
+
+#[tokio::test]
 async fn check_deadline_executes_due_retransmission() {
     let mut sink = Sink::new(KcpConfig::default());
     sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 128)).unwrap();
