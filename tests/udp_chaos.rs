@@ -21,6 +21,7 @@ fn stream_cfg() -> StreamConfig {
     StreamConfig {
         update_interval: Duration::from_millis(5),
         connect_timeout: Duration::from_secs(3),
+        ..Default::default()
     }
 }
 
