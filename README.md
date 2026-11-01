@@ -57,6 +57,8 @@
 
 ## 🚀 快速开始
 
+`close()` 与释放 Stream/Listener 都会终止所属后台任务；关闭立即拒绝收发，丢弃待发送及未读取数据，不等待对端确认。需要可靠完成时，应先等待应用层完成回复。
+
 ### 安装
 
 在`Cargo.toml`中添加：
@@ -379,7 +381,7 @@ cargo test test_stream_mode
 | `lossy.rs` | 丢包、乱序、重复下的可靠性 |
 | `window.rs` | 收发窗口、零窗口、窗口通告、探测起步与退避上限、探测不挤占 ACK、长期零窗口后恢复 |
 | `lifecycle.rs` | 创建、更新、关闭、死链 |
-| `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付与接收背压 |
+| `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付、接收背压与关闭资源回收 |
 | `api_contract.rs` | 公开 API 契约与错误类型 |
 | `retransmit.rs` | 重传与死链判定 |
 | `fuzz_transfer.rs` | 随机链路下 9 条协议不变式（字节精确、消息边界、窗口上限、断链恢复） |

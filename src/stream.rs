@@ -251,6 +251,9 @@ impl KcpStream {
 
     /// 尝试发送数据（非阻塞）
     pub fn try_send(&mut self, data: &[u8]) -> KcpResult<()> {
+        if !self.connected {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
+        }
         self.data_sender
             .try_send(data.into())
             .map_err(|e| KcpError::IoError(format!("stream try send err:{}", e)))
@@ -258,6 +261,9 @@ impl KcpStream {
 
     /// 尝试接收数据（非阻塞）
     pub fn try_recv(&mut self) -> KcpResult<Vec<u8>> {
+        if !self.connected {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
+        }
         self.data_receiver
             .try_recv()
             .map_err(|e| KcpError::IoError(format!("stream try recv err:{}", e)))
@@ -273,10 +279,18 @@ impl KcpStream {
         self.remote
     }
 
-    /// 关闭连接
+    /// 关闭连接，丢弃待发送及未读取数据；不会等待对端确认。
     pub fn close(&mut self) -> KcpResult<()> {
         self.connected = false;
+        self.main_handle.abort();
+        self.data_receiver.close();
         Ok(())
+    }
+}
+
+impl Drop for KcpStream {
+    fn drop(&mut self) {
+        self.main_handle.abort();
     }
 }
 
@@ -290,6 +304,21 @@ pub struct Clinet {
     data_tx: Sender<Vec<u8>>,
     /// send-msg
     send_tx: Sender<Vec<u8>>,
+}
+
+impl Drop for Clinet {
+    fn drop(&mut self) {
+        self.main_handle.abort();
+    }
+}
+
+// 主任务取消后仍要清理取消前最后一次插入的会话。
+struct ClientCleanup(Arc<DashMap<SocketAddr, Clinet>>);
+
+impl Drop for ClientCleanup {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// KCP服务端监听器
@@ -307,6 +336,7 @@ pub struct KcpListener {
     recv_rx: Receiver<(Vec<u8>, SocketAddr)>,
     /// 实际绑定的本地地址（绑定 0 端口时用于获取系统分配的端口）
     local_addr: SocketAddr,
+    closed: bool,
 }
 
 impl KcpListener {
@@ -348,12 +378,14 @@ impl KcpListener {
 
         let clients: Arc<DashMap<SocketAddr, Clinet>> = Arc::new(DashMap::new());
         let clients_clone = clients.clone();
+        let cleanup = ClientCleanup(clients.clone());
         // 设置output回调
         let socket = Arc::new(socket);
         let (udp_tx, mut udp_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_SIZE);
         let (recv_tx, recv_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_SIZE);
         let timeout_druation = Duration::from_millis(100);
         let main_handle: JoinHandle<()> = tokio::spawn(async move {
+            let _cleanup = cleanup;
             let mut buf = vec![0; BUFFER_SIZE];
             let clients_clone = clients_clone.clone();
             let udp_tx_clone = udp_tx.clone();
@@ -436,7 +468,7 @@ impl KcpListener {
                                                                     Err(e) => error!("listener kcp input data err:{}", e),
                                                                 }
                                                             }
-                                                            None => warn!("listener data_rx.recv none"),
+                                                            None => break,
                                                         }
                                                     }
                                                     result = send_rx.recv() => {
@@ -447,7 +479,7 @@ impl KcpListener {
                                                                     Err(e) => error!("listener send data err:{}", e),
                                                                 }
                                                             }
-                                                            None => warn!("listener data_rx.recv none"),
+                                                            None => break,
                                                         }
                                                     }
                                                 }
@@ -482,7 +514,7 @@ impl KcpListener {
             }
         });
 
-        Ok(Self { clients, main_handle, recv_rx, config, local_addr })
+        Ok(Self { clients, main_handle, recv_rx, config, local_addr, closed: false })
     }
 
     /// 获取监听器实际绑定的本地地址
@@ -490,13 +522,20 @@ impl KcpListener {
         self.local_addr
     }
 
-    /// 关闭监听器
+    /// 关闭监听器和所有会话，丢弃待发送及未读取数据；不会等待对端确认。
     pub fn close(&mut self) -> KcpResult<()> {
+        self.closed = true;
+        self.main_handle.abort();
+        self.clients.clear();
+        self.recv_rx.close();
         Ok(())
     }
 
     /// send
     pub async fn send_to(&mut self, data: &[u8], addr: SocketAddr) -> KcpResult<()> {
+        if self.closed {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "Listener closed").into());
+        }
         match self.clients.get(&addr) {
             Some(client) => {
                 client
@@ -512,10 +551,20 @@ impl KcpListener {
 
     /// recv
     pub async fn recv(&mut self) -> KcpResult<(Vec<u8>, SocketAddr)> {
+        if self.closed {
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "Listener closed").into());
+        }
         match self.recv_rx.recv().await {
             Some(result) => Ok(result),
             None => Err(KcpError::IoError("listener send_to err: None".to_string())),
         }
+    }
+}
+
+impl Drop for KcpListener {
+    fn drop(&mut self) {
+        self.main_handle.abort();
+        self.clients.clear();
     }
 }
 
@@ -530,6 +579,7 @@ mod test {
         let data1 = [0_u8, 1, 2, 3, 4, 5];
         let data2 = [5_u8, 6, 7, 8, 9, 10];
 
+        let (done, completed) = tokio::sync::oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
             let mut listener = KcpListener::bind("0.0.0.0:19999").await.unwrap();
             if let Ok(result) = listener.recv().await {
@@ -542,6 +592,7 @@ mod test {
                 let data2 = [10, 9, 8, 7, 6, 5_u8];
                 let _ = listener.send_to(&data2, result.1).await;
             }
+            timeout(Duration::from_secs(5), completed).await.unwrap().unwrap();
         });
 
         sleep(Duration::from_secs(1)).await;
@@ -552,6 +603,7 @@ mod test {
         assert_eq!(result, vec![5, 4, 3, 2, 1, 0]);
         let result = stream.recv().await.unwrap();
         assert_eq!(result, vec![10, 9, 8, 7, 6, 5]);
+        done.send(()).unwrap();
         let _ = handle.await;
     }
 }
