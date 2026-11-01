@@ -14,6 +14,37 @@ use common::{Net, Rng, Sim};
 use kcp_ovo::KcpConfig;
 use kcp_ovo::core::kcp::Kcp;
 
+#[tokio::test]
+async fn idle_updates_do_not_grow_congestion_window() {
+    for cfg in [KcpConfig::normal_mode(), KcpConfig::fast_mode(), KcpConfig::stream_mode()] {
+        let mut kcp = Kcp::new(1, cfg).unwrap();
+        kcp.set_output(|data| async move { Ok(data.len()) });
+        let start = kcp.cwnd;
+        for tick in 0..2_000_000u64 {
+            kcp.update(tick * 100).await.unwrap();
+        }
+        assert_eq!(kcp.cwnd, start);
+    }
+}
+
+#[tokio::test]
+async fn congestion_window_grows_only_on_new_confirmation_and_stays_bounded() {
+    let mut sim = Sim::new(KcpConfig::normal_mode(), Net::default(), 0xE0E0_0007);
+    let start = sim.a.borrow().cwnd;
+    let samples = cwnd_after_each_round(&mut sim, 1).await;
+    assert!(samples[0] > start);
+    sim.run(1_000).await.unwrap();
+    assert_eq!(sim.a.borrow().cwnd, samples[0]);
+
+    sim.a.borrow_mut().cwnd = u16::MAX;
+    let mss = sim.a.borrow().mss;
+    sim.a.borrow_mut().incr = mss - 1;
+    let una = sim.a.borrow().snd_una;
+    cwnd_after_each_round(&mut sim, 1).await;
+    assert_ne!(sim.a.borrow().snd_una, una);
+    assert_eq!(sim.a.borrow().cwnd, u16::MAX);
+}
+
 /// 干净链路下连续发 `segments` 段，返回每轮结束后的 `cwnd` 序列
 async fn cwnd_after_each_round(sim: &mut Sim, segments: usize) -> Vec<u16> {
     let mss = sim.a.borrow().mss as usize;
