@@ -341,20 +341,12 @@ impl Kcp {
     /// 返回发送的字节数，失败返回错误
     pub fn send(&mut self, data: &[u8]) -> KcpResult<usize> {
         let len = data.len();
+        Self::validate_send_size(len, self.mss as usize, self.stream_mode)?;
         if len == 0 {
             return Ok(0);
         }
         let count = len.div_ceil(self.mss as usize);
         let is_stream = self.stream_mode;
-
-        // 非流模式有 255 分片上限，流模式无此限制
-        if !is_stream && count > u8::MAX as usize {
-            return Err(KcpError::InvalidConfig(format!(
-                "Too many fragments, data-size={}byte, allow-max-size={}byte",
-                len,
-                (u8::MAX as usize) * (self.mss as usize)
-            )));
-        }
 
         let mut sent = 0;
         let mut buf = data;
@@ -381,6 +373,17 @@ impl Kcp {
             sent += size;
         }
         Ok(sent)
+    }
+
+    pub(crate) fn validate_send_size(len: usize, mss: usize, stream_mode: bool) -> KcpResult<()> {
+        if !stream_mode && len.div_ceil(mss) > u8::MAX as usize {
+            return Err(KcpError::InvalidConfig(format!(
+                "Too many fragments, data-size={}byte, allow-max-size={}byte",
+                len,
+                u8::MAX as usize * mss
+            )));
+        }
+        Ok(())
     }
 
     /// 查看下一个可读数据的大小（不消耗数据）
