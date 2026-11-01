@@ -388,6 +388,7 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-27 | 构造期不校验 `mtu` 与收发窗口 | 配置校验 | `mtu < 28` 下溢 panic、`mtu == 28` 时 `mss = 0` 触发除零 panic、窗口为 0 的连接永久不可用 | `kcp.rs` 构造函数 |
 | BUG-28 | `check()` 在零窗口时无条件返回 `ts_probe` | 时序 | 零窗口时 `snd_buf` 仍有在途段等待重传，其期限远早于 5000ms 的探测时刻；调用方按返回值调度会睡过重传期限，连接被拖到探测退避的粒度 | `kcp.rs::check` 的零窗口分支 |
 | BUG-30 | `check()` 返回的重传期限早于定期刷新 | 时序 | 到期调用 `update()` 不重传，事件循环在同一时刻自旋 | `kcp.rs::update` 与 `check` |
+| BUG-32 | 取消发送时移走回调并提前清空确认 | 取消安全 | 后续更新丢失输出回调和待发确认，部分发送状态不一致 | `kcp.rs::send_packet` 与 `flush` |
 
 其中 BUG-9、BUG-10、BUG-18、BUG-19、BUG-24、BUG-25、BUG-27 属于「线上会永久卡死、
 panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-26 属于「不丢数据但
@@ -478,6 +479,7 @@ panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-2
 | BUG-23 | `probe_backoff_starts_at_probe_init` | `tests/window.rs` |
 | BUG-28 | `check_prefers_retransmit_deadline_over_probe` | `tests/timing.rs` |
 | BUG-30 | `check_deadline_executes_due_retransmission`、`pending_ack_is_not_delayed_until_zero_window_probe` | `tests/timing.rs` |
+| BUG-32 | `cancelled_output_retains_callback_and_pending_ack`、`cancelled_batch_keeps_successful_segment_state` | `tests/timing.rs` |
 
 #### 三、维护规则
 

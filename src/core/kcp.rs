@@ -692,18 +692,15 @@ impl Kcp {
         }
 
         // 对端窗口未知时按退避间隔重发窗口探测；已知时清空退避。
-        // probe_due 只看本轮是否到期，与 ts_probe 的取值解耦：
         // 首次探测需要立即发出，但 ts_probe 必须同时按退避量推后，
         // 否则它在后续每轮 flush 都会再次到期，退避形同虚设。
         // 首次等待必须从 IKCP_PROBE_INIT 起步。若取 interval（fast 模式 20ms），
         // 退避序列会退化成几十毫秒级，长时间零窗口的连接会被 WASK 高频轰炸。
-        let mut probe_due = false;
         if self.rmt_wnd == 0 {
             if self.probe_wait == 0 {
                 self.probe_wait = IKCP_PROBE_INIT;
                 self.ts_probe = self.current + self.probe_wait;
                 self.probe |= IKCP_ASK_SEND;
-                probe_due = true;
             } else if self.timediff_u64(self.current, self.ts_probe) >= 0 {
                 // 不小于 IKCP_PROBE_INIT 后按 1.5 倍增长
                 if self.probe_wait < IKCP_PROBE_INIT {
@@ -712,7 +709,6 @@ impl Kcp {
                 self.probe_wait = (self.probe_wait + self.probe_wait / 2).min(IKCP_PROBE_LIMIT);
                 self.ts_probe = self.current + self.probe_wait;
                 self.probe |= IKCP_ASK_SEND;
-                probe_due = true;
             }
         } else {
             // 对端窗口已知后必须清空探测退避，否则重新进入 rmt_wnd==0 时
@@ -725,17 +721,16 @@ impl Kcp {
         // 探测不能因为本轮恰好有 ACK 要发就让路：一旦让路，ASK_SEND 会挂在
         // probe 里，check() 于是持续返回 current，调用方按此立即 update 又被
         // ts_flush 节流，形成零窗口期间的全速空转。
-        let acks_to_send = self.acklist.clone();
-        let need_wask = probe_due && (self.probe & IKCP_ASK_SEND) != 0;
+        let need_wask = (self.probe & IKCP_ASK_SEND) != 0;
         let need_wins = (self.probe & IKCP_ASK_TELL) != 0;
-        self.acklist.clear();
 
         if need_wask {
             self.send_control(KcpCmd::Wask, 0).await?;
             self.probe &= !IKCP_ASK_SEND;
         }
-        for sn in acks_to_send {
+        while let Some(&sn) = self.acklist.last() {
             self.send_control(KcpCmd::Ack, sn).await?;
+            self.acklist.pop();
         }
         if need_wins {
             self.send_control(KcpCmd::Wins, 0).await?;
@@ -818,7 +813,9 @@ impl Kcp {
             }
         }
 
-        for (frg, sn, ts, una, wnd, data) in sends {
+        for ((frg, sn, ts, una, wnd, data), (idx, xmit, resendts, rto, is_lost)) in
+            sends.into_iter().zip(need_update)
+        {
             self.send_packet(KcpPacket::new_with_data(
                 KcpPacketHeader::new(
                     self.conv,
@@ -833,25 +830,21 @@ impl Kcp {
                 data,
             ))
             .await?;
-        }
-
-        for (idx, xmit, resendts, rto, is_lost) in need_update {
             if let Some(seg) = self.snd_buf.get_mut(idx) {
                 seg.xmit = xmit;
                 seg.resendts = resendts;
                 seg.rto = rto;
-                if is_lost {
+                if is_lost && !lost {
                     lost = true;
+                    self.ssthresh = (self.cwnd as u32 / 2).max(IKCP_THRESH_MIN);
+                    self.cwnd = 1;
+                    self.incr = 0;
                 }
             }
         }
 
-        // 拥塞控制：丢包则收缩窗口，否则按慢启动/拥塞避免递增
-        if lost {
-            self.ssthresh = (self.cwnd as u32 / 2).max(IKCP_THRESH_MIN);
-            self.cwnd = 1;
-            self.incr = 0;
-        } else if self.timediff_u64(current, self.ts_lastack) >= 0 {
+        // 拥塞控制：未丢包时按慢启动/拥塞避免递增
+        if !lost && self.timediff_u64(current, self.ts_lastack) >= 0 {
             if (self.cwnd as u32) < self.ssthresh {
                 self.incr += self.mss;
             } else if self.mss > 0 {
@@ -868,10 +861,8 @@ impl Kcp {
     /// 统一的发送接口（处理 output 回调的借用问题）
     async fn send_packet(&mut self, pkt: KcpPacket) -> KcpResult<()> {
         let data = pkt.to_bytes()?;
-        let output = self.output.take().ok_or(KcpError::OutputNotSet)?;
-        let result = output(data).await;
-        self.output = Some(output);
-        result?;
+        let output = self.output.as_ref().ok_or(KcpError::OutputNotSet)?;
+        output(data).await?;
         self.xmit = self.xmit.wrapping_add(1);
         Ok(())
     }
@@ -887,8 +878,8 @@ impl Kcp {
         let retransmit_due = self
             .snd_buf
             .iter()
-            .any(|seg| seg.xmit > 0 && self.timediff_u64(self.current, seg.resendts) >= 0);
-        if flush_due || retransmit_due {
+            .any(|seg| seg.xmit == 0 || self.timediff_u64(self.current, seg.resendts) >= 0);
+        if flush_due || retransmit_due || self.probe & IKCP_ASK_SEND != 0 {
             if flush_due {
                 self.ts_flush = self.current.wrapping_add(self.interval);
             }
