@@ -11,6 +11,31 @@ use kcp_ovo::KcpConfig;
 use kcp_ovo::error::KcpErrorKind;
 use kcp_ovo::helper::KcpCmd;
 
+#[tokio::test]
+async fn mismatched_payload_lengths_leave_connection_unchanged() {
+    for cfg in [KcpConfig::fast_mode(), KcpConfig::stream_mode()] {
+        for declared in [0u32, 1, 3] {
+            let mut sink = Sink::new(cfg.clone());
+            let mut packet = push_packet(1, 0, b"AB");
+            packet[24..28].copy_from_slice(&declared.to_be_bytes());
+            assert!(sink.kcp.borrow_mut().input(&packet).is_err());
+            assert_eq!(sink.kcp.borrow().rcv_nxt, 0);
+            assert!(!sink.kcp.borrow().peer_seen);
+            sink.update(0).await.unwrap();
+            assert_eq!(sink.count_cmd(KcpCmd::Ack), 0);
+            sink.kcp.borrow_mut().input(&push_packet(1, 0, b"ok")).unwrap();
+            assert_eq!(&sink.kcp.borrow_mut().recv().unwrap()[..], b"ok");
+        }
+        let mut sink = Sink::new(cfg);
+        let mut combined = push_packet(1, 0, b"a");
+        combined.extend_from_slice(&push_packet(1, 1, b"b"));
+        assert!(sink.kcp.borrow_mut().input(&combined).is_err());
+        assert_eq!(sink.kcp.borrow().rcv_nxt, 0);
+        sink.update(0).await.unwrap();
+        assert_eq!(sink.count_cmd(KcpCmd::Ack), 0);
+    }
+}
+
 /// 任意长度的随机字节都不得让 input 崩溃
 #[tokio::test]
 async fn random_bytes_never_panic() {

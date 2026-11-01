@@ -455,7 +455,7 @@ impl Kcp {
     /// 输入处理：解析并处理从底层网络收到的数据包
     ///
     /// 根据命令类型（Push / Ack / Wask / Wins）分别处理，
-    /// 将有序数据段移入 rcv_queue 供 recv 读取。
+    /// 将有序数据段移入 rcv_queue 供 recv 读取。每次输入必须恰好包含一个数据包。
     pub fn input(&mut self, data: &[u8]) -> KcpResult<()> {
         if data.len() < IKCP_OVERHEAD {
             return Err(KcpError::IncompleteData(IncompleteDataType::Header));
@@ -463,6 +463,12 @@ impl Kcp {
         let mut buf = Bytes::copy_from_slice(data);
         // 解析头部
         let (header, buf) = KcpPacketHeader::from_bytes(&mut buf)?;
+        if buf.len() < header.len as usize {
+            return Err(KcpError::IncompleteData(IncompleteDataType::Payload));
+        }
+        if buf.len() > header.len as usize {
+            return Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr));
+        }
 
         // 验证conv是否匹配
         if self.conv == 0 {
