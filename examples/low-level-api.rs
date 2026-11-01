@@ -185,7 +185,7 @@ fn print_usage() {
     println!("  优点:");
     println!("    - 简单易用，类似TCP");
     println!("    - 自动处理update和socket读写");
-    println!("    - 实现了Read/Write trait");
+    println!("    - 提供异步 send/recv 接口");
     println!("  缺点:");
     println!("    - 灵活性较低");
     println!("    - 额外的抽象层开销");

@@ -47,7 +47,7 @@
 ### Stream API（推荐）
 - ✅ **简单易用** — 类似TCP的使用体验
 - ✅ **自动管理** — 自动处理update和socket读写
-- ✅ **标准trait** — 实现Read/Write trait
+- ✅ **消息接口** — 使用异步 send/recv
 - ✅ **开箱即用** — 几行代码即可使用
 
 ### 底层API
@@ -70,6 +70,7 @@ Stream 的发送接口成功表示数据已进入本地队列，并非对端已�
 ```toml
 [dependencies]
 kcp-ovo = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 ### Stream API（推荐）
@@ -77,97 +78,38 @@ kcp-ovo = "0.4"
 #### Echo服务器
 
 ```rust
-use kcp_ovo::KcpListener;
-use std::io::{Read, Write};
+use kcp_ovo::stream::KcpListener;
 
-fn main() -> std::io::Result<()> {
-    let mut listener = KcpListener::bind("0.0.0.0:8888").await?;
-    println!("服务器启动在 0.0.0.0:8888");
-
-    Ok(())
+#[tokio::main]
+async fn main() -> kcp_ovo::KcpResult<()> {
+    let mut listener = KcpListener::bind("127.0.0.1:8888").await?;
+    loop {
+        let (data, peer) = listener.recv().await?;
+        listener.send_to(&data, peer).await?;
+    }
 }
 ```
 
 #### Echo客户端
 
 ```rust
-use kcp_ovo::KcpStream;
-use std::io::{Read, Write};
+use kcp_ovo::stream::KcpStream;
 
-fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() -> kcp_ovo::KcpResult<()> {
     let mut stream = KcpStream::connect("127.0.0.1:8888").await?;
     stream.send(b"Hello, KCP!").await?;
-
-    let bytes = stream.recv().await?;
-    println!("收到: {}", String::from_utf8_lossy(&bytes));
+    let reply = stream.recv().await?;
+    println!("收到: {}", String::from_utf8_lossy(&reply));
     Ok(())
 }
 ```
 
-### 底层API
+在两个终端分别运行 `cargo run --example echo-server` 和 `cargo run --example echo-client`，客户端应输出 `收到: Hello, KCP!`。完整源码在 [examples](examples/)；`send` 成功表示消息已进入本地队列，不表示对端已收到。
 
-```rust
-use kcp_ovo::{Kcp, KcpConfig};
+### 底层 API 与流模式
 
-fn main() -> kcp_ovo::KcpResult<()> {
-    // 创建KCP实例
-    let mut kcp = Kcp::new(0x11223344, KcpConfig::default())?;
-
-    // 设置输出回调
-    kcp.set_output(|data| {
-        async move {
-            // 通过UDP socket发送
-            udp_socket.send_to(data, &remote_addr)?;
-            Ok(data.len())
-        }
-    });
-
-    // 发送数据
-    kcp.send(b"Hello, KCP!")?;
-    kcp.flush();
-
-    // 接收UDP数据并输入到KCP
-    let (len, _) = udp_socket.recv_from(&mut buf)?;
-    kcp.input(&buf[..len])?;
-
-    // 更新KCP状态
-    kcp.update(current_timestamp_ms);
-
-    // 接收数据
-    let bytes = kcp.recv()?;
-    println!("收到: {}", String::from_utf8_lossy(&bytes));
-
-    Ok(())
-}
-```
-
-### 流模式使用
-
-```rust
-use kcp_ovo::{Kcp, KcpConfig};
-
-// 启用流模式（一行代码）
-let config = KcpConfig::stream_mode();
-
-// 或通过 struct 字面量
-let config = KcpConfig {
-    stream_mode: true,
-    ..KcpConfig::fast_mode()
-};
-
-let mut kcp = Kcp::new(0x11223344, config)?;
-
-// 流模式下可发送任意大小的数据（不再受255分片限制）
-let large_data = vec![0u8; 1_000_000]; // 1MB
-kcp.send(&large_data)?;
-kcp.flush();
-
-// 接收端一次性读回全部字节，无消息边界
-let bytes = kcp.recv()?;
-assert_eq!(bytes.len(), 1_000_000);
-```
-
-> **注意**：流模式与非流模式**不能互连互通**，两端的 `stream_mode` 必须一致。
+底层类型路径为 `kcp_ovo::core::kcp::Kcp`。请运行 `cargo run --example low-level-api` 查看配置、输出回调和队列用法；实际通信还需接收 UDP 数据并调用 `input`，定期异步调用 `update`。底层 `KcpConfig::stream_mode()` 提供无消息边界的字节流，两端必须采用相同模式；高层 `KcpStream` 使用消息模式，与这个配置不是同一设置。
 
 ## 📊 性能
 
@@ -237,7 +179,7 @@ let config = KcpConfig {
 > `nocwnd=true`（`fast_mode()` 默认）时拥塞窗口被绕过，发送量只受
 > `snd_wnd.min(rmt_wnd)` 限制，32 段即约 44KB 在途数据，会成为吞吐的硬上限。
 > 需要跑满带宽请用 `KcpConfig::fast_mode_with_wnd(snd, rcv)` 显式放大，
-> 实测 512 段已接近本机吞吐饱和点。窗口按段计，单段载荷约 `mtu - 24` 字节。
+> 实测 512 段已接近本机吞吐饱和点。窗口按段计，单段载荷约 `mtu - 28` 字节。
 
 详细配置说明请参考：[性能优化指南](docs/performance.md)
 
@@ -260,7 +202,8 @@ cargo doc --open
 
 | 示例 | 说明 | 运行方式 |
 |------|------|---------|
-| `stream-easy-api` | Echo服务器/客户端 | `cargo run --example stream-easy-api` |
+| `echo-server` / `echo-client` | 双进程 Echo | `cargo run --example echo-server` / `cargo run --example echo-client` |
+| `stream-easy-api` | 同进程收发示例 | `cargo run --example stream-easy-api` |
 | `low-level-api` | 底层API演示 | `cargo run --example low-level-api` |
 | `file-transfer` | 文件传输示例 | `cargo run --example file-transfer -- [send\|recv] <file>` |
 
@@ -295,7 +238,7 @@ src/
 | 维度 | 说明 |
 |------|------|
 | **何时使用** | 新项目开发、需要快速上手、类似TCP的使用体验 |
-| **优点** | 简单易用，几行代码即可使用；自动管理KCP状态更新；实现标准IO trait；自动处理socket读写 |
+| **优点** | 简单易用，几行代码即可使用；自动管理KCP状态更新；异步发送和接收消息；自动处理socket读写 |
 
 ### 底层API（推荐高级用户）
 

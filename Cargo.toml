@@ -123,6 +123,14 @@ path = "benches/kcp-transfer.rs"
 harness = false
 
 [[example]]
+name = "echo-server"
+path = "examples/echo-server.rs"
+
+[[example]]
+name = "echo-client"
+path = "examples/echo-client.rs"
+
+[[example]]
 name = "file-transfer"
 path = "examples/file-transfer.rs"
 
