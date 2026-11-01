@@ -531,6 +531,18 @@ impl Kcp {
         {
             self.parse_fastack(header.una);
             self.parse_una(header.una);
+            let increase = if (self.cwnd as u32) < self.ssthresh {
+                self.mss as u64
+            } else {
+                (self.mss as u64 / u64::from(self.cwnd.max(1))).max(1)
+            };
+            let incr = u64::from(self.incr) + increase;
+            if incr >= u64::from(self.mss) {
+                self.cwnd = self.cwnd.saturating_add(1);
+                self.incr = (incr - u64::from(self.mss)) as u32;
+            } else {
+                self.incr = incr as u32;
+            }
         }
         if self.timediff_u64(self.current, header.ts) >= 10000
             || self.timediff_u64(header.ts, self.ts_recent) >= 10000
@@ -559,8 +571,6 @@ impl Kcp {
         if self.timediff_u32(una, self.snd_una) > 0 {
             self.snd_una = una;
         }
-        // 拥塞窗口每收到一次确认最多增长一次（见 flush 尾部），
-        // 记录最近确认时刻作为门限，否则该门限恒真、cwnd 每轮都涨。
         self.ts_lastack = self.current;
     }
 
@@ -597,7 +607,6 @@ impl Kcp {
                 .max(self.rx_minrto)
                 .min(IKCP_RTO_MAX);
         }
-        // 与 parse_una 同理：记录确认时刻，供 cwnd 增长门限使用
         self.ts_lastack = current;
     }
 
@@ -846,21 +855,11 @@ impl Kcp {
             }
         }
 
-        // 拥塞控制：丢包则收缩窗口，否则按慢启动/拥塞避免递增
+        // 拥塞控制：丢包则收缩窗口
         if lost {
             self.ssthresh = (self.cwnd as u32 / 2).max(IKCP_THRESH_MIN);
             self.cwnd = 1;
             self.incr = 0;
-        } else if self.timediff_u64(current, self.ts_lastack) >= 0 {
-            if (self.cwnd as u32) < self.ssthresh {
-                self.incr += self.mss;
-            } else if self.mss > 0 {
-                self.incr += self.mss * self.mss / (self.cwnd as u32);
-            }
-            if self.incr >= self.mss {
-                self.cwnd += 1;
-                self.incr -= self.mss;
-            }
         }
         Ok(())
     }
