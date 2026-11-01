@@ -159,6 +159,13 @@ fn packet_short_payload_errors() {
     assert_eq!(err, KcpError::IncompleteData(IncompleteDataType::Payload));
 }
 
+#[test]
+fn packet_from_header_limits_payload_to_declared_length() {
+    let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 1, 0, 0, 0, 1);
+    let packet = KcpPacket::from_header_and_data(header, b"AB").unwrap();
+    assert_eq!(&packet.data[..], b"A");
+}
+
 /// 不足一个头部长度就解析必须报错
 #[test]
 fn packet_truncated_header_errors() {
