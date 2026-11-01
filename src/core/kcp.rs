@@ -593,7 +593,10 @@ impl Kcp {
                             Some((rtt, rtt / 2))
                         } else {
                             let delta = rtt - self.rx_srtt;
-                            Some((self.rx_srtt + delta / 8, self.rx_rttval + delta.abs() / 4))
+                            Some((
+                                self.rx_srtt + delta / 8,
+                                self.rx_rttval + (delta.abs() - self.rx_rttval) / 4,
+                            ))
                         };
                     }
                 }
