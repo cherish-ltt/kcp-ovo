@@ -4,8 +4,93 @@
 
 mod common;
 
+use common::stress::{Rendezvous, Sink, control_packet};
 use common::{Net, Rng, Sim, assert_same};
 use kcp_ovo::KcpConfig;
+use kcp_ovo::error::{IncompleteDataType, KcpError, KcpErrorKind};
+use kcp_ovo::helper::KcpCmd;
+
+#[tokio::test]
+async fn maximum_message_survives_loss_and_blackout() {
+    for mtu in [29, 128, 1400] {
+        let config = KcpConfig { mtu, ..KcpConfig::fast_mode_with_wnd(255, 255) };
+        let net = Net::loss(0.05)
+            .with_delay(5)
+            .with_jitter(3)
+            .with_reorder(0.2, 0.1)
+            .with_blackout(30, 300);
+        let mut sim = Sim::new(config, net, 0x2550 + u64::from(mtu));
+        let payload = Rng::new(0x2550).bytes((mtu as usize - 28) * 255);
+        let expected = vec![payload, b"after maximum message".to_vec()];
+        for message in &expected {
+            assert_eq!(sim.a.borrow_mut().send(message).unwrap(), message.len());
+        }
+        let total = expected.iter().map(Vec::len).sum();
+        let mut transfer = Rendezvous::new(&mut sim, total, 0);
+        assert!(transfer.run(30_000).await, "mtu={mtu}: maximum message stalled");
+        assert!(transfer.ticks() > 330, "transfer did not span the blackout");
+        assert_eq!(transfer.messages_a_to_b(), expected, "mtu={mtu}");
+        drop(transfer);
+        sim.run(1000).await.unwrap();
+        assert!(sim.b_messages().is_empty(), "late duplicates were delivered");
+    }
+}
+
+#[tokio::test]
+async fn rejected_send_preserves_pending_and_subsequent_messages() {
+    for mtu in [29, 128, 1400] {
+        let config = KcpConfig { mtu, ..KcpConfig::fast_mode_with_wnd(32, 64) };
+        let mut sim = Sim::new(config, Net::loss(0.1).with_delay(5), 0x2560 + u64::from(mtu));
+        let expected = vec![b"before rejection".to_vec(), b"after rejection".to_vec()];
+        sim.a.borrow_mut().send(&expected[0]).unwrap();
+        sim.tick().await.unwrap();
+        let pending = sim.a.borrow().waitsnd();
+        let oversized = vec![0xFF; (mtu as usize - 28) * 255 + 1];
+        for _ in 0..3 {
+            let error = sim.a.borrow_mut().send(&oversized).unwrap_err();
+            assert_eq!(error.kind(), KcpErrorKind::InvalidConfig);
+            assert_eq!(sim.a.borrow_mut().send(&[]).unwrap(), 0);
+            assert_eq!(sim.a.borrow().waitsnd(), pending);
+        }
+        sim.a.borrow_mut().send(&expected[1]).unwrap();
+        let total = expected.iter().map(Vec::len).sum();
+        let mut transfer = Rendezvous::new(&mut sim, total, 0);
+        assert!(transfer.run(10_000).await, "mtu={mtu}: rejected send broke delivery");
+        assert_eq!(transfer.messages_a_to_b(), expected, "mtu={mtu}");
+    }
+}
+
+#[tokio::test]
+async fn repeated_peek_and_incomplete_recv_preserve_message_boundaries() {
+    let config = KcpConfig { mtu: 128, ..KcpConfig::fast_mode() };
+    let mut sender = Sink::new(config.clone());
+    let receiver = Sink::new(config);
+    let first = Rng::new(0x2570).bytes(203);
+    let second = b"next message";
+    sender.kcp.borrow_mut().input(&control_packet(1, KcpCmd::Wins, 128)).unwrap();
+    sender.kcp.borrow_mut().send(&first).unwrap();
+    sender.kcp.borrow_mut().send(second).unwrap();
+    sender.update(0).await.unwrap();
+    let packets = sender.emitted();
+    assert_eq!(packets.len(), 4);
+    for index in [0, 2, 3] {
+        receiver.kcp.borrow_mut().input(&packets[index]).unwrap();
+    }
+    let incomplete = KcpError::IncompleteData(IncompleteDataType::PayloadWaitForFrg);
+    for _ in 0..5 {
+        assert_eq!(receiver.kcp.borrow().peeksize(), Err(incomplete.clone()));
+        assert_eq!(receiver.kcp.borrow_mut().recv(), Err(incomplete.clone()));
+    }
+    receiver.kcp.borrow_mut().input(&packets[1]).unwrap();
+    for expected in [&first[..], &second[..]] {
+        for _ in 0..5 {
+            assert_eq!(receiver.kcp.borrow().peeksize().unwrap(), expected.len());
+        }
+        assert_eq!(&receiver.kcp.borrow_mut().recv().unwrap()[..], expected);
+    }
+    assert_eq!(receiver.kcp.borrow().peeksize(), Err(KcpError::QueueEmpty));
+    assert_eq!(receiver.kcp.borrow_mut().recv(), Err(KcpError::QueueEmpty));
+}
 
 /// 小消息在干净链路上应完整送达
 #[tokio::test]

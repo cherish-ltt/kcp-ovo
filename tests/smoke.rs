@@ -36,6 +36,23 @@ async fn every_preset_delivers_one_message() {
     }
 }
 
+#[tokio::test]
+async fn learned_conversation_completes_request_and_reply() {
+    let config = KcpConfig::fast_mode();
+    let mut sim = Sim::with_conv(42, 0, config.clone(), config, Net::default(), 0x5_0006);
+    sim.a.borrow_mut().send(b"request").unwrap();
+    {
+        let mut transfer = Rendezvous::new(&mut sim, 7, 0);
+        assert!(transfer.run(1000).await);
+        assert_eq!(transfer.messages_a_to_b(), &[b"request".to_vec()]);
+    }
+    assert_eq!(sim.b.borrow().getconv(), 42);
+    sim.b.borrow_mut().send(b"reply").unwrap();
+    let mut transfer = Rendezvous::new(&mut sim, 0, 5);
+    assert!(transfer.run(1000).await);
+    assert_eq!(transfer.messages_b_to_a(), &[b"reply".to_vec()]);
+}
+
 /// 配置矩阵里每一组都能双向互连
 #[tokio::test]
 async fn config_matrix_all_connect() {

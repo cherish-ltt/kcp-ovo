@@ -570,3 +570,17 @@ ci 校验  →  GitHub Release  →  cargo publish
 ### 10.6 文档示例一致性
 
 README 的 Echo 代码与 `examples/echo-server.rs`、`examples/echo-client.rs` 保持一致；`readme_echo_examples_match_compiled_sources` 检查内容，CI 编译示例。修改示例时同步更新 README。
+
+### 10.7 黑盒边界与恢复覆盖
+
+以下是行为覆盖索引，不代表新增产品缺陷；不得将内部实现行为或未经实测的候选当作正确性依据。
+
+| 测试 | 关注点 |
+| --- | --- |
+| `smoke::learned_conversation_completes_request_and_reply` | 首包学习 conv 后双向消息闭环 |
+| `transfer::maximum_message_survives_loss_and_blackout` | 最大 255 分片在 MTU 29/128/1400、丢包、乱序、重复与黑洞组合下精确交付 |
+| `transfer::rejected_send_preserves_pending_and_subsequent_messages` | 超限发送失败不改变待发消息，后续合法发送可恢复 |
+| `transfer::repeated_peek_and_incomplete_recv_preserve_message_boundaries` | 重复查看和不完整读取不消费消息 |
+| `timing::output_error_mid_batch_recovers_data_and_acknowledgements` | 数据与 ACK 输出中途报错后重试，不漏发或重复成功输出 |
+| `malformed::malformed_ack_cannot_discard_pending_messages` | 畸形确认不能消耗在途数据，之后真实交付仍完成 |
+| `malformed::rejected_first_packet_does_not_choose_conversation` | 解析失败的首包不能改变 conv，合法首包仍可建立会话 |

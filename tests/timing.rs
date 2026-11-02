@@ -11,6 +11,86 @@ use kcp_ovo::KcpConfig;
 use kcp_ovo::helper::KcpCmd;
 
 #[tokio::test]
+async fn output_error_mid_batch_recovers_data_and_acknowledgements() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use kcp_ovo::KcpError;
+
+    for failed_cmd in [KcpCmd::Push, KcpCmd::Ack] {
+        let mut sender = Sink::new(KcpConfig::fast_mode());
+        let mut receiver = Sink::new(KcpConfig::fast_mode());
+        sender
+            .kcp
+            .borrow_mut()
+            .input(&common::stress::control_packet(1, KcpCmd::Wins, 128))
+            .unwrap();
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let packets = emitted.clone();
+        let matching_calls = Arc::new(AtomicUsize::new(0));
+        let target = if failed_cmd == KcpCmd::Push { &sender } else { &receiver };
+        target.kcp.borrow_mut().set_output(move |data| {
+            let fail = common::parse_cmd(&data) == Some(failed_cmd)
+                && matching_calls.fetch_add(1, Ordering::SeqCst) == 1;
+            let packets = packets.clone();
+            async move {
+                if fail {
+                    return Err(KcpError::IoError("injected output failure".into()));
+                }
+                packets.lock().unwrap().push(data.to_vec());
+                Ok(data.len())
+            }
+        });
+        let expected = vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()];
+        for message in &expected {
+            sender.kcp.borrow_mut().send(message).unwrap();
+        }
+        let mut failures = 0;
+        let mut received = Vec::new();
+        let mut successful_output = Vec::new();
+        for now in (0..=1000).step_by(20) {
+            for result in [sender.update(now).await, receiver.update(now).await] {
+                if let Err(error) = result {
+                    assert_eq!(error, KcpError::IoError("injected output failure".into()));
+                    failures += 1;
+                }
+            }
+            let retry_packets = std::mem::take(&mut *emitted.lock().unwrap());
+            successful_output.extend(
+                retry_packets
+                    .iter()
+                    .filter(|packet| common::parse_cmd(packet) == Some(failed_cmd))
+                    .map(|packet| u32::from_be_bytes(packet[16..20].try_into().unwrap())),
+            );
+            let (sent, acks) = if failed_cmd == KcpCmd::Push {
+                (retry_packets, receiver.emitted())
+            } else {
+                (sender.emitted(), retry_packets)
+            };
+            sender.clear();
+            receiver.clear();
+            for packet in sent {
+                receiver.kcp.borrow_mut().input(&packet).unwrap();
+            }
+            for packet in acks {
+                sender.kcp.borrow_mut().input(&packet).unwrap();
+            }
+            for _ in 0..4 {
+                match receiver.kcp.borrow_mut().recv() {
+                    Ok(message) => received.push(message.to_vec()),
+                    Err(KcpError::QueueEmpty) => break,
+                    Err(error) => panic!("unexpected receive error: {error}"),
+                }
+            }
+        }
+        assert_eq!(failures, 1, "failure injection not exercised: {failed_cmd:?}");
+        assert_eq!(successful_output, [0, 1, 2], "lost or repeated output: {failed_cmd:?}");
+        assert_eq!(received, expected, "output recovery changed messages: {failed_cmd:?}");
+        assert_eq!(sender.kcp.borrow().waitsnd(), 0, "ACK recovery stalled: {failed_cmd:?}");
+    }
+}
+
+#[tokio::test]
 async fn unread_and_out_of_order_duplicates_are_acknowledged() {
     let mut sink = Sink::new(KcpConfig::fast_mode());
     let first = push_packet(1, 0, b"a");

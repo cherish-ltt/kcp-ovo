@@ -6,7 +6,7 @@
 mod common;
 
 use common::stress::{RawHeader, Sink, control_packet, push_packet, raw_packet};
-use common::{Rng, checksum};
+use common::{Net, Rng, Sim, checksum};
 use kcp_ovo::KcpConfig;
 use kcp_ovo::error::KcpErrorKind;
 use kcp_ovo::helper::KcpCmd;
@@ -292,4 +292,58 @@ fn oversized_payload_parsed_safely() {
     sink.kcp.borrow_mut().input(&pkt).unwrap();
     let got = sink.kcp.borrow_mut().recv().unwrap();
     assert_eq!(got.len(), 8000);
+}
+
+#[tokio::test]
+async fn malformed_ack_cannot_discard_pending_messages() {
+    for malformed in 0..4 {
+        let cfg = KcpConfig::fast_mode_with_wnd(16, 32);
+        let mut sim = Sim::with_conv(1, 1, cfg.clone(), cfg, Net::default(), 0xBAD0_1001);
+        let payload = Rng::new(0xBAD0_1002).bytes(3000);
+        sim.a.borrow_mut().send(&payload).unwrap();
+        sim.tick().await.unwrap();
+        let pending = sim.a.borrow().waitsnd();
+        assert!(pending > 0);
+
+        let mut ack = raw_packet(
+            RawHeader { cmd: KcpCmd::Ack.into(), wnd: 0, una: 1, ..RawHeader::push(1, 0) },
+            b"",
+        );
+        match malformed {
+            0 => ack.truncate(27),
+            1 => ack[4] = 255,
+            2 => ack[24..28].copy_from_slice(&1u32.to_be_bytes()),
+            _ => ack.push(0),
+        }
+        assert!(sim.a.borrow_mut().input(&ack).is_err(), "case={malformed}");
+        assert_eq!(sim.a.borrow().waitsnd(), pending, "case={malformed}");
+
+        let mut delivery = common::stress::Rendezvous::new(&mut sim, payload.len(), 0);
+        assert!(delivery.run(10_000).await, "case={malformed}");
+        assert_eq!(delivery.messages_a_to_b(), &[payload]);
+    }
+}
+
+#[test]
+fn rejected_first_packet_does_not_choose_conversation() {
+    use kcp_ovo::core::kcp::Kcp;
+
+    let valid = push_packet(42, 0, b"accepted");
+    let mut rejected: Vec<Vec<u8>> = (0..valid.len()).map(|len| valid[..len].to_vec()).collect();
+    let mut unknown_command = valid.clone();
+    unknown_command[4] = 255;
+    rejected.push(unknown_command);
+    let mut trailing = valid;
+    trailing.push(0);
+    rejected.push(trailing);
+
+    for packet in rejected {
+        let mut kcp = Kcp::new(0, KcpConfig::fast_mode()).unwrap();
+        assert!(kcp.input(&packet).is_err());
+        assert_eq!(kcp.getconv(), 0);
+        assert!(kcp.recv().is_err());
+        kcp.input(&push_packet(7, 0, b"valid first message")).unwrap();
+        assert_eq!(kcp.getconv(), 7);
+        assert_eq!(&kcp.recv().unwrap()[..], b"valid first message");
+    }
 }
