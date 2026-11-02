@@ -14,6 +14,16 @@
 
 ## 性能基准
 
+### 可重复的本机回环观测
+
+```bash
+cargo test --release --test udp_chaos sustained_loopback_load_is_byte_exact -- --exact --nocapture
+```
+
+该黑盒用例用公开 Stream/Listener API 运行 1/8/20 个客户端，每个客户端预热 2 轮，再完成 16 轮 4096 B 请求/回复；每条消息逐字节核对客户端标识、轮次和内容。输出成功数、双向应用有效吞吐和 RTT p50/p95/p99，20 客户端测量阶段共传输 2.5 MiB 应用数据。
+
+它衡量本机串行请求/回复负载，不是流水线极限吞吐、公网弱网或 TCP 对照实验；没有人为设置速度合格线。实测数据及限制见 [2026-11-03 黑盒验证记录](blackbox-2026-11-03.md)。下列历史场景数值不是本轮验证结果。
+
 ### KCP vs TCP
 
 | 指标 | TCP | KCP (默认) | KCP (快速模式) |

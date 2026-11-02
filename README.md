@@ -319,7 +319,9 @@ cargo test test_stream_mode
 `tests/common/` 提供确定性仿真设施：`Rng`（固定种子）、`Net`（丢包/延迟/抖动/乱序/重复/突发丢包/延迟尖刺/路径 MTU）、
 `Sim`（双端虚拟时钟）、`Sink`（单端抓包）。所有随机用例都由固定种子驱动，
 失败时用同一 seed 即可复现；`tests/property.rs` 另有 proptest 在参数空间内自动搜索并收缩反例。
-全部用例合计约 2 秒。
+协议场景使用虚拟时间；Stream 场景另外使用本机 UDP 回环与有界超时。
+2026-11-03 本机验证的 21 个集成测试套件运行时间合计约 4.1 秒，不含编译时间；
+运行时间随机器与调度负载变化，覆盖和限制见 [黑盒验证记录](docs/blackbox-2026-11-03.md)。
 
 黑盒测试是本项目的上线硬门槛，新增功能必须补齐对应场景才能合并，详见
 [AGENTS.md](AGENTS.md) 第 10.1 节。
@@ -345,7 +347,7 @@ cargo test test_stream_mode
 | `adversarial.rs` | 敌意输入与账本边界：越过 `snd_nxt` 的伪造 `una`、在途段不得越过对端窗口、未知对端只放行一段探路、退化配置拒绝、头部极值扫描 |
 | `property.rs` | 属性测试：任意字节/头部/配置不崩且账本自洽、随机链路（含小接收窗口）字节精确、双向同时传输 |
 | `torture.rs` | 极端链路叠加：成簇丢包、延迟尖刺不引发重传风暴、路径 MTU 黑洞上报死链、双向同时断网、回绕叠加断网、100 连接、零窗口探测有界 |
-| `udp_chaos.rs` | 真实 UDP 混沌：8 客户端消息边界、垃圾报文轰炸后仍可服务、静默客户端不拖累他人、40KB 大消息 |
+| `udp_chaos.rs` | 真实 UDP 混沌：消息边界、垃圾报文、静默客户端隔离、40KB 消息；1/8/20 客户端持续精确回显与吞吐、RTT 分位数观测 |
 | `smoke.rs` | 秒级冒烟：预设配置与矩阵互连、首包学习 conv 后完成请求/回复、空输入与退化配置、未知对端探路、控制帧往返、同刻重复 update 不重发 |
 
 ```bash
@@ -357,6 +359,9 @@ cargo test --test adversarial --test property --test torture --test udp_chaos
 
 # 秒级冒烟（改动后的第一道反馈）
 cargo test --test smoke
+
+# 本机回环负载观测，不代表公网性能或最大吞吐
+cargo test --release --test udp_chaos sustained_loopback_load_is_byte_exact -- --exact --nocapture
 
 # 覆盖率（需先安装 cargo-llvm-cov）
 cargo llvm-cov --workspace --all-features --summary-only
@@ -393,6 +398,7 @@ MIT License
 
 ### 开发规范
 
+- 遵循 [AGENTS.md](AGENTS.md) 中的开发与黑盒测试要求
 - 遵循Rust代码风格（`cargo fmt`）
 - 通过Clippy检查（`cargo clippy`）
 - 添加单元测试（`cargo test`）

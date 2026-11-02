@@ -591,3 +591,7 @@ README 的 Echo 代码与 `examples/echo-server.rs`、`examples/echo-client.rs` 
 | `stream_api::foreign_conversation_does_not_replace_active_session` | 同源地址外来 conv 不污染活动会话 |
 
 第 10.1 节的虚拟时钟规则适用于协议仿真；高层 Stream/Listener 的真实 UDP 测试允许本机回环及有界超时，不用真实 sleep 堆等待，不将公网或跨平台行为视为已验证。
+
+`udp_chaos::sustained_loopback_load_is_byte_exact` 覆盖 1/8/20 客户端持续回显、精确内容与会话隔离，并输出吞吐及 RTT 分位数。固定种子用于载荷，不代表操作系统调度时间确定；性能无可靠 SLO 时只作观测，不设置任意速度阈值。测量前须暖机，失败与超时不得计入成功数据，后台任务必须清理。
+
+本轮测试矩阵、命令、实测结果及覆盖率工具限制见 `docs/blackbox-2026-11-03.md`。

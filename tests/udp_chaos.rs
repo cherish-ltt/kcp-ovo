@@ -7,12 +7,14 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use common::{Rng, checksum};
 use kcp_ovo::stream::{KcpListener, KcpStream, StreamConfig};
 use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
+use tokio::sync::Barrier;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 
 const BUDGET: Duration = Duration::from_secs(20);
@@ -154,4 +156,85 @@ async fn large_message_roundtrip_over_udp() {
         assert_eq!(checksum(&got), checksum(&payload), "大消息内容不一致");
     }
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sustained_loopback_load_is_byte_exact() {
+    const WARMUP: usize = 2;
+    const ROUNDS: usize = 16;
+    const PAYLOAD: usize = 4096;
+
+    for client_count in [1usize, 8, 20] {
+        let (addr, server) = echo_server().await;
+        let ready = Arc::new(Barrier::new(client_count));
+        let mut clients = JoinSet::new();
+        for client_id in 0..client_count {
+            let ready = ready.clone();
+            clients.spawn(async move {
+                let mut stream = connect(addr).await;
+                let mut message = Rng::new(0x10AD_0000 + client_id as u64).bytes(PAYLOAD);
+                message[..8].copy_from_slice(&(client_id as u64).to_be_bytes());
+                for round in 0..WARMUP {
+                    message[8..16].copy_from_slice(&(round as u64).to_be_bytes());
+                    stream.send(&message).await.expect("warmup send");
+                    assert_eq!(stream.recv().await.expect("warmup recv"), message);
+                }
+                ready.wait().await;
+
+                let started = Instant::now();
+                let mut latencies = Vec::with_capacity(ROUNDS);
+                for round in WARMUP..WARMUP + ROUNDS {
+                    message[8..16].copy_from_slice(&(round as u64).to_be_bytes());
+                    let sent_at = Instant::now();
+                    stream.send(&message).await.expect("load send");
+                    let received = stream.recv().await.expect("load recv");
+                    latencies.push(sent_at.elapsed());
+                    assert_eq!(received, message, "client={client_id}, round={round}");
+                }
+                (started, Instant::now(), latencies)
+            });
+        }
+
+        let completed = timeout(BUDGET, async {
+            let mut results = Vec::with_capacity(client_count);
+            while let Some(result) = clients.join_next().await {
+                results.push(result);
+            }
+            results
+        })
+        .await;
+        clients.shutdown().await;
+        server.abort();
+        let server_result = server.await;
+        assert!(
+            server_result.is_err_and(|error| error.is_cancelled()),
+            "echo server stopped unexpectedly"
+        );
+        let results: Vec<_> = completed
+            .expect("loopback load timed out")
+            .into_iter()
+            .map(|result| result.expect("loopback client failed"))
+            .collect();
+        assert_eq!(results.len(), client_count);
+
+        let started = results.iter().map(|result| result.0).min().unwrap();
+        let finished = results.iter().map(|result| result.1).max().unwrap();
+        let mut latencies: Vec<_> = results.into_iter().flat_map(|result| result.2).collect();
+        assert_eq!(latencies.len(), client_count * ROUNDS);
+        latencies.sort_unstable();
+        let percentile_ms = |percent: usize| {
+            latencies[(latencies.len() * percent).div_ceil(100) - 1].as_secs_f64() * 1000.0
+        };
+        let bytes = client_count * ROUNDS * PAYLOAD * 2;
+        let mib_per_second = bytes as f64 / (1024.0 * 1024.0) / (finished - started).as_secs_f64();
+        println!(
+            "loopback clients={client_count} success={}/{} errors=0 payload_bytes={bytes} \
+             bidirectional_mib_s={mib_per_second:.3} rtt_ms p50={:.3} p95={:.3} p99={:.3}",
+            latencies.len(),
+            client_count * ROUNDS,
+            percentile_ms(50),
+            percentile_ms(95),
+            percentile_ms(99)
+        );
+    }
 }
