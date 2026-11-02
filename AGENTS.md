@@ -584,3 +584,10 @@ README 的 Echo 代码与 `examples/echo-server.rs`、`examples/echo-client.rs` 
 | `timing::output_error_mid_batch_recovers_data_and_acknowledgements` | 数据与 ACK 输出中途报错后重试，不漏发或重复成功输出 |
 | `malformed::malformed_ack_cannot_discard_pending_messages` | 畸形确认不能消耗在途数据，之后真实交付仍完成 |
 | `malformed::rejected_first_packet_does_not_choose_conversation` | 解析失败的首包不能改变 conv，合法首包仍可建立会话 |
+| `stream_api::nonblocking_queue_full_then_recovery_preserves_messages` | 非阻塞发送队列满后恢复，混合长度消息精确回显 |
+| `stream_api::cancelled_pending_receives_preserve_subsequent_messages` | 客户端与监听器取消 pending recv 后仍能接收 |
+| `stream_api::full_listener_keeps_active_session_across_cleanup_cycles` | 会话满额时现有活跃会话跨回收周期持续可用 |
+| `stream_api::shared_receive_backlog_preserves_other_session_progress` | 接收积压不阻止另一会话确认、回复，恢复读取后完整排空 |
+| `stream_api::foreign_conversation_does_not_replace_active_session` | 同源地址外来 conv 不污染活动会话 |
+
+第 10.1 节的虚拟时钟规则适用于协议仿真；高层 Stream/Listener 的真实 UDP 测试允许本机回环及有界超时，不用真实 sleep 堆等待，不将公网或跨平台行为视为已验证。

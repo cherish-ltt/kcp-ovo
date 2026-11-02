@@ -533,3 +533,196 @@ async fn connect_without_server_does_not_panic() {
         let _ = s.close();
     }
 }
+
+#[tokio::test]
+async fn nonblocking_queue_full_then_recovery_preserves_messages() {
+    timeout(Duration::from_secs(5), async {
+        let mut listener = KcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut stream = KcpStream::connect(listener.local_addr()).await.unwrap();
+        let messages: Vec<_> = (0..kcp_ovo::stream::CHANNEL_SIZE)
+            .map(|i| vec![i as u8; [1, 1373, 4096][i % 3]])
+            .collect();
+        for message in &messages {
+            stream.try_send(message).unwrap();
+        }
+        assert_eq!(stream.try_send(b"rejected").unwrap_err().kind(), KcpErrorKind::IoError);
+        let mut accepted_peer = None;
+        for expected in &messages {
+            let (got, peer) = listener.recv().await.unwrap();
+            assert_eq!(&got, expected);
+            assert_eq!(*accepted_peer.get_or_insert(peer), peer);
+            listener.send_to(&got, peer).await.unwrap();
+            let reply = loop {
+                match stream.try_recv() {
+                    Ok(data) => break data,
+                    Err(error) => {
+                        assert_eq!(error.kind(), KcpErrorKind::IoError);
+                        assert!(stream.is_connected());
+                        tokio::task::yield_now().await;
+                    },
+                }
+            };
+            assert_eq!(&reply, expected);
+        }
+        stream.try_send(b"after-full").unwrap();
+        let (got, peer) = listener.recv().await.unwrap();
+        assert_eq!(got, b"after-full");
+        assert_eq!(Some(peer), accepted_peer);
+        listener.send_to(&got, peer).await.unwrap();
+        assert_eq!(stream.recv().await.unwrap(), b"after-full");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_pending_receives_preserve_subsequent_messages() {
+    timeout(Duration::from_secs(3), async {
+        let mut listener = KcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut stream = KcpStream::connect(listener.local_addr()).await.unwrap();
+        for round in 0..4u8 {
+            tokio::select! {
+                biased;
+                result = listener.recv() => panic!("unexpected message before send: {result:?}"),
+                () = std::future::ready(()) => {},
+            }
+            let message = vec![round; 1 + usize::from(round) * 1373];
+            stream.send(&message).await.unwrap();
+            let (got, peer) = listener.recv().await.unwrap();
+            assert_eq!(got, message);
+            tokio::select! {
+                biased;
+                result = stream.recv() => panic!("unexpected reply before send: {result:?}"),
+                () = std::future::ready(()) => {},
+            }
+            listener.send_to(&message, peer).await.unwrap();
+            assert_eq!(stream.recv().await.unwrap(), message);
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn full_listener_keeps_active_session_across_cleanup_cycles() {
+    timeout(Duration::from_secs(4), async {
+        let idle_timeout = Duration::from_millis(300);
+        let config = StreamConfig {
+            max_sessions: 1,
+            session_idle_timeout: idle_timeout,
+            ..Default::default()
+        };
+        let mut listener = KcpListener::bind_with_config("127.0.0.1:0", config).await.unwrap();
+        let mut active = KcpStream::connect(listener.local_addr()).await.unwrap();
+        active.send(b"initial").await.unwrap();
+        let (got, active_peer) = listener.recv().await.unwrap();
+        assert_eq!(got, b"initial");
+        let blocked = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let started = tokio::time::Instant::now();
+        let mut rounds = tokio::time::interval(Duration::from_millis(40));
+        for round in 0..20u8 {
+            rounds.tick().await;
+            blocked
+                .send_to(
+                    &common::stress::push_packet(17, 0, b"not-admitted"),
+                    listener.local_addr(),
+                )
+                .await
+                .unwrap();
+            active.send(&[round]).await.unwrap();
+            let (got, peer) = listener.recv().await.unwrap();
+            assert_eq!(peer, active_peer);
+            assert_eq!(got, [round]);
+            listener.send_to(&got, peer).await.unwrap();
+            assert_eq!(active.recv().await.unwrap(), [round]);
+            assert!(
+                listener.send_to(b"not-admitted", blocked.local_addr().unwrap()).await.is_err()
+            );
+        }
+        assert!(started.elapsed() >= idle_timeout * 2);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn shared_receive_backlog_preserves_other_session_progress() {
+    timeout(Duration::from_secs(5), async {
+        let mut listener = KcpListener::bind("127.0.0.1:0").await.unwrap();
+        let busy = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let active = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let busy_count = kcp_ovo::stream::CHANNEL_SIZE + 1;
+        for sn in 0..busy_count as u32 {
+            busy.send_to(
+                &common::stress::push_packet(11, sn, &sn.to_be_bytes()),
+                listener.local_addr(),
+            )
+            .await
+            .unwrap();
+            wait_ack(&busy, sn).await;
+        }
+        active
+            .send_to(&common::stress::push_packet(12, 0, b"active"), listener.local_addr())
+            .await
+            .unwrap();
+        wait_ack(&active, 0).await;
+        listener.send_to(b"reply-before-drain", active.local_addr().unwrap()).await.unwrap();
+        let mut packet = [0u8; 1500];
+        loop {
+            let (size, source) = active.recv_from(&mut packet).await.unwrap();
+            assert_eq!(source, listener.local_addr());
+            if size >= 28 && packet[4] == u8::from(kcp_ovo::KcpCmd::Push) {
+                assert_eq!(&packet[28..size], b"reply-before-drain");
+                break;
+            }
+        }
+        let mut next_busy = 0u32;
+        let mut active_count = 0;
+        for _ in 0..busy_count + 1 {
+            let (got, peer) = listener.recv().await.unwrap();
+            if peer == busy.local_addr().unwrap() {
+                assert_eq!(got, next_busy.to_be_bytes());
+                next_busy += 1;
+            } else {
+                assert_eq!(peer, active.local_addr().unwrap());
+                assert_eq!(got, b"active");
+                active_count += 1;
+            }
+        }
+        assert_eq!(next_busy as usize, busy_count);
+        assert_eq!(active_count, 1);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn foreign_conversation_does_not_replace_active_session() {
+    timeout(Duration::from_secs(3), async {
+        let mut listener = KcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        peer.send_to(&common::stress::push_packet(21, 0, b"initial"), listener.local_addr())
+            .await
+            .unwrap();
+        assert_eq!(
+            listener.recv().await.unwrap(),
+            (b"initial".to_vec(), peer.local_addr().unwrap())
+        );
+        for sn in 1..5u32 {
+            peer.send_to(&common::stress::push_packet(22, 0, b"foreign"), listener.local_addr())
+                .await
+                .unwrap();
+            peer.send_to(
+                &common::stress::push_packet(21, sn, &sn.to_be_bytes()),
+                listener.local_addr(),
+            )
+            .await
+            .unwrap();
+            let (got, addr) = listener.recv().await.unwrap();
+            assert_eq!(got, sn.to_be_bytes());
+            assert_eq!(addr, peer.local_addr().unwrap());
+        }
+    })
+    .await
+    .unwrap();
+}
