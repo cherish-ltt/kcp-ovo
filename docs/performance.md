@@ -51,11 +51,32 @@ cargo test --release --test udp_chaos sustained_loopback_load_is_byte_exact -- -
 
 ## 延迟优化
 
+### 超时退避语义
+
+v0.5.2 修正连续超时的退避与期限计算，`nodelay` 是布尔开关，不提供原版 C 的
+`nodelay >= 2` 模式。下面的 `rto` 是单个在途段的等待量，`rx_rto` 是连接的 RTT 估计结果：
+
+| 行为 | `nodelay=false` | `nodelay=true` |
+| --- | --- | --- |
+| 最小估计 RTO | 100 ms | 30 ms |
+| 首次重传期限 | 首传时刻 + rto + max(rx_rto/8, 1) | 首传时刻 + rto |
+| 超时后段 RTO | min(rto + max(rto, rx_rto), 60000) | min(rto + rto/2, 60000) |
+| 下一超时期限 | 当前时刻 + 更新后的 RTO | 当前时刻 + 更新后的 RTO |
+
+累加采用饱和运算，除法向下取整；快速重传仍使用当前段 RTO，不触发超时退避。
+重传后的 ACK 不参与 RTT 采样，新段继续使用连接估计值，而非沿用旧段的退避值。
+这与原版的 normal／nodelay=1 策略相近，但本项目额外保留 60 秒上限；
+正确性由期限、交付和恢复断言验证，不以原版行为本身作保证。
+
+`nodelay` 不会让 `send` 或 `input` 自动输出，调用方仍需驱动 `update`。
+退避改变恢复时刻和重传流量，不保证任何模式在所有丢包形态下更快。
+固定条件的修复前后数据见 [v0.5.2 验证记录](rto-backoff-v0.5.2.md)。
+
 ### 1. 启用无延迟模式
 
 ```rust
 let config = KcpConfig {
-    nodelay: true,        // 立即发送，不等待
+    nodelay: true,        // 更小的最小 RTO、较缓的超时退避
     interval: 10,         // 最快更新频率
     fastresend: 2,        // 快速重传
     ..Default::default()

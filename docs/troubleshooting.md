@@ -490,7 +490,7 @@ error: the `#[global_allocator]` in this crate conflicts with global allocator i
 
 ```toml
 [dependencies]
-kcp-ovo = "0.5.1"
+kcp-ovo = "0.5.2"
 ```
 
 ```bash

@@ -404,6 +404,7 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-42 | 快速重传按累计 una 而非较高 ACK 计数 | 重传时序 | 乱序 ACK 无法提前恢复丢失的段 | `kcp.rs::input`、`parse_fastack` |
 | BUG-29 | 空闲刷新驱动拥塞窗口增长 | 拥塞控制 | 无确认时窗口持续增长，最终整数溢出 | `kcp.rs::input` 的确认推进分支 |
 | BUG-45 | 库无条件声明全局 mimalloc | 库集成 | 下游自选全局分配器时编译失败，关闭默认 feature 也无法避开 | `src/lib.rs`、`Cargo.toml` 移除分配器声明和依赖 |
+| BUG-46 | normal/fast 超时退避语义反转，期限使用旧 RTO | 重传时序 | 普通模式不累加、快速模式翻倍，连续丢包恢复不符合配置契约 | `kcp.rs::flush`：普通模式加 `max(rto, rx_rto)`，快速模式加 `rto/2`，饱和累加并限幅后安排下一期限 |
 
 其中 BUG-9、BUG-10、BUG-18、BUG-19、BUG-24、BUG-25、BUG-27 属于「线上会永久卡死、
 panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-26 属于「不丢数据但
@@ -510,6 +511,7 @@ panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-2
 | BUG-32 | `cancelled_output_retains_callback_and_pending_ack`、`cancelled_batch_keeps_successful_segment_state` | `tests/timing.rs` |
 | BUG-29 | `idle_updates_do_not_grow_congestion_window`、`congestion_window_grows_only_on_new_confirmation_and_stays_bounded` | `tests/congestion.rs` |
 | BUG-45 | 集成测试 crate 显式声明 System 全局分配器，默认与无默认 feature 均须编译通过 | `tests/api_contract.rs`、Rust CI 与 Release 工作流 |
+| BUG-46 | `normal_timeout_backoff_uses_new_deadline`、`fast_timeout_backoff_uses_new_deadline`、`timeout_backoff_is_bounded_and_obeys_dead_link`、`timeout_and_fastack_are_exclusive_and_ack_recovery_preserves_rtt`、`backoff_modes_deliver_on_clean_burst_and_blackout_links` | `tests/retransmit.rs` |
 
 #### 三、维护规则
 

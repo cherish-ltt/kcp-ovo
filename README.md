@@ -69,7 +69,7 @@ Stream 的发送接口成功表示数据已进入本地队列，并非对端已�
 
 ```toml
 [dependencies]
-kcp-ovo = "0.5.1"
+kcp-ovo = "0.5.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -183,6 +183,11 @@ let config = KcpConfig {
 
 详细配置说明请参考：[性能优化指南](docs/performance.md)
 
+超时退避按 `nodelay` 区分：普通模式将段 RTO 增加 `max(rto, rx_rto)`，
+快速模式增加 `rto/2`（整数除法），均限制为 60 秒，并以新 RTO 安排下一期限。
+普通模式仅在首次重传期限增加 `max(rx_rto/8, 1)` 毫秒余量。
+这不改变消息边界或线格式，也不保证快速模式在所有链路上更快。
+
 ## 📚 文档
 
 - [入门教程](docs/tutorial.md) — 5分钟快速入门
@@ -276,13 +281,13 @@ Rust 默认分配器。需要 mimalloc 等分配器的应用应自行添加依�
 
 ```toml
 # 默认配置（包含Stream API）
-kcp-ovo = "0.5.1"
+kcp-ovo = "0.5.2"
 
 # 仅使用底层API
-kcp-ovo = { version = "0.5.1", default-features = false }
+kcp-ovo = { version = "0.5.2", default-features = false }
 
 # 显式启用Stream API
-kcp-ovo = { version = "0.5.1", features = ["stream"] }
+kcp-ovo = { version = "0.5.2", features = ["stream"] }
 ```
 
 ## 🧪 测试
@@ -339,7 +344,7 @@ cargo test test_stream_mode
 | `lifecycle.rs` | 创建、更新、关闭、死链 |
 | `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付、队列满后的非阻塞恢复、取消接收、跨会话背压隔离、满额活跃会话保留、外来 conv 隔离、地址族与关闭回收 |
 | `api_contract.rs` | 公开 API 契约与错误类型；下游显式设置 System 全局分配器的编译兼容性 |
-| `retransmit.rs` | 重传与死链判定 |
+| `retransmit.rs` | 重传与死链判定、normal/fast 连续超时期限、退避上限与溢出、ACK/Karn 恢复、1 MiB 正常/成簇丢包/黑洞对照 |
 | `fuzz_transfer.rs` | 随机链路下 9 条协议不变式（字节精确、消息边界、窗口上限、断链恢复） |
 | `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、长度不符、未知命令、控制帧洪水、伪造 conv、畸形分片恢复；畸形 ACK 不丢待发消息，非法首包不绑定 conv |
 | `matrix.rs` | 配置组合矩阵：MTU × 窗口 × interval × fastresend × nodelay × 流模式；nodelay 语义（最小 RTO、首传重传期限） |
