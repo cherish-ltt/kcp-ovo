@@ -476,28 +476,30 @@ kcp-ovo = { version = "0.5", features = ["stream"] }
 kcp-ovo = "0.5"  # stream已默认启用
 ```
 
-### 问题2: 链接错误
+### 问题2: 全局分配器冲突
 
 **错误**:
 ```
-error: linking with `cc` failed
+error: the `#[global_allocator]` in this crate conflicts with global allocator in: kcp_ovo
 ```
 
-**原因**: mimalloc链接问题
+**原因**: v0.5.0 在库中声明全局 mimalloc，与应用自身的全局分配器冲突；
+关闭默认 feature 不能消除该声明。
 
-**解决方案**:
+**解决方案**: 升级到 v0.5.1 或更新版本，并更新依赖锁文件：
 
 ```toml
 [dependencies]
-mimalloc = { version = "0.1", default-features = false }
+kcp-ovo = "0.5.1"
 ```
 
-或禁用mimalloc:
-```rust
-// 注释掉 lib.rs 中的全局分配器
-// #[global_allocator]
-// static GLOBAL: MiMalloc = MiMalloc;
+```bash
+cargo update -p kcp-ovo
 ```
+
+v0.5.1 不再依赖或声明 mimalloc，无需修改库源码。默认配置与仅底层 API 配置均尊重
+应用的分配器选择；应用没有声明全局分配器时使用 Rust 默认分配器。
+若应用需要 mimalloc，应自行添加依赖并只在最终程序中声明全局分配器。
 
 ## 运行时错误
 

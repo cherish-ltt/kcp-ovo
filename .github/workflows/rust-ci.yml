@@ -65,3 +65,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-features --verbose
+
+      - name: Check downstream allocator without default features
+        run: cargo test --locked --no-default-features --test api_contract

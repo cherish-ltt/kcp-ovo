@@ -6,7 +6,7 @@
 //! ## 特性
 //!
 //! - 纯Rust实现，无FFI依赖
-//! - 使用mimalloc全局分配器优化内存性能
+//! - 不设置全局分配器，由最终应用决定内存分配策略
 //! - 类型安全，内存安全
 //! - 详细的中文文档注释
 //! - 完整的KCP协议功能
@@ -15,12 +15,6 @@
 //!
 //! 高层异步消息 API 的完整示例见仓库 `examples/echo-server.rs` 和
 //! `examples/echo-client.rs`。底层控制块位于 `kcp_ovo::core::kcp::Kcp`。
-
-// 使用mimalloc作为全局内存分配器
-use mimalloc::MiMalloc;
-
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
 
 // 模块声明
 pub mod config;

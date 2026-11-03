@@ -32,7 +32,7 @@
 
 ### 核心特性
 - ✅ **纯Rust实现** — 无FFI依赖，完全使用Rust重写
-- ✅ **内存优化** — 使用mimalloc全局分配器优化内存性能
+- ✅ **分配器兼容** — 不设置全局分配器，由最终应用决定内存分配策略
 - ✅ **类型安全** — 充分利用Rust类型系统，防止内存错误
 - ✅ **零成本抽象** — 性能接近原版C实现
 - ✅ **双API设计** — 提供底层API和Stream API（高级API）
@@ -267,6 +267,11 @@ src/
 |---------|---------|------|
 | `stream` | ✅ 是 | Stream API高级封装，推荐使用 |
 
+从 v0.5.1 起移除 mimalloc 依赖和库内全局分配器声明。默认配置与
+`default-features = false` 均允许应用自行设置 `#[global_allocator]`；未设置时使用
+Rust 默认分配器。需要 mimalloc 等分配器的应用应自行添加依赖并在最终程序中声明，
+库不提供分配器 feature。分配器变化可能影响性能，需在应用自身负载下测量。
+
 **使用方式**:
 
 ```toml
@@ -333,7 +338,7 @@ cargo test test_stream_mode
 | `window.rs` | 收发窗口、零窗口、窗口通告、探测起步与退避上限、探测不挤占 ACK、长期零窗口后恢复 |
 | `lifecycle.rs` | 创建、更新、关闭、死链 |
 | `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付、队列满后的非阻塞恢复、取消接收、跨会话背压隔离、满额活跃会话保留、外来 conv 隔离、地址族与关闭回收 |
-| `api_contract.rs` | 公开 API 契约与错误类型 |
+| `api_contract.rs` | 公开 API 契约与错误类型；下游显式设置 System 全局分配器的编译兼容性 |
 | `retransmit.rs` | 重传与死链判定 |
 | `fuzz_transfer.rs` | 随机链路下 9 条协议不变式（字节精确、消息边界、窗口上限、断链恢复） |
 | `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、长度不符、未知命令、控制帧洪水、伪造 conv、畸形分片恢复；畸形 ACK 不丢待发消息，非法首包不绑定 conv |
@@ -360,6 +365,9 @@ cargo test --test adversarial --test property --test torture --test udp_chaos
 # 秒级冒烟（改动后的第一道反馈）
 cargo test --test smoke
 
+# 下游分配器兼容性（默认 feature 已由全量测试覆盖）
+cargo test --no-default-features --test api_contract
+
 # 本机回环负载观测，不代表公网性能或最大吞吐
 cargo test --release --test udp_chaos sustained_loopback_load_is_byte_exact -- --exact --nocapture
 
@@ -378,7 +386,6 @@ MIT License
 ## 🙏 致谢
 
 - [skywind3000/kcp](https://github.com/skywind3000/kcp) — 原版KCP协议实现
-- [mimalloc-rust](https://github.com/purpleprotocol/mimalloc_rust) — Rust内存分配器
 - [dashmap](https://github.com/xacrimon/dashmap) — 高效的并发 map
 - [bytes](https://github.com/tokio-rs/bytes) — 字节处理工具库
 - [tokio](https://github.com/tokio-rs/tokio) — 异步运行时

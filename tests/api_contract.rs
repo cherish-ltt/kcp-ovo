@@ -13,6 +13,10 @@ use kcp_ovo::helper::{KcpPacket, KcpPacketHeader};
 use kcp_ovo::queue::{KcpDeque, Segment};
 use kcp_ovo::{KcpCmd, KcpConfig, KcpError};
 
+// 集成测试作为下游 crate，必须能够自行选择全局分配器。
+#[global_allocator]
+static ALLOCATOR: std::alloc::System = std::alloc::System;
+
 // ===== 错误类型 =====
 
 /// 每个错误变体都能映射到独立的分类
