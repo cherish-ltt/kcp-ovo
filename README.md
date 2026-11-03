@@ -69,7 +69,7 @@ Stream 的发送接口成功表示数据已进入本地队列，并非对端已�
 
 ```toml
 [dependencies]
-kcp-ovo = "0.5"
+kcp-ovo = "0.5.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -276,13 +276,13 @@ Rust 默认分配器。需要 mimalloc 等分配器的应用应自行添加依�
 
 ```toml
 # 默认配置（包含Stream API）
-kcp-ovo = "0.5"
+kcp-ovo = "0.5.1"
 
 # 仅使用底层API
-kcp-ovo = { version = "0.5", default-features = false }
+kcp-ovo = { version = "0.5.1", default-features = false }
 
 # 显式启用Stream API
-kcp-ovo = { version = "0.5", features = ["stream"] }
+kcp-ovo = { version = "0.5.1", features = ["stream"] }
 ```
 
 ## 🧪 测试
