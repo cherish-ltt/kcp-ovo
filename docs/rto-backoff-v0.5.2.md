@@ -75,3 +75,12 @@ Cargo 二进制仍因依赖目录工具链选择而出现 `E0514` 编译器不�
 最终负对照明确固定 Rust/Cargo 1.99.1、独立输出目录并禁用编译包装器，实际执行后
 得到四项预期失败。正式全量检查同样绕过包装器，使用独立的项目构建目录。
 稳定版 rustfmt 对既有两个 nightly 配置项有提示，未修改格式规则或压制检查。
+
+版本更新后的 `cargo check --offline --workspace --all-features` 通过，锁文件仅改变本包版本。
+`cargo doc --locked --no-deps --all-features` 生成成功，但既有 `src/stream.rs` 文档中的
+`Vec<u8>` 未加代码标记，触发 `unclosed HTML tag` 警告；本次未修改该接口。
+首次发布预演因本机 crates.io 源替换要求显式指定 registry 而退出，随后
+`cargo publish --dry-run --locked --registry crates-io` 完成打包和编译校验，没有实际上传。
+它提示锁定的 `chacha20 0.10.0` 已被撤回；`cargo tree --edges normal -i chacha20`
+无依赖路径，反向完整树仅经 proptest/rand 开发依赖进入。本次未将其认定为可利用漏洞，
+也未扩展升级依赖。
