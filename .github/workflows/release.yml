@@ -50,6 +50,9 @@ jobs:
       - name: 运行测试
         run: cargo test --workspace --all-features
 
+      - name: 检查无默认 feature 的下游分配器兼容性
+        run: cargo test --locked --no-default-features --test api_contract
+
   release:
     name: 创建 GitHub Release
     needs: verify

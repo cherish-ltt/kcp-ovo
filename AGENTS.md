@@ -403,6 +403,7 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-41 | RTT 方差只累加不衰减 | 重传时序 | 有界抖动下 RTO 持续增长 | `kcp.rs::parse_ack` |
 | BUG-42 | 快速重传按累计 una 而非较高 ACK 计数 | 重传时序 | 乱序 ACK 无法提前恢复丢失的段 | `kcp.rs::input`、`parse_fastack` |
 | BUG-29 | 空闲刷新驱动拥塞窗口增长 | 拥塞控制 | 无确认时窗口持续增长，最终整数溢出 | `kcp.rs::input` 的确认推进分支 |
+| BUG-45 | 库无条件声明全局 mimalloc | 库集成 | 下游自选全局分配器时编译失败，关闭默认 feature 也无法避开 | `src/lib.rs`、`Cargo.toml` 移除分配器声明和依赖 |
 
 其中 BUG-9、BUG-10、BUG-18、BUG-19、BUG-24、BUG-25、BUG-27 属于「线上会永久卡死、
 panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-26 属于「不丢数据但
@@ -508,6 +509,7 @@ panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-2
 | BUG-30 | `check_deadline_executes_due_retransmission`、`pending_ack_is_not_delayed_until_zero_window_probe` | `tests/timing.rs` |
 | BUG-32 | `cancelled_output_retains_callback_and_pending_ack`、`cancelled_batch_keeps_successful_segment_state` | `tests/timing.rs` |
 | BUG-29 | `idle_updates_do_not_grow_congestion_window`、`congestion_window_grows_only_on_new_confirmation_and_stays_bounded` | `tests/congestion.rs` |
+| BUG-45 | 集成测试 crate 显式声明 System 全局分配器，默认与无默认 feature 均须编译通过 | `tests/api_contract.rs`、Rust CI 与 Release 工作流 |
 
 #### 三、维护规则
 
@@ -595,3 +597,9 @@ README 的 Echo 代码与 `examples/echo-server.rs`、`examples/echo-client.rs` 
 `udp_chaos::sustained_loopback_load_is_byte_exact` 覆盖 1/8/20 客户端持续回显、精确内容与会话隔离，并输出吞吐及 RTT 分位数。固定种子用于载荷，不代表操作系统调度时间确定；性能无可靠 SLO 时只作观测，不设置任意速度阈值。测量前须暖机，失败与超时不得计入成功数据，后台任务必须清理。
 
 本轮测试矩阵、命令、实测结果及覆盖率工具限制见 `docs/blackbox-2026-11-03.md`。
+
+### 10.8 全局分配器由应用选择
+
+库不得声明 `#[global_allocator]` 或通过默认 feature 隐式选择全局分配器。
+`tests/api_contract.rs` 作为下游 crate 显式使用 System，编译阶段即验证分配器可组合性；
+CI 与发布校验必须覆盖全 feature 和 `--no-default-features` 两种配置。
