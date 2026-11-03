@@ -786,8 +786,7 @@ impl Kcp {
         let mut sends = Vec::new();
         let mut need_update = Vec::new();
 
-        // 非 nodelay 模式下首传要额外等待 rtomin 再重传（C 原版行为）：
-        // 给 Nagle 式的聚合留出余量，避免刚发出就判定超时。
+        // 普通模式仅在首次重传期限中保留额外余量，后续期限由退避后的 RTO 决定。
         let rtomin = if self.nodelay { 0 } else { (self.rx_rto / 8).max(1) };
 
         for (idx, seg) in self.snd_buf.iter().enumerate() {
@@ -816,19 +815,12 @@ impl Kcp {
                         "Connection lost due to too many retransmissions".to_string(),
                     ));
                 }
-                // C 原版：nodelay 模式退避翻倍，普通模式跟随实测 RTT 取较大者
                 let new_rto = if self.nodelay {
-                    (seg.rto * 2).min(IKCP_RTO_MAX)
+                    seg.rto.saturating_add(seg.rto / 2).min(IKCP_RTO_MAX)
                 } else {
-                    seg.rto.max(self.rx_rto).min(IKCP_RTO_MAX)
+                    seg.rto.saturating_add(seg.rto.max(self.rx_rto)).min(IKCP_RTO_MAX)
                 };
-                need_update.push((
-                    idx,
-                    seg.xmit + 1,
-                    current.wrapping_add(seg.rto).wrapping_add(rtomin),
-                    new_rto,
-                    true,
-                ));
+                need_update.push((idx, seg.xmit + 1, current.wrapping_add(new_rto), new_rto, true));
                 sends.push((
                     seg.kcp_packet.header.frg,
                     seg.kcp_packet.header.sn,

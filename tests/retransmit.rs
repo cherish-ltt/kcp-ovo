@@ -6,9 +6,181 @@
 
 mod common;
 
+use common::stress::{Sink, control_packet, transfer_a_to_b};
 use common::{Net, Rng, Sim, Solo, assert_same};
 use kcp_ovo::KcpConfig;
 use kcp_ovo::core::kcp::Kcp;
+use kcp_ovo::helper::{IKCP_RTO_MAX, KcpCmd};
+
+async fn assert_timeout_schedule(nodelay: bool, schedule: &[(u64, u64)]) {
+    for start in [0, u64::from(u32::MAX) - 100, u64::MAX - 100] {
+        let mut sink = Sink::new(KcpConfig { nodelay, interval: 1, ..KcpConfig::default() });
+        sink.kcp.borrow_mut().input(&control_packet(1, KcpCmd::Wins, 128)).unwrap();
+        sink.kcp.borrow_mut().send(b"lost").unwrap();
+        let mut now = start;
+        for (index, &(rto, deadline)) in schedule.iter().enumerate() {
+            let deadline = start.wrapping_add(deadline);
+            sink.update(now).await.unwrap();
+            assert_eq!(sink.count_cmd(KcpCmd::Push), 1);
+            sink.clear();
+            {
+                let kcp = sink.kcp.borrow();
+                let seg = kcp.snd_buf.front().unwrap();
+                assert_eq!((seg.rto, seg.resendts), (rto, deadline), "retry={index}");
+                assert_eq!(seg.xmit, index as u32 + 1);
+            }
+            sink.update(deadline.wrapping_sub(1)).await.unwrap();
+            assert_eq!(sink.count_cmd(KcpCmd::Push), 0, "early retry={index}");
+            assert_eq!(sink.kcp.borrow().check(deadline.wrapping_sub(1)), deadline);
+            now = deadline;
+        }
+    }
+}
+
+#[tokio::test]
+async fn normal_timeout_backoff_uses_new_deadline() {
+    assert_timeout_schedule(
+        false,
+        &[(200, 225), (400, 625), (800, 1425), (1600, 3025), (3200, 6225), (6400, 12625)],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fast_timeout_backoff_uses_new_deadline() {
+    assert_timeout_schedule(
+        true,
+        &[(200, 200), (300, 500), (450, 950), (675, 1625), (1012, 2637), (1518, 4155)],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn timeout_backoff_is_bounded_and_obeys_dead_link() {
+    for nodelay in [false, true] {
+        for (old_rto, measured_rto) in [(200, 1000), (IKCP_RTO_MAX - 1, 200), (u64::MAX, 200)] {
+            let mut sink = Sink::new(KcpConfig { nodelay, interval: 1, ..KcpConfig::default() });
+            sink.kcp.borrow_mut().input(&control_packet(1, KcpCmd::Wins, 128)).unwrap();
+            sink.kcp.borrow_mut().send(b"lost").unwrap();
+            sink.update(0).await.unwrap();
+            let mut now = {
+                let mut kcp = sink.kcp.borrow_mut();
+                kcp.dead_link = 3;
+                kcp.rx_rto = measured_rto;
+                let seg = kcp.snd_buf.front_mut().unwrap();
+                seg.rto = old_rto;
+                seg.resendts
+            };
+            let mut expected = old_rto;
+            for xmit in 2..=3 {
+                expected = if expected >= IKCP_RTO_MAX - 1 {
+                    IKCP_RTO_MAX
+                } else if nodelay {
+                    expected + expected / 2
+                } else {
+                    expected + expected.max(measured_rto)
+                };
+                sink.clear();
+                sink.update(now).await.unwrap();
+                assert_eq!(sink.count_cmd(KcpCmd::Push), 1);
+                let kcp = sink.kcp.borrow();
+                let seg = kcp.snd_buf.front().unwrap();
+                assert_eq!((seg.rto, seg.resendts, seg.xmit), (expected, now + expected, xmit));
+                now = seg.resendts;
+            }
+            sink.clear();
+            let error = sink.update(now).await.unwrap_err();
+            assert!(error.to_string().contains("retransmissions"));
+            assert_eq!(sink.count_cmd(KcpCmd::Push), 0);
+            assert_eq!(sink.kcp.borrow().snd_buf.front().unwrap().xmit, 3);
+        }
+    }
+}
+
+#[tokio::test]
+async fn timeout_and_fastack_are_exclusive_and_ack_recovery_preserves_rtt() {
+    for nodelay in [false, true] {
+        for timeout in [false, true] {
+            let cfg = KcpConfig { nodelay, interval: 1, fastresend: 2, ..KcpConfig::default() };
+            let mut sender = Sink::new(cfg.clone());
+            let mut receiver = Sink::new(cfg);
+            sender.kcp.borrow_mut().input(&control_packet(1, KcpCmd::Wins, 128)).unwrap();
+            sender.kcp.borrow_mut().send(b"lost").unwrap();
+            sender.update(0).await.unwrap();
+            let at = {
+                let mut kcp = sender.kcp.borrow_mut();
+                let seg = kcp.snd_buf.front_mut().unwrap();
+                seg.fastack = 2;
+                if timeout { seg.resendts } else { 20 }
+            };
+            sender.clear();
+            sender.update(at).await.unwrap();
+            assert_eq!(sender.count_cmd(KcpCmd::Push), 1);
+            {
+                let kcp = sender.kcp.borrow();
+                let seg = kcp.snd_buf.front().unwrap();
+                let rto = if !timeout {
+                    200
+                } else if nodelay {
+                    300
+                } else {
+                    400
+                };
+                assert_eq!((seg.xmit, seg.fastack, seg.rto, seg.resendts), (2, 0, rto, at + rto));
+            }
+            receiver.kcp.borrow_mut().input(&sender.emitted()[0]).unwrap();
+            assert_eq!(&receiver.kcp.borrow_mut().recv().unwrap()[..], b"lost");
+            receiver.update(at + 10).await.unwrap();
+            sender.update(at + 10).await.unwrap();
+            for ack in receiver.emitted() {
+                sender.kcp.borrow_mut().input(&ack).unwrap();
+            }
+            {
+                let kcp = sender.kcp.borrow();
+                assert_eq!(kcp.waitsnd(), 0);
+                assert_eq!((kcp.rx_srtt, kcp.rx_rttval, kcp.rx_rto), (0, 0, 200));
+            }
+            sender.clear();
+            receiver.clear();
+            sender.kcp.borrow_mut().send(b"fresh").unwrap();
+            sender.update(at + 11).await.unwrap();
+            assert_eq!(sender.kcp.borrow().snd_buf.front().unwrap().rto, 200);
+            receiver.kcp.borrow_mut().input(&sender.emitted()[0]).unwrap();
+            assert_eq!(&receiver.kcp.borrow_mut().recv().unwrap()[..], b"fresh");
+            receiver.update(at + 21).await.unwrap();
+            sender.update(at + 21).await.unwrap();
+            for ack in receiver.emitted() {
+                sender.kcp.borrow_mut().input(&ack).unwrap();
+            }
+            assert_eq!(sender.kcp.borrow().waitsnd(), 0);
+            assert_eq!(sender.kcp.borrow().rx_srtt, 10);
+        }
+    }
+}
+
+#[tokio::test]
+async fn backoff_modes_deliver_on_clean_burst_and_blackout_links() {
+    let payload = Rng::new(0x38).bytes(1024 * 1024);
+    for nodelay in [false, true] {
+        for (name, net) in [
+            ("clean", Net::default()),
+            ("burst", Net::default().with_burst(0.03, 0.5)),
+            ("blackout", Net::default().with_blackout(0, 3000)),
+        ] {
+            let cfg = KcpConfig { nodelay, interval: 10, ..KcpConfig::stream_mode() };
+            let mut sim = Sim::new(cfg, net, 0x38);
+            let (ok, got, ticks) = transfer_a_to_b(&mut sim, &payload, 120_000).await;
+            assert!(ok, "nodelay={nodelay} link={name} stalled after {ticks} ticks");
+            assert_same(&got, &payload);
+            assert_eq!(sim.a.borrow().waitsnd(), 0);
+            println!(
+                "nodelay={nodelay} link={name} bytes={} ticks={ticks} output_packets={}",
+                got.len(),
+                sim.a.borrow().xmit + sim.b.borrow().xmit
+            );
+        }
+    }
+}
 
 /// 单个段持续丢失时，应通过快速重传补齐，而不是等到 RTO
 ///

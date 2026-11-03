@@ -21,12 +21,13 @@ pub struct KcpConfig {
 
     /// 是否启用无延迟模式
     ///
-    /// - `true`：最小 RTO 取 30ms（`IKCP_RTO_NDL`），首传不额外等待，
-    ///   超时重传按 RTO 翻倍退避
-    /// - `false`：最小 RTO 取 100ms（`IKCP_RTO_MIN`），首传额外等待 `rto/8`
-    ///   给数据聚合留余量，超时重传取实测 RTT 与当前 RTO 的较大者
+    /// - `true`：最小 RTO 取 30ms（`IKCP_RTO_NDL`），首次重传期限不加余量，
+    ///   超时后段 RTO 增加自身的一半（整数除法）。
+    /// - `false`：最小 RTO 取 100ms（`IKCP_RTO_MIN`），首次重传期限增加
+    ///   `max(rx_rto/8, 1)` 毫秒余量，超时后段 RTO 增加 `max(rto, rx_rto)`。
     ///
-    /// 默认为 `false`。它与 `interval` 一起决定连接的实际往返延迟下界。
+    /// 两种模式均将退避后的 RTO 限制为 60 秒，并用新值计算下一次超时期限。
+    /// 默认为 `false`；发送与确认仍需调用方驱动 `update`，不保证立即输出或固定延迟。
     pub nodelay: bool,
 
     /// 快速重传模式
