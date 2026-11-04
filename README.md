@@ -14,7 +14,7 @@
     <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license"/>
   </a>
   <a href="https://www.rust-lang.org">
-    <img src="https://img.shields.io/badge/rust-1.95.0+-orange.svg" alt="rustc"/>
+    <img src="https://img.shields.io/badge/rust-1.99.1+-orange.svg" alt="rustc"/>
   </a>
 </p>
 </div>
@@ -69,7 +69,7 @@ Stream 的发送接口成功表示数据已进入本地队列，并非对端已�
 
 ```toml
 [dependencies]
-kcp-ovo = "0.5.2"
+kcp-ovo = "0.6.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -126,8 +126,12 @@ cargo bench --bench kcp-transfer -- --save-baseline before-core-perf
 cargo bench --bench kcp-transfer -- --baseline before-core-perf
 ```
 
-2026-11-04 的基线、多轮复测与改动边界见 [核心优化记录](docs/core-perf-2026-11-04.md)。
-当前复测存在系统负载漂移，80% 丢包场景未排除回退，不将单轮结果作为全场景提速结论。
+v0.6.0 减少输入解析与单段接收的复制、flush 临时分配和 ACK 重复扫描，
+默认 MTU 下每个实例省去一块未使用的 4284 B 缓冲。
+0% 丢包场景相对原基线的三轮复测耗时降低 8.31%–19.53%；
+20% 丢包场景在隔离新旧版本的两轮对照中分别降低 18.26% 和 24.25%。
+完整数据、测量范围与方法见 [核心优化记录](docs/core-perf-2026-11-04.md)，
+升级说明见 [v0.6.0 发布说明](.version/RELEASE-v0.6.0.md)。
 基线保存在 `target/criterion/`，对比前不要清理该目录；旧版虚拟耗时结果不可混用。
 
 ### 性能对比
@@ -298,13 +302,13 @@ Rust 默认分配器。需要 mimalloc 等分配器的应用应自行添加依�
 
 ```toml
 # 默认配置（包含Stream API）
-kcp-ovo = "0.5.2"
+kcp-ovo = "0.6.0"
 
 # 仅使用底层API
-kcp-ovo = { version = "0.5.2", default-features = false }
+kcp-ovo = { version = "0.6.0", default-features = false }
 
 # 显式启用Stream API
-kcp-ovo = { version = "0.5.2", features = ["stream"] }
+kcp-ovo = { version = "0.6.0", features = ["stream"] }
 ```
 
 ## 🧪 测试
