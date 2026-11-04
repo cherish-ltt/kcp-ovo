@@ -113,6 +113,23 @@ async fn main() -> kcp_ovo::KcpResult<()> {
 
 ## 📊 性能
 
+### 本地 CPU 处理成本对比
+
+`benches/kcp-transfer.rs` 使用 Criterion 真实耗时，固定载荷、随机种子和虚拟时钟，
+验证逐消息字节内容及发送队列排空。结果包含实例创建、仿真链路和校验开销，
+不是公网吞吐；不同丢包场景的数据量不同，只比较同一场景优化前后。
+
+```bash
+# 优化前保存基线；不要在优化后覆盖它
+cargo bench --bench kcp-transfer -- --save-baseline before-core-perf
+# 优化后与该基线比较
+cargo bench --bench kcp-transfer -- --baseline before-core-perf
+```
+
+2026-11-04 的基线、多轮复测与改动边界见 [核心优化记录](docs/core-perf-2026-11-04.md)。
+当前复测存在系统负载漂移，80% 丢包场景未排除回退，不将单轮结果作为全场景提速结论。
+基线保存在 `target/criterion/`，对比前不要清理该目录；旧版虚拟耗时结果不可混用。
+
 ### 性能对比
 
 | 指标 | TCP | KCP (默认) | KCP (快速模式) | 提升 |
@@ -343,12 +360,12 @@ cargo test test_stream_mode
 | `window.rs` | 收发窗口、零窗口、窗口通告、探测起步与退避上限、探测不挤占 ACK、长期零窗口后恢复 |
 | `lifecycle.rs` | 创建、更新、关闭、死链 |
 | `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付、队列满后的非阻塞恢复、取消接收、跨会话背压隔离、满额活跃会话保留、外来 conv 隔离、地址族与关闭回收 |
-| `api_contract.rs` | 公开 API 契约与错误类型；下游显式设置 System 全局分配器的编译兼容性 |
+| `api_contract.rs` | 公开 API 契约与错误类型；载荷所有权与共享、单段接收复用及窗口恢复、Send/Sync；下游显式设置 System 全局分配器的编译兼容性 |
 | `retransmit.rs` | 重传与死链判定、normal/fast 连续超时期限、退避上限与溢出、ACK/Karn 恢复、1 MiB 正常/成簇丢包/黑洞对照 |
 | `fuzz_transfer.rs` | 随机链路下 9 条协议不变式（字节精确、消息边界、窗口上限、断链恢复） |
 | `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、长度不符、未知命令、控制帧洪水、伪造 conv、畸形分片恢复；畸形 ACK 不丢待发消息，非法首包不绑定 conv |
 | `matrix.rs` | 配置组合矩阵：MTU × 窗口 × interval × fastresend × nodelay × 流模式；nodelay 语义（最小 RTO、首传重传期限） |
-| `timing.rs` | ACK 语义与时序：重复段补 ACK、取消安全、输出批次中途报错后数据与 ACK 重试、快速重传、探测退避、调度期限、确认边界与 RTT 方差收敛 |
+| `timing.rs` | ACK 语义与时序：重复段补 ACK、取消安全、输出批次中途报错后重试、整批死链检查、乱序队列复用与回绕、快速重传、探测退避、调度期限、确认边界与 RTT 方差收敛 |
 | `congestion.rs` | 拥塞窗口：确认驱动增长、空闲与上界、慢启动、AIMD 收缩、`fastresend=0` 开关、三模式吞吐 |
 | `soak.rs` | 规模与长跑：1MB~4MB 大流量、1000 轮长会话、SN 回绕（含双向跨回绕点、回绕叠加重传）、恶劣网络收敛、队列有界 |
 | `outage.rs` | 断网与恢复：黑洞期补发、多次闪断、双向恢复、长断网不静默丢数据 |

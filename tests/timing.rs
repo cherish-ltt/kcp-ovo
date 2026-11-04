@@ -11,6 +11,108 @@ use kcp_ovo::KcpConfig;
 use kcp_ovo::helper::KcpCmd;
 
 #[tokio::test]
+async fn reordered_receive_queue_preserves_messages_across_reuse_and_wrap() {
+    for start in [0u32, u32::MAX - 15] {
+        let mut sink = Sink::new(KcpConfig::fast_mode());
+        sink.kcp.borrow_mut().rcv_nxt = start;
+        for round in 0..70u32 {
+            let base = start.wrapping_add(round * 32);
+            for offset in (1..32u32).rev().chain([16, 31, 1, 0]) {
+                let sn = base.wrapping_add(offset);
+                sink.kcp.borrow_mut().input(&push_packet(1, sn, &sn.to_be_bytes())).unwrap();
+            }
+            {
+                let mut kcp = sink.kcp.borrow_mut();
+                assert_eq!(kcp.nrcv_buf, 0);
+                assert_eq!(kcp.nrcv_que, 32);
+                for offset in 0..32 {
+                    assert_eq!(&kcp.recv().unwrap()[..], &base.wrapping_add(offset).to_be_bytes());
+                }
+                assert_eq!(kcp.recv().unwrap_err(), kcp_ovo::KcpError::QueueEmpty);
+                assert_eq!(kcp.nrcv_que, 0);
+            }
+            sink.update(u64::from(round) * 20).await.unwrap();
+            assert_eq!(sink.count_cmd(KcpCmd::Ack), 35);
+            sink.clear();
+        }
+    }
+}
+
+#[tokio::test]
+async fn dead_link_rejects_entire_data_batch_before_output() {
+    let mut sink = Sink::new(KcpConfig::fast_mode());
+    sink.kcp.borrow_mut().input(&common::stress::control_packet(1, KcpCmd::Wins, 128)).unwrap();
+    for _ in 0..3 {
+        sink.kcp.borrow_mut().send(b"data").unwrap();
+    }
+    sink.update(0).await.unwrap();
+    sink.clear();
+    let before: Vec<_> = {
+        let mut kcp = sink.kcp.borrow_mut();
+        let dead_link = kcp.dead_link;
+        kcp.snd_buf.get_mut(2).unwrap().xmit = dead_link;
+        kcp.snd_buf.iter().map(|seg| (seg.xmit, seg.resendts, seg.rto)).collect()
+    };
+    assert!(sink.update(1000).await.is_err());
+    assert!(sink.emitted().is_empty());
+    let after: Vec<_> =
+        sink.kcp.borrow().snd_buf.iter().map(|seg| (seg.xmit, seg.resendts, seg.rto)).collect();
+    assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn ack_deduplication_handles_gaps_unsent_and_wrapped_sequences() {
+    use kcp_ovo::helper::{KcpPacket, KcpPacketHeader};
+
+    for start in [0u32, u32::MAX - 3] {
+        let mut sink = Sink::new(KcpConfig::fast_mode());
+        {
+            let mut kcp = sink.kcp.borrow_mut();
+            kcp.snd_una = start;
+            kcp.snd_nxt = start;
+            kcp.input(&common::stress::control_packet(1, KcpCmd::Wins, 128)).unwrap();
+            for _ in 0..8 {
+                kcp.send(b"data").unwrap();
+            }
+        }
+        sink.update(0).await.unwrap();
+        let mut kcp = sink.kcp.borrow_mut();
+        kcp.snd_buf.get_mut(7).unwrap().xmit = 0;
+        kcp.current = 10;
+        let mut acknowledged = [false; 8];
+        let mut expected = [0u32; 8];
+        for offset in [7u32, 8, 4, 4, 2, 6, 3, 6, 5, 1, 0] {
+            let header = KcpPacketHeader::new(
+                1,
+                KcpCmd::Ack,
+                0,
+                128,
+                0,
+                start.wrapping_add(offset),
+                start,
+                0,
+            );
+            let before = (kcp.rx_srtt, kcp.rx_rttval, kcp.rx_rto, kcp.ts_lastack);
+            kcp.input(&KcpPacket::new_without_data(header).to_bytes().unwrap()).unwrap();
+            if offset < 7 && !acknowledged[offset as usize] {
+                acknowledged[offset as usize] = true;
+                for idx in 0..8 {
+                    if acknowledged[idx] {
+                        expected[idx] = 0;
+                    } else if idx < offset as usize {
+                        expected[idx] += 1;
+                    }
+                }
+            } else {
+                assert_eq!((kcp.rx_srtt, kcp.rx_rttval, kcp.rx_rto, kcp.ts_lastack), before);
+            }
+            assert_eq!(kcp.snd_buf.iter().map(|seg| seg.fastack).collect::<Vec<_>>(), expected);
+            assert_eq!(kcp.waitsnd(), 8);
+        }
+    }
+}
+
+#[tokio::test]
 async fn output_error_mid_batch_recovers_data_and_acknowledgements() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};

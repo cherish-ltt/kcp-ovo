@@ -170,6 +170,10 @@ impl KcpDeque {
         self.inner.get_mut(index)
     }
 
+    pub(crate) fn insert(&mut self, index: usize, seg: Segment) {
+        self.inner.insert(index, seg);
+    }
+
     /// 保留满足条件的元素，移除不满足的
     ///
     /// 原地过滤，避免为每次调用分配临时 Vec。
