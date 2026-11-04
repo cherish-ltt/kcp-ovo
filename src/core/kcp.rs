@@ -139,15 +139,6 @@ pub struct Kcp {
     /// ACK 列表（待发送的确认序列号）
     acklist: VecDeque<u32>,
     acknowledged: HashSet<u32>,
-    /// ACK 列表容量（预留）
-    #[allow(dead_code)]
-    ackblock: usize,
-
-    // 用户数据 / 缓冲区
-    #[allow(dead_code)]
-    user_data: Option<Box<dyn std::any::Any>>,
-    #[allow(dead_code)]
-    buffer: Vec<u8>,
 
     /// 快速重传：重复 ACK 达到此次数则立即重传（0 = 禁用）
     pub fastresend: i32,
@@ -165,9 +156,6 @@ pub struct Kcp {
     /// 日志回调
     writelog: Option<LogCallback>,
 }
-
-unsafe impl Send for Kcp {}
-unsafe impl Sync for Kcp {}
 
 impl Kcp {
     /// 创建新的 KCP 控制块
@@ -244,9 +232,6 @@ impl Kcp {
             rcv_buf: KcpDeque::new(),
             acklist: VecDeque::with_capacity(16),
             acknowledged: HashSet::new(),
-            ackblock: 16,
-            user_data: None,
-            buffer: vec![0u8; (mtu as usize + IKCP_OVERHEAD) * 3],
             fastresend: config.fastresend,
             fastlimit: IKCP_FASTACK_LIMIT,
             nocwnd: config.nocwnd,
@@ -464,10 +449,19 @@ impl Kcp {
             },
             result => result?,
         };
+        if self.rcv_queue.len() == 1 {
+            let seg = self.rcv_queue.pop_front().unwrap();
+            self.nrcv_que -= 1;
+            self.move_rcv_buf_and_probe();
+            if !self.stream_mode && seg.kcp_packet.data.len() != peeksize {
+                return Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr));
+            }
+            return Ok(seg.kcp_packet.data);
+        }
         let mut buf = BytesMut::with_capacity(peeksize);
         // 流模式读取所有 segment，非流模式读取到 frg==0
         while let Some(seg) = self.rcv_queue.pop_front() {
-            buf.extend_from_slice(&seg.get_data());
+            buf.extend_from_slice(&seg.kcp_packet.data);
             self.nrcv_que -= 1;
             if !self.stream_mode && seg.kcp_packet.header.frg == 0 {
                 break;
@@ -489,9 +483,9 @@ impl Kcp {
         if data.len() < IKCP_OVERHEAD {
             return Err(KcpError::IncompleteData(IncompleteDataType::Header));
         }
-        let mut buf = Bytes::copy_from_slice(data);
+        let mut buf = data;
         // 解析头部
-        let (header, buf) = KcpPacketHeader::from_bytes(&mut buf)?;
+        let header = KcpPacketHeader::read_from(&mut buf)?;
         if buf.len() < header.len as usize {
             return Err(KcpError::IncompleteData(IncompleteDataType::Payload));
         }
@@ -513,13 +507,8 @@ impl Kcp {
         // 根据命令类型处理
         match header.cmd {
             KcpCmd::Ack => {
-                if self
-                    .snd_buf
-                    .iter()
-                    .any(|seg| seg.kcp_packet.header.sn == header.sn && seg.xmit > 0)
-                    && self.acknowledged.insert(header.sn)
-                {
-                    self.parse_ack(header.sn);
+                if !self.acknowledged.contains(&header.sn) && self.parse_ack(header.sn) {
+                    self.acknowledged.insert(header.sn);
                     self.parse_fastack(header.sn);
                 }
                 if let Some(ref writelog) = self.writelog {
@@ -543,7 +532,7 @@ impl Kcp {
                     }
                 }
 
-                let newseg = Segment::new_with_header_and_data(header, &buf)?;
+                let newseg = Segment::new_with_header_and_data(header, buf)?;
                 self.parse_data(newseg);
                 self.move_rcv_buf_to_queue();
             },
@@ -609,12 +598,14 @@ impl Kcp {
     ///
     /// 只负责 RTT/RTO 估计，不推进确认、不删除 `snd_buf`；
     /// 确认的唯一驱动者是包头携带的 `una`（见 `parse_una`）。
-    fn parse_ack(&mut self, sn: u32) {
+    fn parse_ack(&mut self, sn: u32) -> bool {
         let current = self.current;
         let mut rtt_update = None;
+        let mut sent = false;
         for seg in self.snd_buf.iter() {
             // 必须精确匹配：snd_buf 按 SN 升序，用 `>= 0` 会让 RTT 永远取首段
             if self.timediff_u32(sn, seg.kcp_packet.header.sn) == 0 {
+                sent = seg.xmit > 0;
                 // Karn 算法：重传段的 ts 仍是首传时刻，采样会把重传等待时间
                 // 算进 RTT，使 rttval 膨胀、RTO 迅速退避到几十秒。
                 if seg.xmit == 1 {
@@ -641,18 +632,23 @@ impl Kcp {
                 .max(self.rx_minrto)
                 .min(IKCP_RTO_MAX);
         }
-        self.ts_lastack = current;
+        if sent {
+            self.ts_lastack = current;
+        }
+        sent
     }
 
     /// 根据更高的 ACK 序列号增加前序段的快速重传计数。
     fn parse_fastack(&mut self, sn: u32) {
         for seg in self.snd_buf.iter_mut() {
+            let diff = (sn as i32).wrapping_sub(seg.kcp_packet.header.sn as i32);
+            // snd_buf 按回绕序排列；更高段不受本次 ACK 影响，已确认段的计数已清零。
+            if diff < 0 {
+                break;
+            }
             if self.acknowledged.contains(&seg.kcp_packet.header.sn) {
                 seg.fastack = 0;
-            } else if (sn as i32).wrapping_sub(seg.kcp_packet.header.sn as i32) > 0
-                && seg.xmit > 0
-                && seg.fastack < 255
-            {
+            } else if diff > 0 && seg.xmit > 0 && seg.fastack < 255 {
                 seg.fastack += 1;
             }
         }
@@ -663,28 +659,18 @@ impl Kcp {
         if self.nrcv_buf >= self.rcv_wnd as usize {
             return;
         }
-        for seg in self.rcv_buf.iter() {
-            if seg.kcp_packet.header.sn == newseg.kcp_packet.header.sn {
+        let mut insert_pos = 0;
+        for (idx, seg) in self.rcv_buf.iter().enumerate().rev() {
+            let diff = self.timediff_u32(newseg.kcp_packet.header.sn, seg.kcp_packet.header.sn);
+            if diff == 0 {
                 return;
             }
+            if diff > 0 {
+                insert_pos = idx + 1;
+                break;
+            }
         }
-        let insert_pos = self
-            .rcv_buf
-            .iter()
-            .position(|seg| {
-                self.timediff_u32(newseg.kcp_packet.header.sn, seg.kcp_packet.header.sn) < 0
-            })
-            .unwrap_or(self.rcv_buf.len());
-
-        // Drain tail after insert_pos, push new, then push tail back
-        let mut tail = Vec::new();
-        for _ in insert_pos..self.rcv_buf.len() {
-            tail.push(self.rcv_buf.pop_back().unwrap());
-        }
-        self.rcv_buf.push_back(newseg);
-        for seg in tail.into_iter().rev() {
-            self.rcv_buf.push_back(seg);
-        }
+        self.rcv_buf.insert(insert_pos, newseg);
         self.nrcv_buf += 1;
     }
 
@@ -783,103 +769,60 @@ impl Kcp {
         }
 
         let current = self.current;
-        let mut sends = Vec::new();
-        let mut need_update = Vec::new();
+
+        // 整批死链校验必须先于数据输出，避免错误发生前发送部分批次。
+        if self.snd_buf.iter().any(|seg| {
+            seg.xmit > 0
+                && seg.xmit >= self.dead_link
+                && ((current as i32).wrapping_sub(seg.resendts as i32) >= 0
+                    || (self.fastresend > 0 && seg.fastack >= self.fastresend as u32))
+        }) {
+            return Err(KcpError::IoError(
+                "Connection lost due to too many retransmissions".to_string(),
+            ));
+        }
 
         // 普通模式仅在首次重传期限中保留额外余量，后续期限由退避后的 RTO 决定。
         let rtomin = if self.nodelay { 0 } else { (self.rx_rto / 8).max(1) };
 
-        for (idx, seg) in self.snd_buf.iter().enumerate() {
-            if seg.xmit == 0 {
-                need_update.push((
-                    idx,
-                    1,
-                    current.wrapping_add(seg.rto).wrapping_add(rtomin),
-                    seg.rto,
-                    false,
-                ));
-                sends.push((
-                    seg.kcp_packet.header.frg,
-                    seg.kcp_packet.header.sn,
-                    seg.kcp_packet.header.ts,
-                    seg.kcp_packet.header.una,
-                    seg.kcp_packet.header.wnd,
-                    seg.get_data(),
-                ));
-                continue;
-            }
-            // 两个重传条件必须互斥：超时重传优先，否则同一段会被推入 sends 两次
-            if (current as i32).wrapping_sub(seg.resendts as i32) >= 0 {
-                if seg.xmit >= self.dead_link {
-                    return Err(KcpError::IoError(
-                        "Connection lost due to too many retransmissions".to_string(),
-                    ));
-                }
+        for idx in 0..self.snd_buf.len() {
+            let seg = self.snd_buf.get_mut(idx).unwrap();
+            let (xmit, resendts, rto, is_lost) = if seg.xmit == 0 {
+                (1, current.wrapping_add(seg.rto).wrapping_add(rtomin), seg.rto, false)
+            // 两个重传条件必须互斥：超时重传优先，同一段每轮最多发送一次。
+            } else if (current as i32).wrapping_sub(seg.resendts as i32) >= 0 {
                 let new_rto = if self.nodelay {
                     seg.rto.saturating_add(seg.rto / 2).min(IKCP_RTO_MAX)
                 } else {
                     seg.rto.saturating_add(seg.rto.max(self.rx_rto)).min(IKCP_RTO_MAX)
                 };
-                need_update.push((idx, seg.xmit + 1, current.wrapping_add(new_rto), new_rto, true));
-                sends.push((
-                    seg.kcp_packet.header.frg,
-                    seg.kcp_packet.header.sn,
-                    seg.kcp_packet.header.ts,
-                    seg.kcp_packet.header.una,
-                    seg.kcp_packet.header.wnd,
-                    seg.get_data(),
-                ));
+                (seg.xmit + 1, current.wrapping_add(new_rto), new_rto, true)
             // fastresend == 0 表示关闭快速重传（normal_mode 的默认值）。
             // 若不判 0，`fastack >= 0` 恒真，每个在途段每轮都被当作丢包重发，
             // 并把 is_lost 置位，使 cwnd 每轮都被砸回 1。
             } else if self.fastresend > 0 && seg.fastack >= self.fastresend as u32 {
-                if seg.xmit >= self.dead_link {
-                    return Err(KcpError::IoError(
-                        "Connection lost due to too many retransmissions".to_string(),
-                    ));
-                }
-                need_update.push((idx, seg.xmit + 1, current.wrapping_add(seg.rto), seg.rto, true));
-                sends.push((
-                    seg.kcp_packet.header.frg,
-                    seg.kcp_packet.header.sn,
-                    seg.kcp_packet.header.ts,
-                    seg.kcp_packet.header.una,
-                    seg.kcp_packet.header.wnd,
-                    seg.get_data(),
-                ));
+                (seg.xmit + 1, current.wrapping_add(seg.rto), seg.rto, true)
+            } else {
+                continue;
+            };
+            let mut packet = seg.kcp_packet.clone();
+            packet.header.conv = self.conv;
+            packet.header.cmd = KcpCmd::Push;
+            packet.header.len = packet.data.len() as u32;
+            self.send_packet(packet).await?;
+            // await 取消或报错时保留原状态，只提交已成功输出的段。
+            let seg = self.snd_buf.get_mut(idx).unwrap();
+            seg.xmit = xmit;
+            seg.resendts = resendts;
+            seg.rto = rto;
+            if is_lost {
+                seg.fastack = 0;
             }
-        }
-
-        for ((frg, sn, ts, una, wnd, data), (idx, xmit, resendts, rto, is_lost)) in
-            sends.into_iter().zip(need_update)
-        {
-            self.send_packet(KcpPacket::new_with_data(
-                KcpPacketHeader::new(
-                    self.conv,
-                    KcpCmd::Push,
-                    frg,
-                    wnd,
-                    ts,
-                    sn,
-                    una,
-                    data.len() as u32,
-                ),
-                data,
-            ))
-            .await?;
-            if let Some(seg) = self.snd_buf.get_mut(idx) {
-                seg.xmit = xmit;
-                seg.resendts = resendts;
-                seg.rto = rto;
-                if is_lost {
-                    seg.fastack = 0;
-                }
-                if is_lost && !lost {
-                    lost = true;
-                    self.ssthresh = (self.cwnd as u32 / 2).max(IKCP_THRESH_MIN);
-                    self.cwnd = 1;
-                    self.incr = 0;
-                }
+            if is_lost && !lost {
+                lost = true;
+                self.ssthresh = (self.cwnd as u32 / 2).max(IKCP_THRESH_MIN);
+                self.cwnd = 1;
+                self.incr = 0;
             }
         }
 

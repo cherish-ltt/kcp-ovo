@@ -605,3 +605,12 @@ README 的 Echo 代码与 `examples/echo-server.rs`、`examples/echo-client.rs` 
 库不得声明 `#[global_allocator]` 或通过默认 feature 隐式选择全局分配器。
 `tests/api_contract.rs` 作为下游 crate 显式使用 System，编译阶段即验证分配器可组合性；
 CI 与发布校验必须覆盖全 feature 和 `--no-default-features` 两种配置。
+
+### 10.9 核心性能验证约束
+
+- CPU 处理成本用 Criterion 的真实耗时衡量，不把虚拟协议时长混入测量值；仿真固定输入与随机种子，数据不完整或未确认完毕必须失败。
+- 优化前先固定 bench 并保存命名基线，优化后比较同一工作负载；不得拿不同丢包档位的数据量或旧版虚拟时间报告比较速度。
+- 新旧源码并存对照时必须使用独立 target 目录并核验二进制，防止复用错误构建产物；保留负向结果与环境漂移记录，不以单轮显著性证明跨轮稳定收益。
+- 核心实例由单个任务独占驱动，未经并发证据不添加缓存行填充；公开 `Segment` 字段不借用高位存放隐藏状态，也不以破坏公开语义换取位掩码优化。
+- `timing::dead_link_rejects_entire_data_batch_before_output` 保证死链预检发生在数据输出前；逐段输出只在 await 成功后提交状态，取消安全测试必须保留。
+- `timing::ack_deduplication_handles_gaps_unsent_and_wrapped_sequences`、`timing::reordered_receive_queue_preserves_messages_across_reuse_and_wrap` 覆盖去重、乱序插入与回绕；`api_contract` 的共享载荷测试验证复制消除和所有权生命周期。

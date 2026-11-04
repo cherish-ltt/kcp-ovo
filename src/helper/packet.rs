@@ -52,14 +52,20 @@ impl KcpPacketHeader {
     ///
     /// # 参数
     ///
-    /// - `data`: 输入数据,至少需要24字节
+    /// - `data`: 输入数据,至少需要28字节
     ///
     /// # 返回
     ///
-    /// 返回解析后的头部和剩余数据
+    /// 返回解析后的头部和剩余数据；载荷共享输入存储，可能延长原分配的生命周期。
     #[inline]
     pub fn from_bytes(data: &mut Bytes) -> KcpResult<(Self, Bytes)> {
-        if data.len() < IKCP_OVERHEAD {
+        let header = Self::read_from(data)?;
+        Ok((header, data.clone()))
+    }
+
+    #[inline]
+    pub(crate) fn read_from(data: &mut impl Buf) -> KcpResult<Self> {
+        if data.remaining() < IKCP_OVERHEAD {
             return Err(KcpError::IncompleteData(IncompleteDataType::Header));
         }
 
@@ -81,9 +87,7 @@ impl KcpPacketHeader {
         let una = data.get_u32();
         let len = data.get_u32();
 
-        let header = Self { conv, cmd: KcpCmd::try_from(cmd)?, frg, wnd, ts, sn, una, len };
-
-        Ok((header, Bytes::copy_from_slice(data)))
+        Ok(Self { conv, cmd: KcpCmd::try_from(cmd)?, frg, wnd, ts, sn, una, len })
     }
 
     /// 编码头部到字节数组
@@ -140,6 +144,8 @@ impl KcpPacket {
     }
 
     /// 从字节数组解析完整数据包
+    ///
+    /// 载荷共享输入存储，不复制字节；输入推进到载荷起点，保留原有剩余数据。
     #[inline]
     pub fn from_bytes(data: &mut Bytes) -> KcpResult<Self> {
         let (header, payload) = KcpPacketHeader::from_bytes(data)?;
@@ -148,7 +154,7 @@ impl KcpPacket {
             return Err(KcpError::IncompleteData(IncompleteDataType::Payload));
         }
 
-        Ok(Self { header, data: Bytes::copy_from_slice(&payload[..header.len as usize]) })
+        Ok(Self { header, data: payload.slice(..header.len as usize) })
     }
 
     /// 编码完整数据包到字节数组
@@ -224,7 +230,7 @@ impl PacketBuilder {
     /// 设置数据载荷
     pub fn data(mut self, data: Vec<u8>) -> Self {
         self.header.len = data.len() as u32;
-        self.data = Bytes::copy_from_slice(&data);
+        self.data = Bytes::from(data);
         self
     }
 

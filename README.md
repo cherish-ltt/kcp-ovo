@@ -14,7 +14,7 @@
     <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license"/>
   </a>
   <a href="https://www.rust-lang.org">
-    <img src="https://img.shields.io/badge/rust-1.95.0+-orange.svg" alt="rustc"/>
+    <img src="https://img.shields.io/badge/rust-1.99.1+-orange.svg" alt="rustc"/>
   </a>
 </p>
 </div>
@@ -69,7 +69,7 @@ Stream 的发送接口成功表示数据已进入本地队列，并非对端已�
 
 ```toml
 [dependencies]
-kcp-ovo = "0.5.2"
+kcp-ovo = "0.6.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -112,6 +112,27 @@ async fn main() -> kcp_ovo::KcpResult<()> {
 底层类型路径为 `kcp_ovo::core::kcp::Kcp`。请运行 `cargo run --example low-level-api` 查看配置、输出回调和队列用法；实际通信还需接收 UDP 数据并调用 `input`，定期异步调用 `update`。底层 `KcpConfig::stream_mode()` 提供无消息边界的字节流，两端必须采用相同模式；高层 `KcpStream` 使用消息模式，与这个配置不是同一设置。
 
 ## 📊 性能
+
+### 本地 CPU 处理成本对比
+
+`benches/kcp-transfer.rs` 使用 Criterion 真实耗时，固定载荷、随机种子和虚拟时钟，
+验证逐消息字节内容及发送队列排空。结果包含实例创建、仿真链路和校验开销，
+不是公网吞吐；不同丢包场景的数据量不同，只比较同一场景优化前后。
+
+```bash
+# 优化前保存基线；不要在优化后覆盖它
+cargo bench --bench kcp-transfer -- --save-baseline before-core-perf
+# 优化后与该基线比较
+cargo bench --bench kcp-transfer -- --baseline before-core-perf
+```
+
+v0.6.0 减少输入解析与单段接收的复制、flush 临时分配和 ACK 重复扫描，
+默认 MTU 下每个实例省去一块未使用的 4284 B 缓冲。
+0% 丢包场景相对原基线的三轮复测耗时降低 8.31%–19.53%；
+20% 丢包场景在隔离新旧版本的两轮对照中分别降低 18.26% 和 24.25%。
+完整数据、测量范围与方法见 [核心优化记录](docs/core-perf-2026-11-04.md)，
+升级说明见 [v0.6.0 发布说明](.version/RELEASE-v0.6.0.md)。
+基线保存在 `target/criterion/`，对比前不要清理该目录；旧版虚拟耗时结果不可混用。
 
 ### 性能对比
 
@@ -281,13 +302,13 @@ Rust 默认分配器。需要 mimalloc 等分配器的应用应自行添加依�
 
 ```toml
 # 默认配置（包含Stream API）
-kcp-ovo = "0.5.2"
+kcp-ovo = "0.6.0"
 
 # 仅使用底层API
-kcp-ovo = { version = "0.5.2", default-features = false }
+kcp-ovo = { version = "0.6.0", default-features = false }
 
 # 显式启用Stream API
-kcp-ovo = { version = "0.5.2", features = ["stream"] }
+kcp-ovo = { version = "0.6.0", features = ["stream"] }
 ```
 
 ## 🧪 测试
@@ -343,12 +364,12 @@ cargo test test_stream_mode
 | `window.rs` | 收发窗口、零窗口、窗口通告、探测起步与退避上限、探测不挤占 ACK、长期零窗口后恢复 |
 | `lifecycle.rs` | 创建、更新、关闭、死链 |
 | `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付、队列满后的非阻塞恢复、取消接收、跨会话背压隔离、满额活跃会话保留、外来 conv 隔离、地址族与关闭回收 |
-| `api_contract.rs` | 公开 API 契约与错误类型；下游显式设置 System 全局分配器的编译兼容性 |
+| `api_contract.rs` | 公开 API 契约与错误类型；载荷所有权与共享、单段接收复用及窗口恢复、Send/Sync；下游显式设置 System 全局分配器的编译兼容性 |
 | `retransmit.rs` | 重传与死链判定、normal/fast 连续超时期限、退避上限与溢出、ACK/Karn 恢复、1 MiB 正常/成簇丢包/黑洞对照 |
 | `fuzz_transfer.rs` | 随机链路下 9 条协议不变式（字节精确、消息边界、窗口上限、断链恢复） |
 | `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、长度不符、未知命令、控制帧洪水、伪造 conv、畸形分片恢复；畸形 ACK 不丢待发消息，非法首包不绑定 conv |
 | `matrix.rs` | 配置组合矩阵：MTU × 窗口 × interval × fastresend × nodelay × 流模式；nodelay 语义（最小 RTO、首传重传期限） |
-| `timing.rs` | ACK 语义与时序：重复段补 ACK、取消安全、输出批次中途报错后数据与 ACK 重试、快速重传、探测退避、调度期限、确认边界与 RTT 方差收敛 |
+| `timing.rs` | ACK 语义与时序：重复段补 ACK、取消安全、输出批次中途报错后重试、整批死链检查、乱序队列复用与回绕、快速重传、探测退避、调度期限、确认边界与 RTT 方差收敛 |
 | `congestion.rs` | 拥塞窗口：确认驱动增长、空闲与上界、慢启动、AIMD 收缩、`fastresend=0` 开关、三模式吞吐 |
 | `soak.rs` | 规模与长跑：1MB~4MB 大流量、1000 轮长会话、SN 回绕（含双向跨回绕点、回绕叠加重传）、恶劣网络收敛、队列有界 |
 | `outage.rs` | 断网与恢复：黑洞期补发、多次闪断、双向恢复、长断网不静默丢数据 |

@@ -597,9 +597,16 @@ kcp.set_log(|msg, kcp| {
 
 ### 3. 性能测试
 
+v0.6.0 的核心基准使用真实耗时，固定输入并验证完整交付与确认排空。
+同一场景只比较优化前后，不能把不同载荷的丢包档位横向比较；结果包含仿真和校验开销。
+完整优化收益与测量数据见 [核心优化记录](core-perf-2026-11-04.md)。
+
 ```bash
-# 基准测试
-cargo bench
+# 优化前保存基线，优化后不要覆盖
+cargo bench --bench kcp-transfer -- --save-baseline before-core-perf
+
+# 优化后比较同一工作负载
+cargo bench --bench kcp-transfer -- --baseline before-core-perf
 
 # 性能分析
 cargo flamegraph --example stream-api

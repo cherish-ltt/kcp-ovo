@@ -170,6 +170,75 @@ fn packet_from_header_limits_payload_to_declared_length() {
     assert_eq!(&packet.data[..], b"A");
 }
 
+#[test]
+fn packet_parsing_shares_payload_and_preserves_remaining_input() {
+    let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 0, 0, 0, 4);
+    let encoded =
+        KcpPacket::new_with_data(header, Bytes::from_static(b"dataextra")).to_bytes().unwrap();
+    let mut input = encoded.clone();
+    let (parsed, rest) = KcpPacketHeader::from_bytes(&mut input).unwrap();
+    assert_eq!(parsed, header);
+    assert_eq!(&input[..], b"dataextra");
+    assert_eq!(rest.as_ptr(), encoded[28..].as_ptr());
+    drop(rest);
+    let packet = KcpPacket::from_bytes(&mut encoded.clone()).unwrap();
+    assert_eq!(&packet.data[..], b"data");
+    assert_eq!(packet.data.as_ptr(), input.as_ptr());
+    drop(encoded);
+    drop(input);
+    assert_eq!(&packet.data[..], b"data");
+}
+
+#[test]
+fn single_segment_recv_reuses_owned_payload() {
+    for config in [KcpConfig::fast_mode(), KcpConfig::stream_mode()] {
+        let mut kcp = Kcp::new(1, config).unwrap();
+        let packet = make_seg(0).kcp_packet.to_bytes().unwrap();
+        kcp.input(&packet).unwrap();
+        let pointer = kcp.rcv_queue.front().unwrap().kcp_packet.data.as_ptr();
+        let data = kcp.recv().unwrap();
+        assert_eq!(&data[..], b"data");
+        assert_eq!(data.as_ptr(), pointer);
+        assert_eq!(kcp.nrcv_que, 0);
+        assert!(kcp.rcv_queue.is_empty());
+        assert_eq!(kcp.recv().unwrap_err(), KcpError::QueueEmpty);
+    }
+}
+
+#[test]
+fn borrowed_input_owns_payload_after_caller_reuses_buffer() {
+    let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+    let mut packet = make_seg(0).kcp_packet.to_bytes().unwrap().to_vec();
+    kcp.input(&packet).unwrap();
+    packet.fill(0);
+    drop(packet);
+    assert_eq!(&kcp.recv().unwrap()[..], b"data");
+}
+
+#[test]
+fn single_segment_recv_promotes_backlog_before_reopening_window() {
+    for stream_mode in [false, true] {
+        let mut kcp =
+            Kcp::new(1, KcpConfig { rcv_wnd: 1, stream_mode, ..KcpConfig::fast_mode() }).unwrap();
+        for sn in 0..2 {
+            kcp.input(&make_seg(sn).kcp_packet.to_bytes().unwrap()).unwrap();
+        }
+        assert_eq!((kcp.nrcv_que, kcp.nrcv_buf), (1, 1));
+        assert_eq!(&kcp.recv().unwrap()[..], b"data");
+        assert_eq!((kcp.nrcv_que, kcp.nrcv_buf, kcp.rcv_nxt), (1, 0, 2));
+        assert_eq!(kcp.probe & kcp_ovo::helper::IKCP_ASK_TELL, 0);
+        assert_eq!(&kcp.recv().unwrap()[..], b"data");
+        assert_eq!((kcp.nrcv_que, kcp.nrcv_buf), (0, 0));
+        assert_ne!(kcp.probe & kcp_ovo::helper::IKCP_ASK_TELL, 0);
+    }
+}
+
+#[test]
+fn kcp_is_send_and_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Kcp>();
+}
+
 /// 不足一个头部长度就解析必须报错
 #[test]
 fn packet_truncated_header_errors() {
