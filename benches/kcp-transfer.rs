@@ -1,18 +1,17 @@
-//! criterion 标准基准：KCP 在不同丢包率下完成一次传输所需的虚拟时长
+//! Criterion 真实耗时基准：KCP 在不同丢包率下完成一次传输的处理成本。
 //!
 //! 测量模型：
 //! - 每个 benchmark 迭代新建一对 `Kcp`，从零开始把 `SCENARIOS` 指定的数据量送达，
 //!   因此测量值包含建立连接与数据交付的全过程，迭代之间互不影响
-//! - 时钟由虚拟毫秒驱动，按 tick 递增推进 `update()`，不做真实 sleep；
-//!   测量值是虚拟推进量（协议视角的传输时长），不是 CPU 跑模拟的真实耗时
-//! - 丢包在 output 回调处按概率丢弃，数据包与 ACK 都丢，种子随迭代递增以覆盖更多丢包序列
-//! - 每档丢包率的数据量经过标定，使 0%~60% 的单次虚拟时长落在数百毫秒到一秒量级，
-//!   便于人眼直接对比；80% 档受重传退避限制无法压到该区间，详见 `SCENARIOS` 说明
+//! - 协议使用虚拟时钟且不 sleep；Criterion 只测真实耗时，不混入虚拟时间。
+//! - 每轮使用相同输入和种子，避免迭代数改变丢包序列；覆盖范围不是随机压力测试。
+//! - 数据逐消息校验，超时、协议错误或未确认完毕均失败，不计作成功样本。
+//! - 包含连接创建、仿真链路、校验和析构开销，不等于纯 CPU 周期或真实 UDP 吞吐。
 //!
 //! 运行：
 //! ```bash
-//! cargo bench
-//! cargo bench -- loss_80
+//! cargo bench --bench kcp-transfer -- --save-baseline before-core-perf
+//! cargo bench --bench kcp-transfer -- --baseline before-core-perf
 //! ```
 
 use std::collections::VecDeque;
@@ -23,30 +22,23 @@ use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use kcp_ovo::config::KcpConfig;
 use kcp_ovo::core::kcp::Kcp;
+use kcp_ovo::error::{IncompleteDataType, KcpError};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-/// bench 使用的发送窗口段数。
-///
-/// `nocwnd=true` 时不走拥塞窗口，发送量只受窗口限制，因此这里必须显式放大，
-/// 否则测到的是窗口上限而不是协议能力。取 512 是因为实测该值已到达吞吐饱和点：
-/// 256 段 8.3 MiB/s、512 段 16.0 MiB/s、1024 段 16.6 MiB/s、2048 段同为 16.6 MiB/s。
+/// 固定窗口配置，使前后两次测量使用相同的队列规模。
 const BENCH_SND_WND: u16 = 512;
 /// 接收窗口需不小于发送窗口，否则对方的窗口通告会先成为瓶颈。
 const BENCH_RCV_WND: u16 = 512;
 
 /// 各档丢包率对应的单次传输数据量（丢包率, 字节数）。
 ///
-/// 数据量按实测标定，使各组的单次虚拟时长落在数百毫秒到一秒量级，
-/// 便于人眼直接对比：丢包越重，同样时长能送出的数据越少。
-///
-/// 注意 80% 档无法靠缩小数据量把时长压下来：即使只传 1 字节也需要约 11 秒，
-/// 这是该丢包率下重传退避决定的固定下限，属于协议行为的真实反映。
+/// 保留既有数据量；只比较同一场景的前后结果，不横向比较不同丢包档位。
 const SCENARIOS: [(f64, usize); 5] =
     [(0.0, 4 * 1024 * 1024), (0.2, 12 * 1024), (0.4, 2 * 1024), (0.6, 160), (0.8, 32)];
 /// 单次迭代允许推进的最大虚拟毫秒数，防止极端丢包下无限循环。
-const MAX_VIRTUAL_MS: u64 = 60_000;
-/// 时钟步进，与 `KcpConfig::fast_mode()` 的 interval 同量级。
+const MAX_VIRTUAL_MS: u64 = 600_000;
+/// 时钟步进，比协议刷新间隔更细以覆盖重传期限。
 const TICK_MS: u64 = 1;
 const CONV: u32 = 0x1122_3344;
 const SEED: u64 = 0x4b43_505f_4245_4e43;
@@ -64,8 +56,8 @@ impl Link {
     }
 
     fn admit(&mut self, packets: &Arc<Mutex<VecDeque<Bytes>>>) {
-        let drained: Vec<Bytes> = packets.lock().unwrap().drain(..).collect();
-        for p in drained {
+        let mut packets = packets.lock().unwrap();
+        for p in packets.drain(..) {
             if self.loss > 0.0 && self.rng.random::<f64>() < self.loss {
                 continue;
             }
@@ -75,16 +67,13 @@ impl Link {
 
     fn deliver(&mut self, peer: &mut Kcp) {
         while let Some(p) = self.inflight.pop_front() {
-            let _ = peer.input(&p);
+            peer.input(&p).expect("valid simulated packet");
         }
     }
 }
 
-/// 一次性完成 `loss` 丢包率下的完整传输，返回消耗的虚拟毫秒数。
-///
-/// 返回虚拟时间而不是真实耗时，评判交给 criterion 的统计；
-/// 一轮的结果用于防止极端丢包下跑不完。
-async fn transfer_once(loss: f64, seed: u64, payload: usize) -> u64 {
+/// 返回虚拟推进量供 black_box 消费；它不参与 Criterion 的计时。
+async fn transfer_once(loss: f64, payload: &[u8]) -> u64 {
     let cfg = KcpConfig::fast_mode_with_wnd(BENCH_SND_WND, BENCH_RCV_WND);
     let mut sender = Kcp::new(CONV, cfg.clone()).unwrap();
     let mut receiver = Kcp::new(CONV, cfg.clone()).unwrap();
@@ -111,20 +100,17 @@ async fn transfer_once(loss: f64, seed: u64, payload: usize) -> u64 {
         }
     });
 
-    let mut up = Link::new(loss, seed);
-    let mut down = Link::new(loss, seed ^ 0x9e37_79b9);
+    let mut up = Link::new(loss, SEED);
+    let mut down = Link::new(loss, SEED ^ 0x9e37_79b9);
 
-    let chunk = vec![0x5au8; cfg.mtu as usize];
     let mut sent = 0usize;
     let mut recv_bytes = 0usize;
-    // 从中段起步，让 header 中由真实时钟生成的 ts 与虚拟时钟处于同一量级
-    let mut now = kcp_ovo::helper::current_millis();
-    let start_ms = now;
+    let mut now = 0;
 
-    while recv_bytes < payload && now - start_ms < MAX_VIRTUAL_MS {
-        while sent < payload && sender.waitsnd() < 1024 {
-            let size = (payload - sent).min(chunk.len());
-            sender.send(&chunk[..size]).unwrap();
+    while now < MAX_VIRTUAL_MS {
+        while sent < payload.len() && sender.waitsnd() < 1024 {
+            let size = (payload.len() - sent).min(cfg.mtu as usize);
+            sender.send(&payload[sent..sent + size]).unwrap();
             sent += size;
         }
 
@@ -133,46 +119,50 @@ async fn transfer_once(loss: f64, seed: u64, payload: usize) -> u64 {
 
         up.admit(&up_out);
         up.deliver(&mut receiver);
-        while let Ok(data) = receiver.recv() {
-            recv_bytes += data.len();
+        loop {
+            match receiver.recv() {
+                Ok(data) => {
+                    let size = (payload.len() - recv_bytes).min(cfg.mtu as usize);
+                    assert_eq!(data.as_ref(), &payload[recv_bytes..recv_bytes + size]);
+                    recv_bytes += data.len();
+                },
+                Err(KcpError::QueueEmpty)
+                | Err(KcpError::IncompleteData(IncompleteDataType::PayloadWaitForFrg)) => break,
+                Err(error) => panic!("receive failed: {error}"),
+            }
         }
 
         down.admit(&down_out);
         down.deliver(&mut sender);
 
+        if recv_bytes == payload.len() && sender.waitsnd() == 0 {
+            return now;
+        }
         now += TICK_MS;
     }
 
-    now - start_ms
+    panic!(
+        "transfer timed out: loss={loss}, received={recv_bytes}/{}, pending={}",
+        payload.len(),
+        sender.waitsnd()
+    );
 }
 
 fn bench_kcp_transfer(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread().build().expect("build tokio runtime");
 
-    let mut group = c.benchmark_group("kcp_transfer");
+    let mut group = c.benchmark_group("kcp_transfer_wall");
     group.sample_size(20);
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
 
     for (loss, payload) in SCENARIOS {
         group.throughput(Throughput::Bytes(payload as u64));
+        let payload: Vec<u8> =
+            (0..payload).map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8).collect();
         let id = format!("loss_{:.0}", loss * 100.0);
         group.bench_function(&id, |b| {
-            // 测量值是协议视角的传输时长（虚拟毫秒推进量），不是 CPU 跑模拟的耗时，
-            // 后者只反映算力、与网络质量无关。criterion 会把 iter_custom 的返回值
-            // 直接当作测量值且不做分摊，故这里返回整批 iters 次的虚拟毫秒总量。
-            //
-            // 叠加真实耗时是为了给 criterion 提供方差：虚拟时长完全确定，零方差的
-            // 输入会让它的 KDE 估计直接 panic。真实耗时只占虚拟时长的千分之一量级，
-            // 不改变各组之间的量级关系。
-            b.to_async(&rt).iter_custom(|iters| async move {
-                let wall = std::time::Instant::now();
-                let mut total_ms = 0u64;
-                for i in 0..iters {
-                    total_ms += transfer_once(loss, SEED.wrapping_add(i), payload).await;
-                }
-                Duration::from_millis(total_ms) + wall.elapsed()
-            });
+            b.to_async(&rt).iter(|| transfer_once(loss, &payload));
         });
     }
 
