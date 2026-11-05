@@ -49,6 +49,9 @@ pub enum KcpError {
     /// 当发生IO相关错误时返回此错误
     IoError(String),
 
+    /// 协议确认等待超过总期限；数据仍可能已经到达对端。
+    TimedOut,
+
     /// addr错误
     NoAddress,
 }
@@ -66,6 +69,7 @@ impl KcpError {
             KcpError::OutputNotSet => KcpErrorKind::OutputNotSet,
             KcpError::IoError(_) => KcpErrorKind::IoError,
             KcpError::NoAddress => KcpErrorKind::NoAddress,
+            KcpError::TimedOut => KcpErrorKind::TimedOut,
         }
     }
 }
@@ -81,6 +85,7 @@ pub enum KcpErrorKind {
     InvalidConfig,
     OutputNotSet,
     IoError,
+    TimedOut,
     NoAddress,
 }
 
@@ -96,6 +101,7 @@ impl fmt::Display for KcpError {
             KcpError::OutputNotSet => write!(f, "输出回调未设置"),
             KcpError::IoError(msg) => write!(f, "IO错误: {}", msg),
             KcpError::NoAddress => write!(f, "addr错误"),
+            KcpError::TimedOut => write!(f, "协议确认等待超时"),
         }
     }
 }

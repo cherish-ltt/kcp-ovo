@@ -22,6 +22,7 @@ use kcp_ovo::helper::generate_conv;
 use kcp_ovo::{KcpConfig, KcpResult};
 
 pub mod stress;
+pub mod udp;
 
 /// 确定性伪随机数发生器（xorshift64*），测试必须可复现，不能用系统随机源
 pub struct Rng(u64);

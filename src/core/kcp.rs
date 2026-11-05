@@ -288,6 +288,11 @@ impl Kcp {
         self.nsnd_que + self.nsnd_buf
     }
 
+    #[cfg(feature = "stream")]
+    pub(crate) fn is_drained(&self) -> bool {
+        self.waitsnd() == 0 && self.acklist.is_empty() && self.probe & IKCP_ASK_TELL == 0
+    }
+
     // ========== 辅助函数 ==========
 
     /// 计算 32 位时间戳差值（支持回绕）

@@ -405,6 +405,7 @@ cargo llvm-cov --workspace --all-features --summary-only   # 覆盖率需 >= 80%
 | BUG-29 | 空闲刷新驱动拥塞窗口增长 | 拥塞控制 | 无确认时窗口持续增长，最终整数溢出 | `kcp.rs::input` 的确认推进分支 |
 | BUG-45 | 库无条件声明全局 mimalloc | 库集成 | 下游自选全局分配器时编译失败，关闭默认 feature 也无法避开 | `src/lib.rs`、`Cargo.toml` 移除分配器声明和依赖 |
 | BUG-46 | normal/fast 超时退避语义反转，期限使用旧 RTO | 重传时序 | 普通模式不累加、快速模式翻倍，连续丢包恢复不符合配置契约 | `kcp.rs::flush`：普通模式加 `max(rto, rx_rto)`，快速模式加 `rto/2`，饱和累加并限幅后安排下一期限 |
+| BUG-47 | 客户端 output 忽略 UDP send 的内层错误 | 高层输出 | 系统拒绝的 UDP 输出被报成成功，协议状态和等待结果失真 | `stream.rs::send_udp` 保留 socket 错误，后台输出失败退出并唤醒等待者 |
 
 其中 BUG-9、BUG-10、BUG-18、BUG-19、BUG-24、BUG-25、BUG-27 属于「线上会永久卡死、
 panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-26 属于「不丢数据但
@@ -512,6 +513,7 @@ panic 或静默丢数据」的严重级缺陷，BUG-13、BUG-14、BUG-17、BUG-2
 | BUG-29 | `idle_updates_do_not_grow_congestion_window`、`congestion_window_grows_only_on_new_confirmation_and_stays_bounded` | `tests/congestion.rs` |
 | BUG-45 | 集成测试 crate 显式声明 System 全局分配器，默认与无默认 feature 均须编译通过 | `tests/api_contract.rs`、Rust CI 与 Release 工作流 |
 | BUG-46 | `normal_timeout_backoff_uses_new_deadline`、`fast_timeout_backoff_uses_new_deadline`、`timeout_backoff_is_bounded_and_obeys_dead_link`、`timeout_and_fastack_are_exclusive_and_ack_recovery_preserves_rtt`、`backoff_modes_deliver_on_clean_burst_and_blackout_links` | `tests/retransmit.rs` |
+| BUG-47 | `udp_output_preserves_socket_error`（65508 字节 UDP 确定报错）、`stopped_stream_worker_wakes_confirmation_waiter` | `src/stream.rs` |
 
 #### 三、维护规则
 
@@ -614,3 +616,10 @@ CI 与发布校验必须覆盖全 feature 和 `--no-default-features` 两种配�
 - 核心实例由单个任务独占驱动，未经并发证据不添加缓存行填充；公开 `Segment` 字段不借用高位存放隐藏状态，也不以破坏公开语义换取位掩码优化。
 - `timing::dead_link_rejects_entire_data_batch_before_output` 保证死链预检发生在数据输出前；逐段输出只在 await 成功后提交状态，取消安全测试必须保留。
 - `timing::ack_deduplication_handles_gaps_unsent_and_wrapped_sequences`、`timing::reordered_receive_queue_preserves_messages_across_reuse_and_wrap` 覆盖去重、乱序插入与回绕；`api_contract` 的共享载荷测试验证复制消除和所有权生命周期。
+
+### 10.10 高层确认等待
+
+- `drain` / `drain_to` 的控制请求必须和应用发送共用有界 FIFO；不能只检查调用瞬间的 `waitsnd()`，否则尚在高层队列的数据会被漏掉。
+- 成功需同时满足此前数据获得 KCP 累计确认、当前待发 ACK 与窗口通告已输出到 UDP socket；读取缓冲后推进的累计确认也必须输出。监听器输出入队不算 socket 输出成功；错误与后台退出必须唤醒等待者。
+- 单次总期限覆盖入队及确认等待，取消/超时不得撤回数据或留下常驻等待控制；close/Drop 仍立即终止。等待绑定原会话，新会话不得完成旧等待。
+- `tests/stream_drain.rs` 覆盖高层链路与生命周期，`src/stream/drain.rs` 的单测覆盖控制队列期限、worker 退出、SN 回绕与 ACK 输出边界；文件示例须双端显式收尾，并区分已落盘与最终确认结果。
