@@ -53,6 +53,17 @@ jobs:
       - name: 检查无默认 feature 的下游分配器兼容性
         run: cargo test --locked --no-default-features --test api_contract
 
+      - name: 检查独立下游工程的标准类型和依赖兼容性
+        run: |
+          for fixture in core stream; do
+            manifest="tests/downstream/$fixture/Cargo.toml"
+            cargo fmt --manifest-path "$manifest" -- --check
+            cargo clippy --locked --manifest-path "$manifest" --all-targets -- -D warnings
+            cargo test --locked --manifest-path "$manifest"
+          done
+        env:
+          CARGO_TARGET_DIR: target/downstream
+
   release:
     name: 创建 GitHub Release
     needs: verify

@@ -1,0 +1,18 @@
+[package]
+name = "kcp-ovo-downstream-stream"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99.1"
+publish = false
+
+[workspace]
+
+[[test]]
+name = "api"
+path = "api.rs"
+
+# 下游自行选择的兼容版本，高于库验证过的最低版本。
+[dependencies]
+kcp-ovo = { path = "../../.." }
+bytes = "=1.12.1"
+tokio = { version = "=1.54.1", features = ["macros", "rt-multi-thread", "time"] }

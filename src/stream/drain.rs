@@ -75,16 +75,18 @@ mod tests {
         sender.set_output(move |data| {
             let out = out.clone();
             async move {
-                out.send(data.clone()).unwrap();
-                Ok(data.len())
+                let len = data.len();
+                out.send(data).unwrap();
+                Ok(len)
             }
         });
         let (out, mut acks) = mpsc::unbounded_channel();
         peer.set_output(move |data| {
             let out = out.clone();
             async move {
-                out.send(data.clone()).unwrap();
-                Ok(data.len())
+                let len = data.len();
+                out.send(data).unwrap();
+                Ok(len)
             }
         });
         sender.send(b"wrapped").unwrap();
@@ -116,8 +118,9 @@ mod tests {
         receiver.set_output(move |data| {
             let out = out.clone();
             async move {
-                out.send(data.clone()).unwrap();
-                Ok(data.len())
+                let len = data.len();
+                out.send(data).unwrap();
+                Ok(len)
             }
         });
         for sn in 0..2 {
@@ -129,14 +132,14 @@ mod tests {
         receiver.update(0).await.unwrap();
         for sn in 0..2 {
             let (header, _) =
-                KcpPacketHeader::from_bytes(&mut packets.try_recv().unwrap()).unwrap();
+                KcpPacketHeader::from_bytes(&mut packets.try_recv().unwrap().as_slice()).unwrap();
             assert_eq!(header.cmd, KcpCmd::Ack);
             assert_eq!(header.sn, sn);
             assert_eq!(header.una, 1);
         }
         assert!(packets.try_recv().is_err());
         for byte in 0..2 {
-            assert_eq!(receiver.recv().unwrap().as_ref(), &[byte]);
+            assert_eq!(receiver.recv().unwrap().as_slice(), &[byte]);
         }
         assert_eq!(receiver.rcv_nxt, 2);
         let (reply, mut completed) = oneshot::channel();
@@ -148,7 +151,8 @@ mod tests {
         );
 
         receiver.update(20).await.unwrap();
-        let (header, _) = KcpPacketHeader::from_bytes(&mut packets.try_recv().unwrap()).unwrap();
+        let (header, _) =
+            KcpPacketHeader::from_bytes(&mut packets.try_recv().unwrap().as_slice()).unwrap();
         assert_eq!(header.cmd, KcpCmd::Wins);
         assert_eq!(header.una, 2);
         finish_drain(&receiver, &mut pending);

@@ -7,22 +7,21 @@
 use std::collections::{HashSet, VecDeque};
 use std::pin::Pin;
 
-use bytes::{Buf, Bytes, BytesMut};
-
 use crate::KcpCmd;
 use crate::config::KcpConfig;
 use crate::error::{IncompleteDataType, KcpError, KcpResult};
 use crate::helper::{
     IKCP_ASK_SEND, IKCP_ASK_TELL, IKCP_DEADLINK, IKCP_FASTACK_LIMIT, IKCP_OVERHEAD,
     IKCP_PROBE_INIT, IKCP_PROBE_LIMIT, IKCP_RTO_DEF, IKCP_RTO_MAX, IKCP_RTO_MIN, IKCP_RTO_NDL,
-    IKCP_THRESH_INIT, IKCP_THRESH_INIT_WND, IKCP_THRESH_MIN, KcpPacket, KcpPacketHeader,
-    current_millis,
+    IKCP_THRESH_INIT, IKCP_THRESH_INIT_WND, IKCP_THRESH_MIN, KcpPacketHeader, current_millis,
 };
 use crate::queue::{KcpDeque, Segment};
 
 /// 输出回调函数类型别名
 type OutputCallback = Box<
-    dyn Fn(Bytes) -> Pin<Box<dyn Future<Output = KcpResult<usize>> + Send + 'static>> + Send + Sync,
+    dyn Fn(Vec<u8>) -> Pin<Box<dyn Future<Output = KcpResult<usize>> + Send + 'static>>
+        + Send
+        + Sync,
 >;
 
 /// 日志回调函数类型别名
@@ -247,10 +246,10 @@ impl Kcp {
     ///
     /// # 参数
     ///
-    /// * `callback` — 接收 `Bytes` 数据，返回发送的字节数
+    /// * `callback` — 接收拥有所有权的 `Vec<u8>` 数据，返回发送的字节数
     pub fn set_output<F, Fut>(&mut self, callback: F)
     where
-        F: Fn(Bytes) -> Fut + Send + Sync + 'static,
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = KcpResult<usize>> + Send + 'static,
     {
         self.output = Some(Box::new(move |data| Box::pin(callback(data))));
@@ -391,7 +390,7 @@ impl Kcp {
     ///
     /// # 注意
     ///
-    /// 流模式下，`BytesMut::with_capacity(peeksize)` 可以一次性分配足量缓冲区，
+    /// 流模式下，`Vec::with_capacity(peeksize)` 可以一次性分配足量缓冲区，
     /// 一次性算出总长，避免多次重新分配。
     pub fn peeksize(&self) -> KcpResult<usize> {
         let first = self.rcv_queue.front().ok_or(KcpError::QueueEmpty)?;
@@ -425,14 +424,14 @@ impl Kcp {
 
     /// 接收数据
     ///
-    /// **非流模式**：从 rcv_queue 读取一条完整消息（frg 链），返回 `Bytes`。
+    /// **非流模式**：从 rcv_queue 读取一条完整消息（frg 链），返回 `Vec<u8>`。
     /// **流模式**：一次性读取 rcv_queue 中所有可读 segment 并拼接返回，无消息边界。
     ///
     /// # 返回
     ///
-    /// 返回接收到的完整 `Bytes` 数据；队列为空返回 `QueueEmpty`。
+    /// 返回接收到的完整 `Vec<u8>` 数据；单段直接移出已有载荷，队列为空返回 `QueueEmpty`。
     /// 分片链损坏时返回 `PayloadErr` 并丢弃损坏前缀，保留第一个不匹配的段。
-    pub fn recv(&mut self) -> KcpResult<Bytes> {
+    pub fn recv(&mut self) -> KcpResult<Vec<u8>> {
         let peeksize = match self.peeksize() {
             Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr)) => {
                 let mut expected = self.rcv_queue.front().unwrap().kcp_packet.header.frg;
@@ -454,7 +453,9 @@ impl Kcp {
             },
             result => result?,
         };
-        if self.rcv_queue.len() == 1 {
+        if self.rcv_queue.len() == 1
+            || (!self.stream_mode && self.rcv_queue.front().unwrap().kcp_packet.header.frg == 0)
+        {
             let seg = self.rcv_queue.pop_front().unwrap();
             self.nrcv_que -= 1;
             self.move_rcv_buf_and_probe();
@@ -463,7 +464,7 @@ impl Kcp {
             }
             return Ok(seg.kcp_packet.data);
         }
-        let mut buf = BytesMut::with_capacity(peeksize);
+        let mut buf = Vec::with_capacity(peeksize);
         // 流模式读取所有 segment，非流模式读取到 frg==0
         while let Some(seg) = self.rcv_queue.pop_front() {
             buf.extend_from_slice(&seg.kcp_packet.data);
@@ -477,7 +478,7 @@ impl Kcp {
         if !self.stream_mode && buf.len() != peeksize {
             return Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr));
         }
-        Ok(buf.copy_to_bytes(buf.len()))
+        Ok(buf)
     }
 
     /// 输入处理：解析并处理从底层网络收到的数据包
@@ -685,16 +686,19 @@ impl Kcp {
     /// 窗口通告使用可用窗口（rcv_wnd - nrcv_que）而非总窗口 rcv_wnd，
     /// 与控制段 header 中 wnd 字段的设置一致。
     async fn send_control(&mut self, cmd: KcpCmd, sn: u32) -> KcpResult<()> {
-        self.send_packet(KcpPacket::new_without_data(KcpPacketHeader::new(
-            self.conv,
-            cmd,
-            0,
-            self.rcv_wnd.saturating_sub(self.nrcv_que as u16),
-            current_millis(),
-            sn,
-            self.rcv_nxt,
-            0,
-        )))
+        self.send_packet(
+            KcpPacketHeader::new(
+                self.conv,
+                cmd,
+                0,
+                self.rcv_wnd.saturating_sub(self.nrcv_que as u16),
+                current_millis(),
+                sn,
+                self.rcv_nxt,
+                0,
+            )
+            .to_bytes()?,
+        )
         .await
     }
 
@@ -810,11 +814,13 @@ impl Kcp {
             } else {
                 continue;
             };
-            let mut packet = seg.kcp_packet.clone();
-            packet.header.conv = self.conv;
-            packet.header.cmd = KcpCmd::Push;
-            packet.header.len = packet.data.len() as u32;
-            self.send_packet(packet).await?;
+            let mut header = seg.kcp_packet.header;
+            header.conv = self.conv;
+            header.cmd = KcpCmd::Push;
+            header.len = seg.kcp_packet.data.len() as u32;
+            let mut data = header.to_bytes()?;
+            data.extend_from_slice(&seg.kcp_packet.data);
+            self.send_packet(data).await?;
             // await 取消或报错时保留原状态，只提交已成功输出的段。
             let seg = self.snd_buf.get_mut(idx).unwrap();
             seg.xmit = xmit;
@@ -835,8 +841,7 @@ impl Kcp {
     }
 
     /// 统一的发送接口（处理 output 回调的借用问题）
-    async fn send_packet(&mut self, pkt: KcpPacket) -> KcpResult<()> {
-        let data = pkt.to_bytes()?;
+    async fn send_packet(&mut self, data: Vec<u8>) -> KcpResult<()> {
         let output = self.output.as_ref().ok_or(KcpError::OutputNotSet)?;
         output(data).await?;
         self.xmit = self.xmit.wrapping_add(1);
@@ -1424,7 +1429,7 @@ mod tests {
             let sent_wask = sent_wask.clone();
             kcp.set_output(move |data| {
                 // Parse the packet to check its type
-                let mut buf = Bytes::copy_from_slice(&data);
+                let mut buf = data.as_slice();
                 if let Ok((header, _)) = KcpPacketHeader::from_bytes(&mut buf) {
                     if header.cmd == KcpCmd::Ack {
                         *sent_ack.lock().unwrap() = true;

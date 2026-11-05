@@ -5,8 +5,6 @@
 
 mod common;
 
-use bytes::Bytes;
-
 use kcp_ovo::core::kcp::Kcp;
 use kcp_ovo::error::{IncompleteDataType, KcpErrorKind};
 use kcp_ovo::helper::{KcpPacket, KcpPacketHeader};
@@ -127,7 +125,7 @@ fn header_roundtrip() {
         KcpPacketHeader::new(0xDEAD_BEEF, KcpCmd::Ack, 3, 256, 1_700_000_000_000, 42, 40, 128);
     let encoded = header.to_bytes().unwrap();
     assert_eq!(encoded.len(), 28);
-    let mut buf = Bytes::from(encoded.to_vec());
+    let mut buf = encoded.as_slice();
     let (parsed, rest) = KcpPacketHeader::from_bytes(&mut buf).unwrap();
     assert_eq!(parsed, header);
     assert!(rest.is_empty());
@@ -139,7 +137,7 @@ fn header_timestamp_beyond_u32() {
     let big = u32::MAX as u64 + 12345;
     let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 1, big, 0, 0, 0);
     let encoded = header.to_bytes().unwrap();
-    let mut buf = Bytes::from(encoded.to_vec());
+    let mut buf = encoded.as_slice();
     let (parsed, _) = KcpPacketHeader::from_bytes(&mut buf).unwrap();
     assert_eq!(parsed.ts, big, "时间戳必须按 u64 保留");
 }
@@ -149,12 +147,12 @@ fn header_timestamp_beyond_u32() {
 fn packet_roundtrip_with_payload() {
     let payload = b"hello-kcp";
     let header = KcpPacketHeader::new(7, KcpCmd::Push, 0, 512, 1000, 9, 8, payload.len() as u32);
-    let packet = KcpPacket::new_with_data(header, Bytes::copy_from_slice(payload));
+    let packet = KcpPacket::new_with_data(header, payload.to_vec());
     let encoded = packet.to_bytes().unwrap();
-    let mut buf = Bytes::from(encoded.to_vec());
+    let mut buf = encoded.as_slice();
     let parsed = KcpPacket::from_bytes(&mut buf).unwrap();
     assert_eq!(parsed.header, header);
-    assert_eq!(parsed.data.as_ref(), payload);
+    assert_eq!(parsed.data.as_slice(), payload);
 }
 
 /// 声明长度大于实际负载时必须报错
@@ -173,22 +171,48 @@ fn packet_from_header_limits_payload_to_declared_length() {
 }
 
 #[test]
-fn packet_parsing_shares_payload_and_preserves_remaining_input() {
+fn packet_parsing_owns_payload_and_preserves_remaining_input() {
     let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 0, 0, 0, 4);
-    let encoded =
-        KcpPacket::new_with_data(header, Bytes::from_static(b"dataextra")).to_bytes().unwrap();
-    let mut input = encoded.clone();
+    let mut encoded = KcpPacket::new_with_data(header, b"dataextra".to_vec()).to_bytes().unwrap();
+    let mut input = encoded.as_slice();
     let (parsed, rest) = KcpPacketHeader::from_bytes(&mut input).unwrap();
     assert_eq!(parsed, header);
-    assert_eq!(&input[..], b"dataextra");
+    assert_eq!(input, b"dataextra");
     assert_eq!(rest.as_ptr(), encoded[28..].as_ptr());
-    drop(rest);
-    let packet = KcpPacket::from_bytes(&mut encoded.clone()).unwrap();
+    let packet = KcpPacket::from_bytes(&mut encoded.as_slice()).unwrap();
     assert_eq!(&packet.data[..], b"data");
-    assert_eq!(packet.data.as_ptr(), input.as_ptr());
+    assert_ne!(packet.data.as_ptr(), input.as_ptr());
+    encoded.fill(0);
     drop(encoded);
-    drop(input);
     assert_eq!(&packet.data[..], b"data");
+}
+
+#[test]
+fn packet_construction_moves_owned_payload() {
+    let data = b"owned".to_vec();
+    let pointer = data.as_ptr();
+    let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 0, 0, 0, data.len() as u32);
+    let packet = KcpPacket::new_with_data(header, data);
+    assert_eq!(packet.data.as_ptr(), pointer);
+    let segment = Segment::new(packet);
+    assert_eq!(segment.get_data().as_ptr(), pointer);
+
+    let data = b"builder".to_vec();
+    let pointer = data.as_ptr();
+    let packet = kcp_ovo::helper::PacketBuilder::new(1).data(data).build();
+    assert_eq!(packet.data.as_ptr(), pointer);
+}
+
+#[test]
+fn short_packet_payload_preserves_header_advancement() {
+    let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 0, 0, 0, 5);
+    let encoded = KcpPacket::new_with_data(header, b"short"[..2].to_vec()).to_bytes().unwrap();
+    let mut input = encoded.as_slice();
+    assert_eq!(
+        KcpPacket::from_bytes(&mut input).unwrap_err(),
+        KcpError::IncompleteData(IncompleteDataType::Payload)
+    );
+    assert_eq!(input, &encoded[28..]);
 }
 
 #[test]
@@ -215,6 +239,21 @@ fn borrowed_input_owns_payload_after_caller_reuses_buffer() {
     packet.fill(0);
     drop(packet);
     assert_eq!(&kcp.recv().unwrap()[..], b"data");
+}
+
+#[test]
+fn queued_single_segment_messages_move_each_payload() {
+    let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
+    for sn in 0..3 {
+        kcp.input(&make_seg(sn).kcp_packet.to_bytes().unwrap()).unwrap();
+    }
+    for remaining in (0..3).rev() {
+        let pointer = kcp.rcv_queue.front().unwrap().kcp_packet.data.as_ptr();
+        let data = kcp.recv().unwrap();
+        assert_eq!(data, b"data");
+        assert_eq!(data.as_ptr(), pointer);
+        assert_eq!(kcp.nrcv_que, remaining);
+    }
 }
 
 #[test]
@@ -245,9 +284,11 @@ fn kcp_is_send_and_sync() {
 #[test]
 fn packet_truncated_header_errors() {
     for len in [0usize, 1, 27] {
-        let mut buf = Bytes::from(vec![0u8; len]);
+        let data = vec![0u8; len];
+        let mut buf = data.as_slice();
         let err = KcpPacketHeader::from_bytes(&mut buf).unwrap_err();
         assert_eq!(err, KcpError::IncompleteData(IncompleteDataType::Header));
+        assert_eq!(buf, data.as_slice());
     }
 }
 

@@ -37,8 +37,6 @@ pub use crate::config::KcpConfig;
 pub use crate::error::{KcpError, KcpResult};
 pub use crate::helper::KcpCmd;
 pub use crate::queue::{KcpDeque, Segment};
-pub use bytes;
-pub use tokio;
 
 // 导出Stream API (当stream feature启用时)
 // #[cfg(feature = "stream")]

@@ -288,8 +288,9 @@ impl Sink {
             kcp.borrow_mut().set_output(move |data| {
                 let sink = sink.clone();
                 Box::pin(async move {
-                    sink.lock().unwrap().push(data.to_vec());
-                    Ok::<usize, kcp_ovo::KcpError>(data.len())
+                    let len = data.len();
+                    sink.lock().unwrap().push(data);
+                    Ok::<usize, kcp_ovo::KcpError>(len)
                 })
             });
         }

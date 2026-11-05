@@ -40,8 +40,8 @@ async fn zero_update_interval_is_rejected() {
 #[tokio::test]
 async fn loopback_address_families_and_hostname() {
     for host in ["127.0.0.1", "::1"] {
-        let addr = format!("[{host}]:0");
-        let addr = if host == "127.0.0.1" { "127.0.0.1:0" } else { &addr };
+        let addr =
+            if host == "127.0.0.1" { "127.0.0.1:0".to_owned() } else { format!("[{host}]:0") };
         let mut listener = match KcpListener::bind(addr).await {
             Ok(listener) => listener,
             Err(e) if host == "::1" && tokio::net::UdpSocket::bind("[::1]:0").await.is_err() => {
@@ -366,7 +366,7 @@ async fn spawn_echo_server(rounds: usize) -> (String, tokio::sync::oneshot::Send
 #[tokio::test]
 async fn echo_roundtrip() {
     let (addr, _shutdown) = spawn_echo_server(1).await;
-    let mut stream = KcpStream::connect(&addr).await.unwrap();
+    let mut stream = KcpStream::connect(addr).await.unwrap();
     assert!(stream.is_connected());
 
     stream.send(b"echo-payload").await.unwrap();
@@ -379,7 +379,7 @@ async fn echo_roundtrip() {
 async fn echo_multiple_rounds() {
     let rounds = 5;
     let (addr, _shutdown) = spawn_echo_server(rounds).await;
-    let mut stream = KcpStream::connect(&addr).await.unwrap();
+    let mut stream = KcpStream::connect(addr).await.unwrap();
 
     for i in 0..rounds {
         let msg = format!("round-{i}");
@@ -393,7 +393,7 @@ async fn echo_multiple_rounds() {
 #[tokio::test]
 async fn echo_large_payload() {
     let (addr, _shutdown) = spawn_echo_server(1).await;
-    let mut stream = KcpStream::connect(&addr).await.unwrap();
+    let mut stream = KcpStream::connect(addr).await.unwrap();
 
     let payload: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
     stream.send(&payload).await.unwrap();
@@ -409,7 +409,7 @@ async fn concurrent_clients_isolated() {
     for i in 0..3u8 {
         let addr = addr.clone();
         handles.push(tokio::spawn(async move {
-            let mut stream = KcpStream::connect(&addr).await.unwrap();
+            let mut stream = KcpStream::connect(addr).await.unwrap();
             let msg = vec![i; 400];
             stream.send(&msg).await.unwrap();
             let got = timeout(Duration::from_secs(8), stream.recv()).await.unwrap().unwrap();
@@ -425,7 +425,7 @@ async fn concurrent_clients_isolated() {
 #[tokio::test]
 async fn closed_stream_rejects_io() {
     let (addr, _shutdown) = spawn_echo_server(1).await;
-    let mut stream = KcpStream::connect(&addr).await.unwrap();
+    let mut stream = KcpStream::connect(addr).await.unwrap();
     assert!(stream.is_connected());
 
     stream.close().unwrap();
@@ -439,15 +439,16 @@ async fn closed_stream_rejects_io() {
 #[tokio::test]
 async fn remote_addr_matches_target() {
     let (addr, _shutdown) = spawn_echo_server(1).await;
-    let stream = KcpStream::connect(&addr).await.unwrap();
-    assert_eq!(stream.remote_addr().to_string(), addr);
+    let expected = addr.clone();
+    let stream = KcpStream::connect(addr).await.unwrap();
+    assert_eq!(stream.remote_addr().to_string(), expected);
 }
 
 /// try_recv 在没有数据时应返回错误而不是阻塞
 #[tokio::test]
 async fn try_recv_without_data_errors() {
     let (addr, _shutdown) = spawn_echo_server(1).await;
-    let mut stream = KcpStream::connect(&addr).await.unwrap();
+    let mut stream = KcpStream::connect(addr).await.unwrap();
     let err = stream.try_recv().unwrap_err();
     assert_eq!(err.kind(), KcpErrorKind::IoError);
 }
@@ -476,7 +477,7 @@ async fn custom_stream_config_works() {
     });
 
     let mut stream = KcpStream::connect_with_config(
-        &addr,
+        addr,
         StreamConfig {
             update_interval: Duration::from_millis(5),
             connect_timeout: Duration::from_secs(3),

@@ -29,9 +29,9 @@ Error: IoError: Connection refused
 **诊断步骤**:
 
 ```rust
-use kcp_ovo::KcpStream;
+use kcp_ovo::stream::KcpStream;
 
-match KcpStream::connect("127.0.0.1:8888") {
+match KcpStream::connect("127.0.0.1:8888").await {
     Ok(_) => println!("连接成功"),
     Err(e) => {
         eprintln!("连接失败: {}", e);
@@ -85,15 +85,15 @@ Error: IoError: Connection timed out
 **诊断**:
 
 ```rust
-use kcp_ovo::{KcpStream, StreamConfig};
+use kcp_ovo::stream::{KcpStream, StreamConfig};
 use std::time::Duration;
 
 let config = StreamConfig {
-    connect_timeout: Duration::from_secs(10),  // 增加超时时间
+    connect_timeout: Duration::from_secs(10),  // UDP 输出操作的超时
     ..Default::default()
 };
 
-match KcpStream::connect_with_config("127.0.0.1:8888", config) {
+match KcpStream::connect_with_config("127.0.0.1:8888", config).await {
     Ok(stream) => println!("连接成功"),
     Err(e) => {
         eprintln!("连接超时: {}", e);
@@ -148,10 +148,10 @@ struct KcpConnection {
 }
 
 impl KcpConnection {
-    fn keep_alive(&mut self) -> KcpResult<()> {
+    async fn keep_alive(&mut self) -> KcpResult<()> {
         let now = Instant::now();
         if now.duration_since(self.last_update) >= self.update_interval {
-            self.kcp.update(get_current_ms());
+            self.kcp.update(get_current_ms()).await?;
             self.last_update = now;
         }
         Ok(())
@@ -165,7 +165,7 @@ impl KcpConnection {
 
 **症状**:
 ```rust
-match kcp.recv(&mut buffer) {
+match kcp.recv() {
     Err(KcpError::QueueEmpty) => {
         println!("队列为空");
     }
@@ -180,7 +180,7 @@ match kcp.recv(&mut buffer) {
 **诊断**:
 
 ```rust
-use kcp_ovo::Kcp;
+use kcp_ovo::core::kcp::Kcp;
 
 let mut kcp = Kcp::new(0x11223344, KcpConfig::default())?;
 
@@ -198,9 +198,9 @@ loop {
             }
 
             // 尝试接收
-            match kcp.recv(&mut buffer) {
-                Ok(n) => {
-                    println!("接收到: {}", String::from_utf8_lossy(&buffer[..n]));
+            match kcp.recv() {
+                Ok(data) => {
+                    println!("接收到: {}", String::from_utf8_lossy(&data));
                     break;
                 }
                 Err(KcpError::QueueEmpty) => {
@@ -230,7 +230,7 @@ kcp.input(&udp_packet)?;
 
 2. 确保定期调用update():
 ```rust
-kcp.update(current_time);
+kcp.update(current_time).await?;
 ```
 
 3. 检查队列状态:
@@ -241,121 +241,44 @@ println!("RCV buf: {}", kcp.nrcv_buf);
 
 ### 问题2: 数据发送不出去
 
-**症状**:
-```rust
-kcp.send(data)?;
-// 但对端收不到
-```
+`send(&[u8])` 只把数据加入发送队列。底层 API 需要设置输出回调，并持续调用
+`update(current).await` 驱动输出、确认和重传，同时将收到的 UDP 报文交给 `input`。
+`flush` 是私有实现，调用方不应直接使用。
 
-**可能原因**:
-1. 未设置output回调
-2. 未调用flush()
-3. socket未正确配置
-
-**诊断**:
+输出回调接收拥有所有权的 `Vec<u8>`，返回异步发送结果。例如，`socket` 是已连接的
+`Arc<tokio::net::UdpSocket>` 时：
 
 ```rust
-use kcp_ovo::Kcp;
-
-let mut kcp = Kcp::new(0x11223344, KcpConfig::default())?;
-
-// 设置output回调
-let sent_count = std::sync::Arc::new(std::sync::Mutex::new(0));
-let sent_clone = sent_count.clone();
-
-kcp.set_output(move |data, _kcp| {
-    println!("发送 {} 字节", data.len());
-    *sent_clone.lock().unwrap() += 1;
-    socket.send(data)?;
-    Ok(data.len())
+kcp.set_output(move |data: Vec<u8>| {
+    let socket = socket.clone();
+    async move { socket.send(&data).await.map_err(Into::into) }
 });
-
-// 发送数据
 kcp.send(b"Hello")?;
-
-// 检查队列
-println!("SND queue: {}", kcp.nsnd_que);
-println!("SND buf: {}", kcp.nsnd_buf);
-println!("实际发送: {}", *sent_count.lock().unwrap());
-
-// 必须调用flush()！
-kcp.flush();
+kcp.update(current_time).await?;
 ```
 
-**解决方案**:
+回调可以直接把 `data` 移入异步任务，无需转换成 `Bytes` 或先复制一份。发送失败必须返回错误，
+不能仅打印日志并返回成功。通过 `waitsnd()` 观察待确认段数；高层 API 使用
+`drain(timeout).await` 或 `drain_to(peer, timeout).await` 等待协议确认。
 
-1. 必须设置output回调:
-```rust
-kcp.set_output(|data, _| {
-    socket.send(data)?;
-    Ok(data.len())
-});
-```
+### 问题3: 消息顺序或边界与预期不符
 
-2. 发送后必须flush():
-```rust
-kcp.send(data)?;
-kcp.flush();  // 重要！
-```
-
-3. 检查socket是否连接:
-```rust
-println!("Socket connected: {}", socket.peer_addr().is_ok());
-```
-
-### 问题3: 数据乱序
-
-**症状**:
-接收到的数据顺序与发送不一致
-
-**原因**:
-这是KCP的正常行为，KCP会处理乱序并重组
-
-**验证**:
+底层消息模式按发送顺序交付完整消息，每次 `recv()` 返回一个 `Vec<u8>`；网络报文乱序
+不会使应用消息乱序。接收不完整消息时会返回 `IncompleteData`，不能将其当作完整消息处理。
 
 ```rust
-// 发送
 kcp.send(b"Msg1")?;
 kcp.send(b"Msg2")?;
-kcp.send(b"Msg3")?;
-kcp.flush();
-
-// 接收
-let mut msg1 = [0u8; 4];
-let mut msg2 = [0u8; 4];
-let mut msg3 = [0u8; 4];
-
-// 注意：可能需要多次recv才能收到完整消息
-kcp.recv(&mut msg1)?;  // "Msg1"
-kcp.recv(&mut msg2)?;  // "Msg2"
-kcp.recv(&mut msg3)?;  // "Msg3"
+// 持续驱动两端 update/input 后，在接收端逐条读取：
+let msg1: Vec<u8> = receiver.recv()?;
+let msg2: Vec<u8> = receiver.recv()?;
+assert_eq!(msg1, b"Msg1");
+assert_eq!(msg2, b"Msg2");
 ```
 
-**如果需要消息边界**:
-
-使用流式模式或添加消息长度头:
-
-```rust
-fn send_message(kcp: &mut Kcp, msg: &[u8]) -> KcpResult<()> {
-    // 发送长度前缀
-    let len = msg.len() as u32;
-    kcp.send(&len.to_be_bytes())?;
-
-    // 发送消息体
-    kcp.send(msg)?;
-    kcp.flush()
-}
-
-fn recv_message(kcp: &mut Kcp) -> KcpResult<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    kcp.recv(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    let mut msg = vec![0u8; len];
-    kcp.recv(&mut msg)?;
-    Ok(msg)
-}
-```
+`KcpConfig::stream_mode()` 不保留消息边界，一次 `recv()` 会拼接当前所有可读段。
+需要消息边界时使用消息模式，或在应用协议中维护持久接收缓冲区并解析长度帧；
+不能假定一次流式接收恰好返回一个长度头或一条业务消息。高层 `KcpStream` 使用消息模式。
 
 ## 性能问题
 
@@ -428,7 +351,7 @@ let start = Instant::now();
 
 // 执行1000次update
 for _ in 0..1000 {
-    kcp.update(get_current_ms());
+    kcp.update(get_current_ms()).await?;
 }
 
 let elapsed = start.elapsed();
@@ -442,12 +365,11 @@ println!("1000次update耗时: {:?}", elapsed);
 kcp.interval = 100;  // 从10ms改为100ms
 
 // 或者使用Stream API的自动管理
-use kcp_ovo::{KcpStream, StreamConfig};
+use kcp_ovo::stream::{KcpStream, StreamConfig};
 use std::time::Duration;
 
 let config = StreamConfig {
     update_interval: Duration::from_millis(50),
-    auto_update: true,  // 自动管理
     ..Default::default()
 };
 ```
@@ -467,13 +389,13 @@ error[E0433]: failed to resolve: use of undeclared crate or module `stream`
 
 ```toml
 [dependencies]
-kcp-ovo = { version = "0.7.0", features = ["stream"] }
+kcp-ovo = { version = "0.8.0", features = ["stream"] }
 ```
 
 或使用默认配置:
 ```toml
 [dependencies]
-kcp-ovo = "0.7.0"  # stream已默认启用
+kcp-ovo = "0.8.0"  # stream已默认启用
 ```
 
 ### 问题2: 全局分配器冲突
@@ -490,7 +412,7 @@ error: the `#[global_allocator]` in this crate conflicts with global allocator i
 
 ```toml
 [dependencies]
-kcp-ovo = "0.7.0"
+kcp-ovo = "0.8.0"
 ```
 
 ```bash
@@ -500,6 +422,27 @@ cargo update -p kcp-ovo
 v0.5.1 不再依赖或声明 mimalloc，无需修改库源码。默认配置与仅底层 API 配置均尊重
 应用的分配器选择；应用没有声明全局分配器时使用 Rust 默认分配器。
 若应用需要 mimalloc，应自行添加依赖并只在最终程序中声明全局分配器。
+
+### 问题3: Tokio/bytes 导入、类型或版本冲突
+
+v0.8.0 移除了 `kcp_ovo::tokio` 和 `kcp_ovo::bytes`。应用仍需 Tokio 时，直接在自己的
+`Cargo.toml` 中声明并使用 `tokio`；高层 API 仍需 Tokio 运行时。底层 `recv`、输出回调、
+包数据和编码结果改为 `Vec<u8>`，不再要求下游导入 bytes 类型。
+
+如果出现 `failed to select a version`，检查 `cargo tree` 和双方依赖约束。内部 Tokio/bytes
+分别使用兼容范围 `1.52.3` / `1.11.1`，可以与满足该范围的较新版本统一解析；
+更旧的精确版本或其他不相交约束仍可能冲突。仅移除重导出无法消除精确版本约束造成的冲突。
+
+地址参数现在满足标准库 `ToSocketAddrs + Send + 'static`。遇到局部字符串“不满足 `'static`”时，
+改为移动 `String`（需要保留原值时显式克隆）、传入 `(String, u16)` 或预解析的 `SocketAddr`：
+
+```rust
+let address = format!("{host}:{port}");
+let stream = kcp_ovo::stream::KcpStream::connect(address).await?;
+```
+
+包解析请改用 `KcpPacket::from_bytes(&mut encoded.as_slice())`；`Segment::get_data()` 返回
+借用切片，需在段释放后保留数据时使用 `.to_vec()`。完整语义见 [v0.8.0 迁移](api-guide.md#v080-迁移)。
 
 ## 运行时错误
 
@@ -516,11 +459,11 @@ thread 'main' panicked at 'called `Result::unwrap()` on an `Err` value'
 
 ```rust
 // 错误做法
-let n = kcp.recv(&mut buffer).unwrap();
+let data = kcp.recv().unwrap();
 
 // 正确做法
-match kcp.recv(&mut buffer) {
-    Ok(n) => println!("收到 {} 字节", n),
+match kcp.recv() {
+    Ok(data) => println!("收到 {} 字节", data.len()),
     Err(KcpError::QueueEmpty) => {
         println!("队列为空，正常情况");
     }
@@ -542,14 +485,13 @@ match kcp.recv(&mut buffer) {
 ```rust
 use std::sync::{Arc, Mutex};
 
-// KCP不是线程安全的！
+// 同一控制块的可变操作需要串行执行。
 let kcp = Arc::new(Mutex::new(Kcp::new(conv, config)?));
 
 // 正确的使用方式
 {
     let mut kcp = kcp.lock().unwrap();
     kcp.send(data)?;
-    kcp.flush();
 }  // 锁在此释放
 
 // 不要嵌套锁
@@ -662,7 +604,7 @@ wireshark kcp.pcap
 ```bash
 # CPU性能分析
 cargo install flamegraph
-cargo flamegraph --example stream-api
+cargo flamegraph --example stream-easy-api
 
 # 生成火焰图
 # 打开 flamegraph.svg
@@ -710,17 +652,18 @@ env_logger::init();
 提交Bug时，请提供最小复现示例：
 
 ```rust
-use kcp_ovo::{Kcp, KcpConfig};
+use kcp_ovo::{core::kcp::Kcp, KcpConfig};
 
 fn main() -> kcp_ovo::KcpResult<()> {
     let mut kcp = Kcp::new(0x11223344, KcpConfig::default())?;
 
     // 设置输出
-    kcp.set_output(|data, _| Ok(data.len()))?;
+    kcp.set_output(|data: Vec<u8>| async move { Ok(data.len()) });
 
     // 问题代码
     kcp.send(b"test")?;
-    kcp.recv(&mut [0u8; 1024])?;
+    let received: Vec<u8> = kcp.recv()?;
+    println!("收到 {} 字节", received.len());
 
     Ok(())
 }
@@ -730,7 +673,6 @@ fn main() -> kcp_ovo::KcpResult<()> {
 
 - [ ] 检查conv ID是否匹配
 - [ ] 确认设置了output回调
-- [ ] 验证调用了flush()
 - [ ] 确认定期调用update()
 - [ ] 检查网络连通性
 - [ ] 验证防火墙设置

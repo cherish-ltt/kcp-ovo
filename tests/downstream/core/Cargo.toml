@@ -1,0 +1,16 @@
+[package]
+name = "kcp-ovo-downstream-core"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99.1"
+publish = false
+
+[workspace]
+
+[[test]]
+name = "api"
+path = "api.rs"
+
+# 核心公开 API 无需下游直接依赖异步运行时或字节容器。
+[dependencies]
+kcp-ovo = { path = "../../..", default-features = false }
