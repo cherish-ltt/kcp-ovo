@@ -268,6 +268,31 @@ src/
 | **何时使用** | 新项目开发、需要快速上手、类似TCP的使用体验 |
 | **优点** | 简单易用，几行代码即可使用；自动管理KCP状态更新；异步发送和接收消息；自动处理socket读写 |
 
+高层接口默认使用 `KcpConfig::fast_mode()`，也可以显式配置 MTU、窗口和重传参数：
+
+```rust
+use kcp_ovo::{KcpConfig, stream::{KcpStream, StreamConfig}};
+
+#[tokio::main]
+async fn main() -> kcp_ovo::KcpResult<()> {
+    let protocol = KcpConfig { mtu: 1200, ..KcpConfig::fast_mode_with_wnd(64, 128) };
+    let mut stream = KcpStream::connect_with_kcp_config(
+        "127.0.0.1:8888", StreamConfig::default(), protocol,
+    ).await?;
+    stream.send(b"hello").await?;
+    println!("{:?}", stream.recv().await?);
+    Ok(())
+}
+```
+
+服务端使用同式的 `KcpListener::bind_with_kcp_config(addr, stream_config, kcp_config)`。
+原有构造方法和 `StreamConfig` 字段保持兼容；高层只支持消息模式，拒绝 `stream_mode=true`、
+零窗口或不在 `29..=65507` 内的 MTU。MTU 包含 28 字节 KCP 头，不包含 UDP/IP 头。
+发送上限按实际配置计算为 `255 * (mtu - 28)` 字节，同时消息分片数须能放入对端接收窗口。
+参数不会自动协商，应用应分块发送大数据。
+后台 `StreamConfig.update_interval` 与协议 `KcpConfig.interval` 各自控制更新驱动和刷新周期；
+调参不能替代实际链路测量。完整约束见 [API 指南](docs/api-guide.md#高层协议配置)。
+
 ### 底层API（推荐高级用户）
 
 | 维度 | 说明 |
@@ -364,6 +389,7 @@ cargo test test_stream_mode
 | `window.rs` | 收发窗口、零窗口、窗口通告、探测起步与退避上限、探测不挤占 ACK、长期零窗口后恢复 |
 | `lifecycle.rs` | 创建、更新、关闭、死链 |
 | `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付、队列满后的非阻塞恢复、取消接收、跨会话背压隔离、满额活跃会话保留、外来 conv 隔离、地址族与关闭回收 |
+| `stream_config.rs` | 高层协议配置、旧构造和字面量兼容、normal/fast 与非对称 MTU/窗口抓包、255 分片边界、受损链路和黑洞恢复、双端 drain 超时后恢复确认、20 客户端分块传输超过 1 MiB |
 | `stream_drain.rs` | 高层 FIFO 确认等待、ACK 丢失、损伤与黑洞恢复、取消、会话生命周期、背压及多客户端隔离 |
 | `api_contract.rs` | 公开 API 契约与错误类型；载荷所有权与共享、单段接收复用及窗口恢复、Send/Sync；下游显式设置 System 全局分配器的编译兼容性 |
 | `retransmit.rs` | 重传与死链判定、normal/fast 连续超时期限、退避上限与溢出、ACK/Karn 恢复、1 MiB 正常/成簇丢包/黑洞对照 |

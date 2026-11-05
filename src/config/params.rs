@@ -5,12 +5,16 @@
 /// KCP配置选项
 ///
 /// 定义了KCP协议运行时的各种配置参数
+///
+/// 高层 `KcpStream::connect_with_kcp_config` / `KcpListener::bind_with_kcp_config`
+/// 同样接收此配置，但只支持消息模式；未显式传入时高层 API 使用 `fast_mode()`。
 #[derive(Debug, Clone)]
 pub struct KcpConfig {
     /// 最大传输单元（字节）
     ///
     /// 默认值：1400
     /// 范围：通常在576-1500之间
+    /// 包含 28 字节 KCP 头，不包含 UDP/IP 头；高层 UDP API 要求 29..=65507。
     pub mtu: u32,
 
     /// 内部更新间隔（毫秒）

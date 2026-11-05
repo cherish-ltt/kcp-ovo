@@ -18,7 +18,7 @@ use tokio::time::{Instant, interval, timeout};
 
 use crate::core::kcp::Kcp;
 use crate::error::IncompleteDataType;
-use crate::helper::{IKCP_OVERHEAD, KcpPacketHeader, current_millis, generate_conv};
+use crate::helper::{KcpPacketHeader, current_millis, generate_conv};
 use crate::{KcpConfig, KcpError, KcpResult};
 use std::io::{self};
 use std::net::SocketAddr;
@@ -32,9 +32,15 @@ use drain::{SendCommand, drain, finish_drain};
 pub const CHANNEL_SIZE: usize = 64;
 pub const BUFFER_SIZE: usize = u16::MAX as usize;
 
-fn validate_send_size(len: usize) -> KcpResult<()> {
-    let config = KcpConfig::fast_mode();
-    Kcp::validate_send_size(len, config.mtu as usize - IKCP_OVERHEAD, config.stream_mode)
+fn message_kcp(conv: u32, config: KcpConfig) -> KcpResult<Kcp> {
+    if config.stream_mode {
+        return Err(KcpError::InvalidConfig("high-level API requires message mode".to_string()));
+    }
+    // IPv4 的最小头部和 UDP 头部占 28 字节；两种地址族使用同一可移植上限。
+    if config.mtu > 65_507 {
+        return Err(KcpError::InvalidConfig("UDP mtu must not exceed 65507 bytes".to_string()));
+    }
+    Kcp::new(conv, config)
 }
 
 async fn send_udp(socket: &UdpSocket, data: &[u8], wait: Duration) -> KcpResult<usize> {
@@ -83,6 +89,7 @@ pub struct KcpStream {
     remote: SocketAddr,
     /// 是否已连接
     connected: bool,
+    mss: usize,
 }
 
 impl KcpStream {
@@ -122,9 +129,36 @@ impl KcpStream {
         addr: A,
         config: StreamConfig,
     ) -> KcpResult<Self> {
+        Self::connect_with_kcp_config(addr, config, KcpConfig::fast_mode()).await
+    }
+
+    /// 使用显式协议配置创建消息连接；原有入口仍使用 `KcpConfig::fast_mode()`。
+    ///
+    /// `mtu` 必须在 29..=65507 字节内，收发窗口须非零，`stream_mode` 必须为 false。
+    /// `config.update_interval` 驱动后台更新，`kcp_config.interval` 控制协议刷新；
+    /// 两端不协商参数，单条消息的分片数不得超过对端接收窗口和 255。
+    ///
+    /// ```no_run
+    /// # async fn example() -> kcp_ovo::KcpResult<()> {
+    /// use kcp_ovo::{KcpConfig, stream::{KcpStream, StreamConfig}};
+    /// let protocol = KcpConfig { mtu: 1200, ..KcpConfig::fast_mode_with_wnd(64, 128) };
+    /// let mut stream = KcpStream::connect_with_kcp_config(
+    ///     "127.0.0.1:8888", StreamConfig::default(), protocol,
+    /// ).await?;
+    /// stream.send(b"hello").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn connect_with_kcp_config<A: ToSocketAddrs>(
+        addr: A,
+        config: StreamConfig,
+        kcp_config: KcpConfig,
+    ) -> KcpResult<Self> {
         if config.update_interval.is_zero() {
             return Err(KcpError::InvalidConfig("update_interval must be non-zero".to_string()));
         }
+        let mut kcp = message_kcp(generate_conv(), kcp_config)?;
+        let mss = kcp.mss as usize;
         // 解析地址
         let remote = lookup_host(addr).await?.next().ok_or(KcpError::NoAddress)?;
 
@@ -132,12 +166,6 @@ impl KcpStream {
         let local = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
         let socket = UdpSocket::bind(local).await?;
         socket.connect(remote).await?;
-        // 生成唯一的conv(客户端生成，需服务端确认)
-        let conv = generate_conv();
-
-        // 创建KCP实例
-        let mut kcp = Kcp::new(conv, KcpConfig::fast_mode())?;
-
         // 设置output回调
         let socket = Arc::new(socket);
         let socket_clone = socket.clone();
@@ -217,6 +245,7 @@ impl KcpStream {
             data_receiver: recv_rx,
             remote,
             connected: true,
+            mss,
         })
     }
 
@@ -235,7 +264,7 @@ impl KcpStream {
         if !self.is_connected() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
-        validate_send_size(data.len())?;
+        Kcp::validate_send_size(data.len(), self.mss, false)?;
 
         // 发送数据（放入队列）
         if let Err(e) = self.data_sender.send(SendCommand::Data(data.into())).await {
@@ -287,7 +316,7 @@ impl KcpStream {
         if !self.is_connected() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
-        validate_send_size(data.len())?;
+        Kcp::validate_send_size(data.len(), self.mss, false)?;
         self.data_sender
             .try_send(SendCommand::Data(data.into()))
             .map_err(|e| KcpError::IoError(format!("stream try send err:{}", e)))
@@ -374,6 +403,7 @@ pub struct KcpListener {
     /// 实际绑定的本地地址（绑定 0 端口时用于获取系统分配的端口）
     local_addr: SocketAddr,
     closed: bool,
+    mss: usize,
 }
 
 impl KcpListener {
@@ -413,12 +443,24 @@ impl KcpListener {
         addr: A,
         config: StreamConfig,
     ) -> KcpResult<Self> {
+        Self::bind_with_kcp_config(addr, config, KcpConfig::fast_mode()).await
+    }
+
+    /// 使用显式协议配置监听，所有新会话共用该配置。
+    ///
+    /// 配置约束与 [`KcpStream::connect_with_kcp_config`] 相同，非法配置在绑定前报错。
+    pub async fn bind_with_kcp_config<A: ToSocketAddrs>(
+        addr: A,
+        config: StreamConfig,
+        kcp_config: KcpConfig,
+    ) -> KcpResult<Self> {
         if config.update_interval.is_zero() {
             return Err(KcpError::InvalidConfig("update_interval must be non-zero".to_string()));
         }
         if config.max_sessions == 0 || config.session_idle_timeout.is_zero() {
             return Err(KcpError::InvalidConfig("session limits must be non-zero".to_string()));
         }
+        let mss = message_kcp(0, kcp_config.clone())?.mss as usize;
         let socket = UdpSocket::bind(addr).await.map_err(|e| KcpError::IoError(e.to_string()))?;
         let local_addr = socket.local_addr().map_err(|e| KcpError::IoError(e.to_string()))?;
 
@@ -488,7 +530,7 @@ impl KcpListener {
                                         let id = next_id;
                                         next_id = next_id.wrapping_add(1);
                                         // 新链接进入
-                                        let Ok(mut kcp) = Kcp::new(0, KcpConfig::fast_mode()) else {
+                                        let Ok(mut kcp) = Kcp::new(0, kcp_config.clone()) else {
                                             error!("Kcp create failed");
                                             continue;
                                         };
@@ -597,7 +639,7 @@ impl KcpListener {
             }
         });
 
-        Ok(Self { clients, main_handle, recv_rx, config, local_addr, closed: false })
+        Ok(Self { clients, main_handle, recv_rx, config, local_addr, closed: false, mss })
     }
 
     /// 获取监听器实际绑定的本地地址
@@ -624,7 +666,7 @@ impl KcpListener {
             .get(&addr)
             .map(|client| client.send_tx.clone())
             .ok_or_else(|| KcpError::IoError("listener send_to err: None".to_string()))?;
-        validate_send_size(data.len())?;
+        Kcp::validate_send_size(data.len(), self.mss, false)?;
         sender
             .send(SendCommand::Data(data.to_vec()))
             .await

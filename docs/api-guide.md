@@ -41,6 +41,40 @@ Stream API 不实现 `std::io::Read` / `Write`，监听器不提供 `accept` 或
 
 使用结构体字面量时可用 `..Default::default()` 填充其余字段。空闲回收可能丢弃尚未交付的数据，客户端需要重新连接。
 
+## 高层协议配置
+
+`connect` / `connect_with_config` 和 `bind` / `bind_with_config` 保持 `KcpConfig::fast_mode()`。
+需要调整协议时，分别使用 `KcpStream::connect_with_kcp_config(addr, stream_config, kcp_config)`
+和 `KcpListener::bind_with_kcp_config(addr, stream_config, kcp_config)`；监听器为每个会话使用相同配置。
+`StreamConfig` 的字段保持不变，原有完整结构体字面量仍可编译。
+
+```rust
+use kcp_ovo::{KcpConfig, stream::{KcpListener, KcpStream, StreamConfig}};
+
+#[tokio::main]
+async fn main() -> kcp_ovo::KcpResult<()> {
+    let protocol = KcpConfig { mtu: 1200, ..KcpConfig::fast_mode_with_wnd(64, 128) };
+    let listener = KcpListener::bind_with_kcp_config(
+        "127.0.0.1:8888", StreamConfig::default(), protocol.clone(),
+    ).await?;
+    let _stream = KcpStream::connect_with_kcp_config(
+        listener.local_addr(), StreamConfig::default(), protocol,
+    ).await?;
+    Ok(())
+}
+```
+
+构造函数在解析地址或绑定 socket 前验证：MTU 为 `29..=65507` 字节、收发窗口非零、
+`stream_mode=false`，不满足时返回 `KcpError::InvalidConfig`。MTU 包含 28 字节 KCP 头，
+不包含 UDP/IP 头；65507 是本接口为 IPv4/IPv6 采用的共同 UDP 载荷上限，并不保证路径或操作系统接受该大小。
+`normal_mode()`、`fast_mode()` 的重传/拥塞策略均可使用，底层字节流模式只通过 `Kcp` 使用。
+
+`StreamConfig.update_interval` 是后台调用 `update` 的周期，`KcpConfig.interval` 是协议刷新周期；
+把协议周期调得比后台周期短不会增加后台唤醒次数。参数不会自动协商，两端 MTU 和窗口可以不同，
+但单条消息的分片数须能放入对端接收窗口，否则消息可能无法完成组装。
+`send`、`try_send`、`send_to` 都按本端实际 `MSS = mtu - 28` 校验，最多发送 `255 * MSS` 字节，
+超出时在入队前返回 `InvalidConfig`，不影响此前及后续合法消息；更大的数据应由应用分块。
+
 ## 底层 Kcp
 
 `Kcp::new(conv, config)` 创建控制块，`set_output` 注册异步发包回调；`send` 入队，`input` 输入收到的 UDP 报文，`update(current).await` 推进协议，`check(current)` 返回下次调度时间，`peeksize` / `recv` 读取数据，`waitsnd` 查看待发送段数。双方必须约定兼容的会话和协议配置。完整签名以 `cargo doc --open` 和源码为准，本地示例见 [low-level-api.rs](../examples/low-level-api.rs)。
