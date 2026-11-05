@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use log::{debug, error, warn};
 use tokio::net::{ToSocketAddrs, UdpSocket, lookup_host};
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval, timeout};
 
@@ -23,6 +24,10 @@ use std::io::{self};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+
+mod drain;
+
+use drain::{SendCommand, drain, finish_drain};
 
 pub const CHANNEL_SIZE: usize = 64;
 pub const BUFFER_SIZE: usize = u16::MAX as usize;
@@ -36,6 +41,13 @@ fn message_kcp(conv: u32, config: KcpConfig) -> KcpResult<Kcp> {
         return Err(KcpError::InvalidConfig("UDP mtu must not exceed 65507 bytes".to_string()));
     }
     Kcp::new(conv, config)
+}
+
+async fn send_udp(socket: &UdpSocket, data: &[u8], wait: Duration) -> KcpResult<usize> {
+    timeout(wait, socket.send(data))
+        .await
+        .map_err(|_| KcpError::IoError("UDP output timed out".to_string()))?
+        .map_err(KcpError::from)
 }
 
 /// Stream配置
@@ -70,7 +82,7 @@ pub struct KcpStream {
     /// 主线程
     main_handle: JoinHandle<()>,
     /// 发送数据channel-sender
-    data_sender: Sender<Vec<u8>>,
+    data_sender: Sender<SendCommand>,
     /// 接收数据channel-receiver
     data_receiver: Receiver<Vec<u8>>,
     /// 远程地址
@@ -160,20 +172,17 @@ impl KcpStream {
         let timeout_duration = config.connect_timeout;
         kcp.set_output(move |data| {
             let socket_clone = socket_clone.clone();
-            async move {
-                let _ = timeout(timeout_duration, socket_clone.send(&data))
-                    .await
-                    .map_err(|_e| KcpError::IoError("send data fail".to_string()))?;
-                Ok(data.len())
-            }
+            async move { send_udp(&socket_clone, &data, timeout_duration).await }
         });
 
-        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+        let (data_tx, mut data_rx) = mpsc::channel::<SendCommand>(CHANNEL_SIZE);
         let (recv_tx, recv_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
         let main_handle = tokio::spawn(async move {
             let mut interval = interval(config.update_interval);
             let mut buf = vec![0; BUFFER_SIZE];
+            let mut pending = None;
             loop {
+                finish_drain(&kcp, &mut pending);
                 let readable = match kcp.peeksize() {
                     Ok(_) => true,
                     Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr)) => {
@@ -195,6 +204,7 @@ impl KcpStream {
                     _ = interval.tick() => {
                         if let Err(e) = kcp.update(current_millis()).await {
                             error!("kcp update err:{}", e);
+                            break;
                         }
                     }
                     result = socket.recv(&mut buf) => {
@@ -204,21 +214,25 @@ impl KcpStream {
                                     error!("kcp input err:{}", e);
                                 }
                             }
-                            Err(e) => error!("socket err:{}", e),
-                        }
-                    }
-                    result = data_rx.recv() => {
-                        match result {
-                            Some(data) => {
-                                match kcp.send(&data) {
-                                    Ok(size) => {debug!("send data(size-{}) success", size)},
-                                    Err(e) => error!("send data err:{}", e),
-                                }
-
-                            }
-                            None => {
+                            Err(e) => {
+                                error!("socket err:{}", e);
                                 break;
                             },
+                        }
+                    }
+                    _ = async { pending.as_mut().unwrap().closed().await }, if pending.is_some() => {
+                        pending = None;
+                    }
+                    result = data_rx.recv(), if pending.is_none() => {
+                        match result {
+                            Some(SendCommand::Data(data)) => {
+                                if let Err(e) = kcp.send(&data) {
+                                    error!("send data err:{}", e);
+                                    break;
+                                }
+                            }
+                            Some(SendCommand::Drain(reply)) => pending = Some(reply),
+                            None => break,
                         }
                     }
                 }
@@ -253,12 +267,27 @@ impl KcpStream {
         Kcp::validate_send_size(data.len(), self.mss, false)?;
 
         // 发送数据（放入队列）
-        if let Err(e) = self.data_sender.send(data.into()).await {
+        if let Err(e) = self.data_sender.send(SendCommand::Data(data.into())).await {
             error!("stream send err: {}", e);
             return Err(KcpError::IoError(format!("stream send err: {}", e)));
         }
 
         Ok(())
+    }
+
+    /// 等待此前成功入队的数据获得 KCP 确认，并输出当前待发 ACK 与窗口通告。
+    ///
+    /// 总期限包含等待控制请求入队的时间，从 future 首次轮询开始计算。
+    /// 成功不代表对端应用已读取或持久化；超时不代表数据未到达。
+    /// 取消或超时不撤回已接收的数据，close/Drop 仍立即终止后台任务。
+    /// future 绑定当前连接，可在等待期间继续 recv 或显式 close。
+    pub fn drain(&self, wait: Duration) -> impl Future<Output = KcpResult<()>> + Send + 'static {
+        let sender = if self.is_connected() {
+            Ok(self.data_sender.clone())
+        } else {
+            Err(KcpError::IoError("stream closed".to_string()))
+        };
+        drain(sender, wait)
     }
 
     /// 接收数据(阻塞)
@@ -289,7 +318,7 @@ impl KcpStream {
         }
         Kcp::validate_send_size(data.len(), self.mss, false)?;
         self.data_sender
-            .try_send(data.into())
+            .try_send(SendCommand::Data(data.into()))
             .map_err(|e| KcpError::IoError(format!("stream try send err:{}", e)))
     }
 
@@ -337,7 +366,7 @@ pub struct Clinet {
     /// listener-msg
     data_tx: Sender<Vec<u8>>,
     /// send-msg
-    send_tx: Sender<Vec<u8>>,
+    send_tx: Sender<SendCommand>,
     conv: u32,
     id: u64,
     last_active: Instant,
@@ -440,7 +469,8 @@ impl KcpListener {
         let cleanup = ClientCleanup(clients.clone());
         // 设置output回调
         let socket = Arc::new(socket);
-        let (udp_tx, mut udp_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, u64)>(CHANNEL_SIZE);
+        let (udp_tx, mut udp_rx) =
+            mpsc::channel::<(Vec<u8>, SocketAddr, u64, oneshot::Sender<()>)>(CHANNEL_SIZE);
         let (recv_tx, recv_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_SIZE);
         let timeout_druation = Duration::from_millis(100);
         let max_sessions = config.max_sessions;
@@ -464,12 +494,12 @@ impl KcpListener {
                     }
                     result = udp_rx.recv() => {
                         match result {
-                            Some((data, addr, id)) => {
+                            Some((data, addr, id, sent)) => {
                                 if !clients_clone.get(&addr).is_some_and(|client| client.id == id) {
                                     continue;
                                 }
                                 match timeout(timeout_druation, socket.send_to(&data, addr)).await {
-                                    Ok(Ok(_)) => {},
+                                    Ok(Ok(_)) => { let _ = sent.send(()); },
                                     result => {
                                         error!("socket.send_to err: {:?}", result);
                                         clients_clone.remove_if(&addr, |_, client| client.id == id);
@@ -505,21 +535,25 @@ impl KcpListener {
                                             continue;
                                         };
                                         let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
-                                        let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+                                        let (send_tx, mut send_rx) = mpsc::channel::<SendCommand>(CHANNEL_SIZE);
 
                                         kcp.set_output(move |data| {
                                             let udp_tx_clone = udp_tx_clone.clone();
                                             async move {
                                                 let len = data.len();
-                                                udp_tx_clone.send((data.to_vec(),addr,id))
+                                                let (sent, completed) = oneshot::channel();
+                                                udp_tx_clone.send((data.to_vec(), addr, id, sent))
                                                     .await
                                                     .map_err(|_e| KcpError::IoError("send data fail".to_string()))?;
+                                                completed.await.map_err(|_| KcpError::IoError("UDP output stopped".to_string()))?;
                                                 Ok(len)
                                             }
                                         });
                                         let main_handle = tokio::spawn(async move {
                                             let mut interval = interval(config.update_interval);
+                                            let mut pending = None;
                                             loop{
+                                                finish_drain(&kcp, &mut pending);
                                                 let readable = match kcp.peeksize() {
                                                     Ok(_) => true,
                                                     Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr)) => {
@@ -555,14 +589,18 @@ impl KcpListener {
                                                             None => break,
                                                         }
                                                     }
-                                                    result = send_rx.recv() => {
+                                                    _ = async { pending.as_mut().unwrap().closed().await }, if pending.is_some() => {
+                                                        pending = None;
+                                                    }
+                                                    result = send_rx.recv(), if pending.is_none() => {
                                                         match result {
-                                                            Some(data) => {
-                                                                match kcp.send(&data) {
-                                                                    Ok(size) => debug!("listener send data(size-{}) success", size),
-                                                                    Err(e) => error!("listener send data err:{}", e),
+                                                            Some(SendCommand::Data(data)) => {
+                                                                if let Err(e) = kcp.send(&data) {
+                                                                    error!("listener send data err:{}", e);
+                                                                    break;
                                                                 }
                                                             }
+                                                            Some(SendCommand::Drain(reply)) => pending = Some(reply),
                                                             None => break,
                                                         }
                                                     }
@@ -630,10 +668,27 @@ impl KcpListener {
             .ok_or_else(|| KcpError::IoError("listener send_to err: None".to_string()))?;
         Kcp::validate_send_size(data.len(), self.mss, false)?;
         sender
-            .send(data.to_vec())
+            .send(SendCommand::Data(data.to_vec()))
             .await
             .map_err(|e| KcpError::IoError(format!("listener send_to err: {}", e)))?;
         Ok(())
+    }
+
+    /// 等待指定会话此前入队的数据获得 KCP 确认，并输出当前待发 ACK 与窗口通告。
+    ///
+    /// 期限、取消及成功语义与 [`KcpStream::drain`] 相同。future 在调用时绑定
+    /// 当前会话；同地址的新会话不能完成旧等待。其他会话仍可独立收发。
+    pub fn drain_to(
+        &self,
+        addr: SocketAddr,
+        wait: Duration,
+    ) -> impl Future<Output = KcpResult<()>> + Send + 'static {
+        let sender = if self.closed || self.main_handle.is_finished() {
+            None
+        } else {
+            self.clients.get(&addr).map(|client| client.send_tx.clone())
+        };
+        drain(sender.ok_or_else(|| KcpError::IoError("session unavailable".to_string())), wait)
     }
 
     /// recv
@@ -660,6 +715,30 @@ mod test {
     use tokio::time::sleep;
 
     use super::*;
+
+    #[tokio::test]
+    async fn udp_output_preserves_socket_error() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(peer.local_addr().unwrap()).await.unwrap();
+        let result = send_udp(&socket, &vec![0; 65_508], Duration::from_secs(1)).await;
+        assert!(matches!(result, Err(KcpError::IoError(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn stopped_stream_worker_wakes_confirmation_waiter() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut stream = KcpStream::connect(peer.local_addr().unwrap()).await.unwrap();
+        stream.send(b"unconfirmed").await.unwrap();
+        let waiting = tokio::spawn(stream.drain(Duration::from_secs(60)));
+        let mut buf = [0; 1500];
+        peer.recv(&mut buf).await.unwrap();
+        stream.main_handle.abort();
+        assert!(matches!(
+            timeout(Duration::from_secs(1), waiting).await.unwrap().unwrap(),
+            Err(KcpError::IoError(_))
+        ));
+    }
 
     #[tokio::test]
     async fn stopped_worker_reports_disconnection() {

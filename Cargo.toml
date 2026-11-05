@@ -58,6 +58,10 @@ name = "stream_config"
 path = "tests/stream_config.rs"
 
 [[test]]
+name = "stream_drain"
+path = "tests/stream_drain.rs"
+
+[[test]]
 name = "api_contract"
 path = "tests/api_contract.rs"
 

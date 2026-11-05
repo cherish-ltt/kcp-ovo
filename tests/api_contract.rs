@@ -32,6 +32,7 @@ fn every_error_has_distinct_kind() {
         (KcpError::OutputNotSet, KcpErrorKind::OutputNotSet),
         (KcpError::IoError("x".into()), KcpErrorKind::IoError),
         (KcpError::NoAddress, KcpErrorKind::NoAddress),
+        (KcpError::TimedOut, KcpErrorKind::TimedOut),
     ];
     for (err, expected) in cases {
         assert_eq!(err.kind(), expected, "错误 {err:?} 的分类不匹配");
@@ -51,6 +52,7 @@ fn every_error_is_displayable() {
         KcpError::OutputNotSet,
         KcpError::IoError("io".into()),
         KcpError::NoAddress,
+        KcpError::TimedOut,
     ];
     for err in errors {
         let text = err.to_string();

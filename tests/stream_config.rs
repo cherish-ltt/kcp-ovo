@@ -3,6 +3,8 @@
 mod common;
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -255,6 +257,97 @@ async fn custom_protocol_recovers_from_loss_reordering_and_blackout() {
         assert!(stats.reordered > 0 && stats.duplicated > 0);
         assert_eq!(stats.max_client_packet, 128);
         assert_eq!(stats.max_server_packet, 128);
+        relay.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn asymmetric_mtu_drains_both_directions_after_blackhole_timeout() {
+    for client_fast in [false, true] {
+        let normal = KcpConfig::normal_mode();
+        let fast = KcpConfig::fast_mode();
+        let (client_base, server_base) = if client_fast { (fast, normal) } else { (normal, fast) };
+        let client_config = KcpConfig { mtu: 128, snd_wnd: 8, rcv_wnd: 16, ..client_base };
+        let server_config = KcpConfig { mtu: 576, snd_wnd: 16, rcv_wnd: 32, ..server_base };
+        let mut listener =
+            KcpListener::bind_with_kcp_config("127.0.0.1:0", transport(), server_config)
+                .await
+                .unwrap();
+        let blocked = Arc::new(AtomicBool::new(false));
+        let discarded = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let filtering = blocked.clone();
+        let observed = discarded.clone();
+        let relay = UdpRelay::start_with_filter(
+            listener.local_addr(),
+            Net::default().with_delay(1),
+            0x40_41,
+            move |_, from_server| {
+                let discard = filtering.load(Ordering::SeqCst);
+                if discard {
+                    observed[usize::from(from_server)].fetch_add(1, Ordering::SeqCst);
+                }
+                discard
+            },
+        )
+        .await;
+        let mut client = KcpStream::connect_with_kcp_config(relay.addr, transport(), client_config)
+            .await
+            .unwrap();
+        timeout(LIMIT, async {
+            client.send(b"ready").await.unwrap();
+            let (ready, peer) = listener.recv().await.unwrap();
+            assert_eq!(ready, b"ready");
+            let (client_done, server_done) =
+                tokio::join!(client.drain(LIMIT), listener.drain_to(peer, LIMIT));
+            client_done.unwrap();
+            server_done.unwrap();
+
+            let request = Rng::new(40).bytes(2301);
+            let response = Rng::new(41).bytes(5001);
+            blocked.store(true, Ordering::SeqCst);
+            client.send(&request).await.unwrap();
+            listener.send_to(&response, peer).await.unwrap();
+            // 超时跨过两个 normal 刷新周期，确保两个方向都实际经历黑洞。
+            let wait = Duration::from_millis(200);
+            let (client_done, server_done) =
+                tokio::join!(client.drain(wait), listener.drain_to(peer, wait));
+            assert_eq!(client_done.unwrap_err(), KcpError::TimedOut);
+            assert_eq!(server_done.unwrap_err(), KcpError::TimedOut);
+            for (direction, count) in discarded.iter().enumerate() {
+                assert!(
+                    count.load(Ordering::SeqCst) > 0,
+                    "direction={direction}, client_fast={client_fast} must enter blackhole"
+                );
+            }
+
+            blocked.store(false, Ordering::SeqCst);
+            let (client_done, server_done, received, delivered) = tokio::join!(
+                client.drain(LIMIT),
+                listener.drain_to(peer, LIMIT),
+                client.recv(),
+                listener.recv(),
+            );
+            client_done.unwrap();
+            server_done.unwrap();
+            assert_eq!(received.unwrap(), response);
+            assert_eq!(delivered.unwrap(), (request, peer));
+
+            client.send(b"after timeout").await.unwrap();
+            listener.send_to(b"after recovery", peer).await.unwrap();
+            assert_eq!(listener.recv().await.unwrap(), (b"after timeout".to_vec(), peer));
+            assert_eq!(client.recv().await.unwrap(), b"after recovery");
+            let (client_done, server_done) =
+                tokio::join!(client.drain(LIMIT), listener.drain_to(peer, LIMIT));
+            client_done.unwrap();
+            server_done.unwrap();
+            client.close().unwrap();
+            listener.close().unwrap();
+        })
+        .await
+        .expect("asymmetric protocol drain recovery deadline");
+        let stats = *relay.stats.lock().unwrap();
+        assert_eq!(stats.max_client_packet, 128);
+        assert_eq!(stats.max_server_packet, 576);
         relay.stop().await;
     }
 }
