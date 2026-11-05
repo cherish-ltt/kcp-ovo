@@ -614,3 +614,10 @@ CI 与发布校验必须覆盖全 feature 和 `--no-default-features` 两种配�
 - 核心实例由单个任务独占驱动，未经并发证据不添加缓存行填充；公开 `Segment` 字段不借用高位存放隐藏状态，也不以破坏公开语义换取位掩码优化。
 - `timing::dead_link_rejects_entire_data_batch_before_output` 保证死链预检发生在数据输出前；逐段输出只在 await 成功后提交状态，取消安全测试必须保留。
 - `timing::ack_deduplication_handles_gaps_unsent_and_wrapped_sequences`、`timing::reordered_receive_queue_preserves_messages_across_reuse_and_wrap` 覆盖去重、乱序插入与回绕；`api_contract` 的共享载荷测试验证复制消除和所有权生命周期。
+
+### 10.10 高层协议配置契约
+
+- `StreamConfig` 只配置后台传输和会话生命周期；其字段保持兼容。显式协议参数通过 `connect_with_kcp_config` / `bind_with_kcp_config` 传入，旧入口保留 fast 默认值。
+- 高层接口只支持消息模式；构造时校验 UDP MTU `29..=65507` 和非零窗口，所有发送入口必须与后台控制块使用同一 MSS 的 255 分片校验。不得在后台才发现超限发送。
+- `tests/stream_config.rs` 用真实 UDP 抓包验证 MTU、窗口与旧默认行为，覆盖非对称配置、拒绝后恢复、最大消息、受损链路及 20 客户端超过 1 MiB 的分块传输；新增协议组合同步加入 `tests/common/stress.rs::config_matrix()`。
+- `tests/common/udp.rs` 统一提供固定种子网络损伤及按报文过滤的回环代理，所有网络测试使用有界超时并清理后台任务；固定种子不保证操作系统调度顺序固定。

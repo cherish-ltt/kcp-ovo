@@ -54,6 +54,10 @@ name = "stream_api"
 path = "tests/stream_api.rs"
 
 [[test]]
+name = "stream_config"
+path = "tests/stream_config.rs"
+
+[[test]]
 name = "api_contract"
 path = "tests/api_contract.rs"
 

@@ -164,6 +164,8 @@ pub fn config_matrix() -> Vec<Case> {
 
     vec![
         Case::same("stream", stream),
+        Case::same("normal_preset", KcpConfig::normal_mode()),
+        Case::same("fast_preset", KcpConfig::fast_mode()),
         Case::same("normal", normal),
         Case::same("tiny_mtu", tiny_mtu),
         Case::same("big_wnd", big_wnd),
@@ -187,6 +189,11 @@ pub fn config_matrix() -> Vec<Case> {
             name: "asym_mtu",
             a: KcpConfig { mtu: 900, ..KcpConfig::stream_mode() },
             b: KcpConfig { mtu: 1400, ..KcpConfig::stream_mode() },
+        },
+        Case {
+            name: "asym_message_mtu",
+            a: KcpConfig { mtu: 128, ..KcpConfig::fast_mode_with_wnd(8, 32) },
+            b: KcpConfig { mtu: 576, ..KcpConfig::normal_mode() },
         },
     ]
 }
