@@ -63,13 +63,19 @@ Stream 的发送接口成功表示数据已进入本地队列，并非对端已�
 
 监听器默认最多保留 1024 个会话，并在 300 秒未收到有效报文后回收会话；可通过 `StreamConfig` 的 `max_sessions` 和 `session_idle_timeout` 调整，两者必须大于零，`update_interval` 也必须大于零。会话被回收后，空闲客户端需要重新连接。客户端按解析出的第一个地址选择 IPv4 或 IPv6，不会自动尝试后续地址。使用 `StreamConfig` 结构体字面量时，请通过 `..Default::default()` 填充未指定的字段。
 
+### v0.7.0 升级
+
+高层消息 API 现在支持有总期限的 `drain` / `drain_to`，以及显式 MTU、窗口和重传配置；旧构造仍采用 fast 默认值。文件传输示例使用双端确认收尾。新增 `TimedOut` 错误成员，下游穷尽匹配须补充分支；协议确认不代表业务处理或落盘，超时也不证明未收到。
+
+使用与兼容性见 [v0.7.0 发布说明](.version/RELEASE-v0.7.0.md)，验收场景、实际结果及平台限制见 [v0.7.0 验证记录](docs/stream-v0.7.0.md)。
+
 ### 安装
 
 在`Cargo.toml`中添加：
 
 ```toml
 [dependencies]
-kcp-ovo = "0.6.0"
+kcp-ovo = "0.7.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -327,13 +333,13 @@ Rust 默认分配器。需要 mimalloc 等分配器的应用应自行添加依�
 
 ```toml
 # 默认配置（包含Stream API）
-kcp-ovo = "0.6.0"
+kcp-ovo = "0.7.0"
 
 # 仅使用底层API
-kcp-ovo = { version = "0.6.0", default-features = false }
+kcp-ovo = { version = "0.7.0", default-features = false }
 
 # 显式启用Stream API
-kcp-ovo = { version = "0.6.0", features = ["stream"] }
+kcp-ovo = { version = "0.7.0", features = ["stream"] }
 ```
 
 ## 🧪 测试

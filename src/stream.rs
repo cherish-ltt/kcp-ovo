@@ -290,15 +290,11 @@ impl KcpStream {
         drain(sender, wait)
     }
 
-    /// 接收数据(阻塞)
-    ///
-    /// # 参数
-    ///
-    /// - `buf`: 接收缓冲区
+    /// 异步等待并接收一条消息。
     ///
     /// # 返回
     ///
-    /// 返回接收到的Vec<u8>
+    /// 返回接收到的 `Vec<u8>`。
     pub async fn recv(&mut self) -> KcpResult<Vec<u8>> {
         if !self.is_connected() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
