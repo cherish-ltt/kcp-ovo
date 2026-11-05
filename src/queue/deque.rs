@@ -204,7 +204,6 @@ impl IntoIterator for KcpDeque {
 mod tests {
     use super::*;
     use crate::{helper::KcpPacket, queue::segment::Segment};
-    use bytes::Bytes;
 
     #[test]
     fn test_deque_new() {
@@ -220,13 +219,13 @@ mod tests {
             0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1,
             2, 3,
         ];
-        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let kcp_packet = KcpPacket::from_bytes(&mut data.as_slice()).unwrap();
         let seg1 = Segment::new(kcp_packet);
         let data: Vec<u8> = vec![
             0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 4,
             5, 6,
         ];
-        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let kcp_packet = KcpPacket::from_bytes(&mut data.as_slice()).unwrap();
         let seg2 = Segment::new(kcp_packet);
 
         deque.push_back(seg1);
@@ -247,7 +246,7 @@ mod tests {
             0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1,
             2, 3,
         ];
-        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let kcp_packet = KcpPacket::from_bytes(&mut data.as_slice()).unwrap();
         let seg = Segment::new(kcp_packet);
 
         deque.push_front(seg.clone());
@@ -264,13 +263,13 @@ mod tests {
             0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1,
             2, 3,
         ];
-        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let kcp_packet = KcpPacket::from_bytes(&mut data.as_slice()).unwrap();
         let seg1 = Segment::new(kcp_packet);
         let data: Vec<u8> = vec![
             0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 4,
             5, 6,
         ];
-        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let kcp_packet = KcpPacket::from_bytes(&mut data.as_slice()).unwrap();
         let seg2 = Segment::new(kcp_packet);
 
         deque.push_back(seg1);
@@ -292,13 +291,13 @@ mod tests {
             0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1,
             2, 3,
         ];
-        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let kcp_packet = KcpPacket::from_bytes(&mut data.as_slice()).unwrap();
         let seg1 = Segment::new(kcp_packet);
         let data: Vec<u8> = vec![
             0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 4,
             5, 6,
         ];
-        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let kcp_packet = KcpPacket::from_bytes(&mut data.as_slice()).unwrap();
         let seg2 = Segment::new(kcp_packet);
 
         deque.push_back(seg1);
@@ -315,7 +314,7 @@ mod tests {
             0, 0, 0, 1, 81, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1,
             2, 3,
         ];
-        let kcp_packet = KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&data)).unwrap();
+        let kcp_packet = KcpPacket::from_bytes(&mut data.as_slice()).unwrap();
         let seg = Segment::new(kcp_packet);
 
         deque.push_back(seg.clone());

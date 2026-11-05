@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
 use kcp_ovo::helper::{IKCP_OVERHEAD, KcpCmd, KcpPacketHeader};
 use kcp_ovo::stream::{KcpListener, KcpStream, StreamConfig};
 use kcp_ovo::{KcpConfig, KcpError};
@@ -122,8 +121,7 @@ async fn observed_window(socket: &UdpSocket) -> (usize, u16, usize) {
         let mut max_size = 0;
         loop {
             let (size, source) = socket.recv_from(&mut buf).await.unwrap();
-            let (header, _) =
-                KcpPacketHeader::from_bytes(&mut Bytes::copy_from_slice(&buf[..size])).unwrap();
+            let (header, _) = KcpPacketHeader::from_bytes(&mut &buf[..size]).unwrap();
             if header.cmd != KcpCmd::Push {
                 continue;
             }

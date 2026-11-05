@@ -10,9 +10,15 @@ Stream API 不实现 `std::io::Read` / `Write`，监听器不提供 `accept` 或
 
 ## 客户端与监听器
 
-`KcpStream::connect(addr).await` 或 `connect_with_config(addr, config).await` 创建客户端。`send(&[u8]).await` 入队消息，`recv().await` 返回一条消息；`try_send` / `try_recv` 不等待。`remote_addr` 返回所选地址，`is_connected` 表示本地任务仍在运行，并不证明远端可达。主机名使用解析出的第一个地址，不自动尝试后续地址。
+`KcpStream::connect(addr).await` 或 `connect_with_config(addr, config).await` 创建客户端。`send(&[u8]).await` 入队消息，`recv().await` 返回一条 `Vec<u8>` 消息；`try_send` / `try_recv` 不等待。`remote_addr` 返回所选地址，`is_connected` 表示本地任务仍在运行，并不证明远端可达。主机名使用解析出的第一个地址，不自动尝试后续地址。
 
 `KcpListener::bind(addr).await` 或 `bind_with_config(addr, config).await` 创建监听器；`local_addr` 返回实际绑定地址。`recv().await` 返回 `(Vec<u8>, SocketAddr)`，使用 `send_to(&data, addr).await` 回复已有会话。两者的 `close` 会停止后台任务并丢弃待处理数据，不等待发送确认。
+
+所有 connect/bind 构造函数的地址参数满足 `std::net::ToSocketAddrs + Send + 'static`，
+支持标准库地址类型及自定义实现。地址解析在后台执行，不阻塞异步执行线程；
+监听器按解析顺序尝试绑定，客户端仍只使用第一个地址。字符串字面量可以直接传入，
+非静态借用应改为拥有所有权的 `String`、`(String, u16)` 或预解析的 `SocketAddr`。
+高层操作需要 Tokio 运行时，但公开签名不包含 Tokio 类型或 trait。
 
 发送成功表示消息进入本地队列，而不是对端收到。消息模式单次发送最多 255 个分片，接收窗口必须足以容纳完整消息。UDP 和 KCP 不提供应用层身份认证、加密或业务交付确认。
 
@@ -80,3 +86,41 @@ async fn main() -> kcp_ovo::KcpResult<()> {
 `Kcp::new(conv, config)` 创建控制块，`set_output` 注册异步发包回调；`send` 入队，`input` 输入收到的 UDP 报文，`update(current).await` 推进协议，`check(current)` 返回下次调度时间，`peeksize` / `recv` 读取数据，`waitsnd` 查看待发送段数。双方必须约定兼容的会话和协议配置。完整签名以 `cargo doc --open` 和源码为准，本地示例见 [low-level-api.rs](../examples/low-level-api.rs)。
 
 `KcpConfig::default()` 为消息模式；`fast_mode()`、`fast_mode_with_wnd()` 和 `stream_mode()` 是预设。底层流模式不保留消息边界，通信两端必须使用相同模式；高层 `KcpStream` 使用消息模式，不能通过 `StreamConfig` 切换到底层流模式。
+
+## v0.8.0 迁移
+
+| v0.7.x 用法 | v0.8.0 用法 |
+| --- | --- |
+| `kcp_ovo::tokio` / `kcp_ovo::bytes` | 应用需要时直接声明并导入 `tokio` / `bytes`，本库不再重导出 |
+| `Kcp::recv() -> KcpResult<Bytes>` | 返回 `KcpResult<Vec<u8>>`，可直接交给接收 `Vec<u8>` 的代码 |
+| `set_output` 的 `Bytes` 参数 | 回调接收 `Vec<u8>`；可移动到异步任务，不必 `.to_vec()` |
+| `KcpPacket::data` / `new_with_data` 的 `Bytes` | 使用拥有所有权的 `Vec<u8>` |
+| Header/Packet 的 `to_bytes` 返回 `BytesMut` / `Bytes` | 均返回 `Vec<u8>` |
+| Header/Packet 的 `from_bytes(&mut Bytes)` | 改为 `from_bytes(&mut &[u8])` |
+| `Segment::get_data() -> Bytes` | 返回 `&[u8]`；独立保留载荷时使用 `.to_vec()` |
+| 构造入口接受 Tokio 的 `ToSocketAddrs` | 改为标准库 `ToSocketAddrs + Send + 'static` |
+
+Header 解析返回 `(KcpPacketHeader, &[u8])`，其中剩余切片借用原输入；Header 与 Packet
+解析都只将输入推进 28 字节到载荷起点，不消费载荷。短头错误不推进输入；完整头但载荷不足时，
+Packet 解析返回错误且输入已推进头部。Packet 仅复制头部声明长度的载荷，返回值独立于原输入存活。
+
+```rust
+use kcp_ovo::{KcpCmd, helper::{KcpPacket, KcpPacketHeader}};
+
+let header = KcpPacketHeader::new(1, KcpCmd::Push, 0, 128, 0, 0, 0, 4);
+let encoded: Vec<u8> = KcpPacket::new_with_data(header, b"data".to_vec()).to_bytes()?;
+let mut input = encoded.as_slice();
+let packet = KcpPacket::from_bytes(&mut input)?;
+assert_eq!(input, b"data");
+assert_eq!(packet.data, b"data");
+```
+
+载荷内部直接持有 `Vec<u8>`，单段 `recv` 转移已有分配，输出回调与高层接收也直接移动缓冲区。
+`freeze()` 的结果仍是 `Bytes`，不适用于要求 `Vec<u8>` 的公开边界；借用输入取得独立所有权、
+多段组装及头部与载荷编码仍保留必要复制，不承诺端到端零复制。
+显式克隆 `KcpPacket`、`Segment` 或含有载荷的 `KcpDeque` 会复制 `Vec<u8>` 内容，
+不再共享引用计数载荷；只读取数据时优先借用，转交所有权时优先移动。
+
+内部依赖使用 `tokio = "1.52.3"`、`bytes = "1.11.1"` 的 Cargo 兼容范围，允许解析到
+满足范围的较新版本；不要求下游精确使用库锁文件里的版本。范围不包含更旧版本或下一主版本，
+高层 API 也没有变成与运行时无关的接口。仅使用底层 API 的应用无需直接依赖 Tokio 或 bytes。

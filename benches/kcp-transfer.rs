@@ -18,7 +18,6 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use kcp_ovo::config::KcpConfig;
 use kcp_ovo::core::kcp::Kcp;
@@ -47,7 +46,7 @@ const SEED: u64 = 0x4b43_505f_4245_4e43;
 struct Link {
     loss: f64,
     rng: StdRng,
-    inflight: VecDeque<Bytes>,
+    inflight: VecDeque<Vec<u8>>,
 }
 
 impl Link {
@@ -55,7 +54,7 @@ impl Link {
         Self { loss, rng: StdRng::seed_from_u64(seed), inflight: VecDeque::new() }
     }
 
-    fn admit(&mut self, packets: &Arc<Mutex<VecDeque<Bytes>>>) {
+    fn admit(&mut self, packets: &Arc<Mutex<VecDeque<Vec<u8>>>>) {
         let mut packets = packets.lock().unwrap();
         for p in packets.drain(..) {
             if self.loss > 0.0 && self.rng.random::<f64>() < self.loss {
@@ -78,8 +77,8 @@ async fn transfer_once(loss: f64, payload: &[u8]) -> u64 {
     let mut sender = Kcp::new(CONV, cfg.clone()).unwrap();
     let mut receiver = Kcp::new(CONV, cfg.clone()).unwrap();
 
-    let up_out: Arc<Mutex<VecDeque<Bytes>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let down_out: Arc<Mutex<VecDeque<Bytes>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let up_out: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let down_out: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     let sink = up_out.clone();
     sender.set_output(move |data| {
@@ -123,7 +122,7 @@ async fn transfer_once(loss: f64, payload: &[u8]) -> u64 {
             match receiver.recv() {
                 Ok(data) => {
                     let size = (payload.len() - recv_bytes).min(cfg.mtu as usize);
-                    assert_eq!(data.as_ref(), &payload[recv_bytes..recv_bytes + size]);
+                    assert_eq!(data.as_slice(), &payload[recv_bytes..recv_bytes + size]);
                     recv_bytes += data.len();
                 },
                 Err(KcpError::QueueEmpty)

@@ -5,12 +5,15 @@
 //! 使用异步 `send` / `recv` 交换消息；服务端通过 `recv` / `send_to`
 //! 按来源地址收发。该 API 不实现标准 `Read` / `Write`，也不提供 `accept`。
 //!
+//! 地址参数使用标准库 [`ToSocketAddrs`]，在后台阻塞线程解析，要求 `Send + 'static`。
+//! 字符串字面量和 [`SocketAddr`] 可直接传入；局部字符串借用应改为传入拥有所有权的
+//! [`String`]，如 `address.to_owned()`。
+//!
 //! 完整客户端和服务端见仓库中的 `examples/echo-client.rs` 与 `examples/echo-server.rs`。
 
-use bytes::Bytes;
 use dashmap::DashMap;
 use log::{debug, error, warn};
-use tokio::net::{ToSocketAddrs, UdpSocket, lookup_host};
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -21,7 +24,7 @@ use crate::error::IncompleteDataType;
 use crate::helper::{KcpPacketHeader, current_millis, generate_conv};
 use crate::{KcpConfig, KcpError, KcpResult};
 use std::io::{self};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +44,14 @@ fn message_kcp(conv: u32, config: KcpConfig) -> KcpResult<Kcp> {
         return Err(KcpError::InvalidConfig("UDP mtu must not exceed 65507 bytes".to_string()));
     }
     Kcp::new(conv, config)
+}
+
+async fn resolve_addresses<A: ToSocketAddrs + Send + 'static>(
+    addr: A,
+) -> KcpResult<Vec<SocketAddr>> {
+    Ok(tokio::task::spawn_blocking(move || addr.to_socket_addrs().map(|addrs| addrs.collect()))
+        .await
+        .map_err(io::Error::other)??)
 }
 
 async fn send_udp(socket: &UdpSocket, data: &[u8], wait: Duration) -> KcpResult<usize> {
@@ -97,7 +108,7 @@ impl KcpStream {
     ///
     /// # 参数
     ///
-    /// - `addr`: 远程地址，格式为 "IP:PORT"
+    /// - `addr`: 标准库地址类型；解析在后台线程执行，须满足 `Send + 'static`
     ///
     /// # 返回
     ///
@@ -111,7 +122,7 @@ impl KcpStream {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn connect<A: ToSocketAddrs>(addr: A) -> KcpResult<Self> {
+    pub async fn connect<A: ToSocketAddrs + Send + 'static>(addr: A) -> KcpResult<Self> {
         Self::connect_with_config(addr, StreamConfig::default()).await
     }
 
@@ -119,13 +130,13 @@ impl KcpStream {
     ///
     /// # 参数
     ///
-    /// - `addr`: 远程地址
+    /// - `addr`: 远程地址，约束与 [`Self::connect`] 相同
     /// - `config`: Stream配置
     ///
     /// # 返回
     ///
     /// 返回连接成功的KcpStream实例
-    pub async fn connect_with_config<A: ToSocketAddrs>(
+    pub async fn connect_with_config<A: ToSocketAddrs + Send + 'static>(
         addr: A,
         config: StreamConfig,
     ) -> KcpResult<Self> {
@@ -137,6 +148,7 @@ impl KcpStream {
     /// `mtu` 必须在 29..=65507 字节内，收发窗口须非零，`stream_mode` 必须为 false。
     /// `config.update_interval` 驱动后台更新，`kcp_config.interval` 控制协议刷新；
     /// 两端不协商参数，单条消息的分片数不得超过对端接收窗口和 255。
+    /// 地址约束与 [`Self::connect`] 相同，解析出多个地址时使用首个地址。
     ///
     /// ```no_run
     /// # async fn example() -> kcp_ovo::KcpResult<()> {
@@ -149,7 +161,7 @@ impl KcpStream {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn connect_with_kcp_config<A: ToSocketAddrs>(
+    pub async fn connect_with_kcp_config<A: ToSocketAddrs + Send + 'static>(
         addr: A,
         config: StreamConfig,
         kcp_config: KcpConfig,
@@ -160,7 +172,8 @@ impl KcpStream {
         let mut kcp = message_kcp(generate_conv(), kcp_config)?;
         let mss = kcp.mss as usize;
         // 解析地址
-        let remote = lookup_host(addr).await?.next().ok_or(KcpError::NoAddress)?;
+        let remote =
+            resolve_addresses(addr).await?.into_iter().next().ok_or(KcpError::NoAddress)?;
 
         // 创建UDP socket
         let local = if remote.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
@@ -197,7 +210,7 @@ impl KcpStream {
                     permit = recv_tx.reserve(), if readable => {
                         let Ok(permit) = permit else { break };
                         match kcp.recv() {
-                            Ok(bytes) => { permit.send(bytes.to_vec()); }
+                            Ok(data) => { permit.send(data); }
                             Err(e) => error!("kcp recv err:{}", e),
                         }
                     }
@@ -407,7 +420,7 @@ impl KcpListener {
     ///
     /// # 参数
     ///
-    /// - `addr`: 绑定地址，格式为 "IP:PORT"
+    /// - `addr`: 标准库地址类型；解析在后台线程执行，须满足 `Send + 'static`
     ///
     /// # 返回
     ///
@@ -421,7 +434,7 @@ impl KcpListener {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn bind<A: ToSocketAddrs>(addr: A) -> KcpResult<Self> {
+    pub async fn bind<A: ToSocketAddrs + Send + 'static>(addr: A) -> KcpResult<Self> {
         Self::bind_with_config(addr, StreamConfig::default()).await
     }
 
@@ -429,13 +442,13 @@ impl KcpListener {
     ///
     /// # 参数
     ///
-    /// - `addr`: 绑定地址
+    /// - `addr`: 绑定地址，约束与 [`Self::bind`] 相同
     /// - `config`: Stream配置
     ///
     /// # 返回
     ///
     /// 返回KcpListener实例
-    pub async fn bind_with_config<A: ToSocketAddrs>(
+    pub async fn bind_with_config<A: ToSocketAddrs + Send + 'static>(
         addr: A,
         config: StreamConfig,
     ) -> KcpResult<Self> {
@@ -445,7 +458,8 @@ impl KcpListener {
     /// 使用显式协议配置监听，所有新会话共用该配置。
     ///
     /// 配置约束与 [`KcpStream::connect_with_kcp_config`] 相同，非法配置在绑定前报错。
-    pub async fn bind_with_kcp_config<A: ToSocketAddrs>(
+    /// 地址约束与 [`Self::bind`] 相同，按解析顺序尝试各个地址，直到绑定成功。
+    pub async fn bind_with_kcp_config<A: ToSocketAddrs + Send + 'static>(
         addr: A,
         config: StreamConfig,
         kcp_config: KcpConfig,
@@ -457,7 +471,10 @@ impl KcpListener {
             return Err(KcpError::InvalidConfig("session limits must be non-zero".to_string()));
         }
         let mss = message_kcp(0, kcp_config.clone())?.mss as usize;
-        let socket = UdpSocket::bind(addr).await.map_err(|e| KcpError::IoError(e.to_string()))?;
+        let addresses = resolve_addresses(addr).await?;
+        let socket = UdpSocket::bind(addresses.as_slice())
+            .await
+            .map_err(|e| KcpError::IoError(e.to_string()))?;
         let local_addr = socket.local_addr().map_err(|e| KcpError::IoError(e.to_string()))?;
 
         let clients: Arc<DashMap<SocketAddr, Clinet>> = Arc::new(DashMap::new());
@@ -508,14 +525,14 @@ impl KcpListener {
                     result = socket.recv_from(&mut buf) => {
                         match result {
                             Ok((size, addr)) => {
-                                let mut packet = Bytes::copy_from_slice(&buf[..size]);
+                                let mut packet = &buf[..size];
                                 let Ok((header, payload)) = KcpPacketHeader::from_bytes(&mut packet) else { continue };
                                 if payload.len() != header.len as usize { continue; }
                                 match clients_clone.get_mut(&addr) {
                                     Some(mut client) => {
                                         if client.conv != header.conv { continue; }
                                         client.last_active = Instant::now();
-                                        let data = Bytes::copy_from_slice(&buf[..size]).to_vec();
+                                        let data = buf[..size].to_vec();
                                         let sender = client.data_tx.clone();
                                         if let Err(e) = sender.try_send(data) {
                                             warn!("listener packet queue: {}", e);
@@ -538,7 +555,7 @@ impl KcpListener {
                                             async move {
                                                 let len = data.len();
                                                 let (sent, completed) = oneshot::channel();
-                                                udp_tx_clone.send((data.to_vec(), addr, id, sent))
+                                                udp_tx_clone.send((data, addr, id, sent))
                                                     .await
                                                     .map_err(|_e| KcpError::IoError("send data fail".to_string()))?;
                                                 completed.await.map_err(|_| KcpError::IoError("UDP output stopped".to_string()))?;
@@ -564,7 +581,7 @@ impl KcpListener {
                                                     permit = recv_tx_clone.reserve(), if readable => {
                                                         let Ok(permit) = permit else { break };
                                                         match kcp.recv() {
-                                                            Ok(bytes) => { permit.send((bytes.to_vec(), addr)); }
+                                                            Ok(data) => { permit.send((data, addr)); }
                                                             Err(e) => error!("listener kcp recv err:{}", e),
                                                         }
                                                     }
@@ -604,7 +621,7 @@ impl KcpListener {
                                             }
                                         });
 
-                                        let data = Bytes::copy_from_slice(&buf[..size]).to_vec();
+                                        let data = buf[..size].to_vec();
                                         let sender = data_tx.clone();
                                         if let Err(e) = sender.try_send(data) {
                                             warn!("listener packet queue: {}", e);

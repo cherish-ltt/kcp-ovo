@@ -2,8 +2,6 @@
 //!
 //! 本模块定义了KCP协议中的数据段结构，对应C代码中的IKCPSEG
 
-use bytes::Bytes;
-
 use crate::{
     KcpCmd, KcpResult,
     helper::{IKCP_OVERHEAD, KcpPacket, KcpPacketHeader},
@@ -46,9 +44,9 @@ impl Segment {
         self.kcp_packet.data.is_empty()
     }
 
-    /// 取数data
-    pub fn get_data(&self) -> Bytes {
-        self.kcp_packet.data.clone()
+    /// 借用载荷；需要独立所有权时使用 `to_vec()`。
+    pub fn get_data(&self) -> &[u8] {
+        &self.kcp_packet.data
     }
 
     /// 取conv
@@ -65,7 +63,6 @@ impl Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
 
     fn make_packet(data_len: usize, payload: &[u8]) -> KcpPacket {
         let raw: Vec<u8> = [
@@ -74,7 +71,7 @@ mod tests {
             payload.to_vec(),
         ]
         .concat();
-        KcpPacket::from_bytes(&mut Bytes::copy_from_slice(&raw)).unwrap()
+        KcpPacket::from_bytes(&mut raw.as_slice()).unwrap()
     }
 
     #[test]

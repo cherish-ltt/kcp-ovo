@@ -6,7 +6,6 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use bytes::Bytes;
 use kcp_ovo::error::KcpErrorKind;
 use kcp_ovo::helper::KcpPacketHeader;
 use kcp_ovo::stream::{CHANNEL_SIZE, KcpListener, KcpStream, StreamConfig};
@@ -30,8 +29,7 @@ impl Peer {
         let stream = KcpStream::connect(socket.local_addr().unwrap()).await.unwrap();
         let mut buf = [0; 1500];
         let (len, addr) = timeout(LIMIT, socket.recv_from(&mut buf)).await.unwrap().unwrap();
-        let (header, _) =
-            KcpPacketHeader::from_bytes(&mut Bytes::copy_from_slice(&buf[..len])).unwrap();
+        let (header, _) = KcpPacketHeader::from_bytes(&mut &buf[..len]).unwrap();
         (Self { socket, addr, conv: header.conv }, stream)
     }
 
@@ -46,16 +44,15 @@ impl Peer {
         peer
     }
 
-    async fn receive(&self, cmd: KcpCmd) -> (KcpPacketHeader, Bytes) {
+    async fn receive(&self, cmd: KcpCmd) -> (KcpPacketHeader, Vec<u8>) {
         timeout(LIMIT, async {
             let mut buf = [0; 1500];
             loop {
                 let (len, addr) = self.socket.recv_from(&mut buf).await.unwrap();
                 assert_eq!(addr, self.addr);
-                let (header, payload) =
-                    KcpPacketHeader::from_bytes(&mut Bytes::copy_from_slice(&buf[..len])).unwrap();
+                let (header, payload) = KcpPacketHeader::from_bytes(&mut &buf[..len]).unwrap();
                 if header.conv == self.conv && header.cmd == cmd {
-                    return (header, payload);
+                    return (header, payload.to_vec());
                 }
             }
         })
@@ -110,7 +107,7 @@ async fn queued_messages_and_lost_ack_cannot_complete_drain_early() {
         result = &mut waiting => panic!("queued data was not confirmed: {result:?}"),
         packet = peer.receive(KcpCmd::Push) => packet,
     };
-    assert_eq!(data.as_ref(), &[0]);
+    assert_eq!(data.as_slice(), &[0]);
     let (retry, repeated) = tokio::select! {
         result = &mut waiting => panic!("lost ACK completed drain: {result:?}"),
         packet = peer.receive(KcpCmd::Push) => packet,
@@ -126,7 +123,7 @@ async fn queued_messages_and_lost_ack_cannot_complete_drain_early() {
                 packet = peer.receive(KcpCmd::Push) => packet,
             };
             if header.sn == next {
-                assert_eq!(data.as_ref(), &[next as u8]);
+                assert_eq!(data.as_slice(), &[next as u8]);
                 next += 1;
             }
             peer.acknowledge(header, next, 128).await;
@@ -150,7 +147,7 @@ async fn cancellation_keeps_data_and_later_sends_do_not_extend_the_barrier() {
             packet = peer.receive(KcpCmd::Push) => packet,
         }
     };
-    assert_eq!(data.as_ref(), b"before");
+    assert_eq!(data.as_slice(), b"before");
     let waiting = stream.drain(LIMIT);
     tokio::pin!(waiting);
     assert_pending(&mut waiting).await;
@@ -158,7 +155,7 @@ async fn cancellation_keeps_data_and_later_sends_do_not_extend_the_barrier() {
     peer.acknowledge(header, 1, 128).await;
     timeout(LIMIT, &mut waiting).await.unwrap().unwrap();
     let (header, data) = peer.receive(KcpCmd::Push).await;
-    assert_eq!(data.as_ref(), b"after");
+    assert_eq!(data.as_slice(), b"after");
     let final_wait = stream.drain(LIMIT);
     tokio::pin!(final_wait);
     assert_pending(&mut final_wait).await;
@@ -205,7 +202,7 @@ async fn blackhole_times_out_without_discarding_data_and_zero_window_waits() {
         if zero_window {
             let (header, data) = peer.receive(KcpCmd::Push).await;
             assert_eq!(header.sn, 1);
-            assert_eq!(data.as_ref(), b"after zero window");
+            assert_eq!(data.as_slice(), b"after zero window");
             peer.acknowledge(header, 2, 128).await;
         }
         timeout(LIMIT, stream.drain(LIMIT)).await.unwrap().unwrap();
@@ -294,13 +291,13 @@ async fn listener_waits_for_confirmations_and_captures_missing_sessions_at_call_
         result = &mut waiting => panic!("listener reply was not confirmed: {result:?}"),
         packet = peer.receive(KcpCmd::Push) => packet,
     };
-    assert_eq!(data.as_ref(), b"reply");
+    assert_eq!(data.as_slice(), b"reply");
     let (retry, data) = tokio::select! {
         result = &mut waiting => panic!("listener completed after lost ACK: {result:?}"),
         packet = peer.receive(KcpCmd::Push) => packet,
     };
     assert_eq!(retry.sn, header.sn);
-    assert_eq!(data.as_ref(), b"reply");
+    assert_eq!(data.as_slice(), b"reply");
     peer.acknowledge(retry, 1, 128).await;
     timeout(LIMIT, waiting).await.unwrap().unwrap();
 }
@@ -312,7 +309,7 @@ async fn listener_timeout_and_cancellation_preserve_a_zero_window_queue() {
     let addr = peer.socket.local_addr().unwrap();
     listener.send_to(b"first", addr).await.unwrap();
     let (first, data) = peer.receive(KcpCmd::Push).await;
-    assert_eq!(data.as_ref(), b"first");
+    assert_eq!(data.as_slice(), b"first");
     peer.acknowledge(first, 1, 0).await;
     timeout(LIMIT, listener.drain_to(addr, LIMIT)).await.unwrap().unwrap();
     listener.send_to(b"waiting for window", addr).await.unwrap();
@@ -329,7 +326,7 @@ async fn listener_timeout_and_cancellation_preserve_a_zero_window_queue() {
     peer.acknowledge(first, 1, 128).await;
     let (header, data) = peer.receive(KcpCmd::Push).await;
     assert_eq!(header.sn, 1);
-    assert_eq!(data.as_ref(), b"waiting for window");
+    assert_eq!(data.as_slice(), b"waiting for window");
     peer.acknowledge(header, 2, 128).await;
     timeout(LIMIT, listener.drain_to(addr, LIMIT)).await.unwrap().unwrap();
 }
@@ -407,7 +404,7 @@ async fn client_receive_backpressure_preserves_outgoing_drain_and_message_order(
     tokio::pin!(waiting);
     assert_pending(&mut waiting).await;
     let (header, data) = peer.receive(KcpCmd::Push).await;
-    assert_eq!(data.as_ref(), b"outgoing");
+    assert_eq!(data.as_slice(), b"outgoing");
     peer.acknowledge(header, 1, 128).await;
     timeout(LIMIT, waiting).await.unwrap().unwrap();
     for expected in 0..65 {

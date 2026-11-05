@@ -63,11 +63,22 @@ Stream 的发送接口成功表示数据已进入本地队列，并非对端已�
 
 监听器默认最多保留 1024 个会话，并在 300 秒未收到有效报文后回收会话；可通过 `StreamConfig` 的 `max_sessions` 和 `session_idle_timeout` 调整，两者必须大于零，`update_interval` 也必须大于零。会话被回收后，空闲客户端需要重新连接。客户端按解析出的第一个地址选择 IPv4 或 IPv6，不会自动尝试后续地址。使用 `StreamConfig` 结构体字面量时，请通过 `..Default::default()` 填充未指定的字段。
 
-### v0.7.0 升级
+### v0.8.0 升级
 
-高层消息 API 现在支持有总期限的 `drain` / `drain_to`，以及显式 MTU、窗口和重传配置；旧构造仍采用 fast 默认值。文件传输示例使用双端确认收尾。新增 `TimedOut` 错误成员，下游穷尽匹配须补充分支；协议确认不代表业务处理或落盘，超时也不证明未收到。
+公开数据接口使用 `Vec<u8>` / `&[u8]`，不再重导出 `kcp_ovo::bytes` 或 `kcp_ovo::tokio`。
+底层 `recv` 与输出回调直接交接拥有所有权的 `Vec<u8>`；包解析使用切片，
+`Segment::get_data()` 返回借用切片，需要独立保留时调用 `.to_vec()`。
+单段接收直接移出已有缓冲区，多段组装和报文编码仍需拼接。
 
-使用与兼容性见 [v0.7.0 发布说明](.version/RELEASE-v0.7.0.md)，验收场景、实际结果及平台限制见 [v0.7.0 验证记录](docs/stream-v0.7.0.md)。
+六个高层 connect/bind 入口改用 `std::net::ToSocketAddrs + Send + 'static`，
+DNS 在后台解析。字符串字面量与 `SocketAddr` 可直接传入；局部字符串借用改传
+`String` 或 `(String, u16)`。高层仍须在 Tokio 运行时内调用，应用自行声明 Tokio 依赖。
+内部 Tokio/bytes 依赖改用兼容范围，最低版本分别为 1.52.3 / 1.11.1；
+这允许下游选择满足范围的较新版本，不保证任意旧版本或其他主版本可用。
+
+这是公开 API 的破坏性更新，完整迁移表见 [API 指南](docs/api-guide.md#v080-迁移)，
+变更见 [v0.8.0 发布说明](.version/RELEASE-v0.8.0.md)，实测结果与限制见 [v0.8.0 验证记录](docs/public-api-v0.8.0.md)。v0.7.0 引入的确认等待与高层协议配置
+继续保留，其验收记录见 [v0.7.0 验证记录](docs/stream-v0.7.0.md)。
 
 ### 安装
 
@@ -75,7 +86,7 @@ Stream 的发送接口成功表示数据已进入本地队列，并非对端已�
 
 ```toml
 [dependencies]
-kcp-ovo = "0.7.0"
+kcp-ovo = "0.8.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -247,7 +258,7 @@ cargo doc --open
 
 ```
 src/
-├── lib.rs          # 库入口，全局分配器
+├── lib.rs          # 库入口与公开导出
 ├── error.rs        # 错误类型定义
 ├── queue/          # 队列管理模块
 │   ├── segment.rs  # 数据段结构
@@ -292,7 +303,7 @@ async fn main() -> kcp_ovo::KcpResult<()> {
 ```
 
 服务端使用同式的 `KcpListener::bind_with_kcp_config(addr, stream_config, kcp_config)`。
-原有构造方法和 `StreamConfig` 字段保持兼容；高层只支持消息模式，拒绝 `stream_mode=true`、
+原有构造方法保留，地址约束按 v0.8.0 迁移；`StreamConfig` 字段保持兼容。高层只支持消息模式，拒绝 `stream_mode=true`、
 零窗口或不在 `29..=65507` 内的 MTU。MTU 包含 28 字节 KCP 头，不包含 UDP/IP 头。
 发送上限按实际配置计算为 `255 * (mtu - 28)` 字节，同时消息分片数须能放入对端接收窗口。
 参数不会自动协商，应用应分块发送大数据。
@@ -333,13 +344,13 @@ Rust 默认分配器。需要 mimalloc 等分配器的应用应自行添加依�
 
 ```toml
 # 默认配置（包含Stream API）
-kcp-ovo = "0.7.0"
+kcp-ovo = "0.8.0"
 
 # 仅使用底层API
-kcp-ovo = { version = "0.7.0", default-features = false }
+kcp-ovo = { version = "0.8.0", default-features = false }
 
 # 显式启用Stream API
-kcp-ovo = { version = "0.7.0", features = ["stream"] }
+kcp-ovo = { version = "0.8.0", features = ["stream"] }
 ```
 
 ## 🧪 测试
@@ -397,7 +408,9 @@ cargo test test_stream_mode
 | `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付、队列满后的非阻塞恢复、取消接收、跨会话背压隔离、满额活跃会话保留、外来 conv 隔离、地址族与关闭回收 |
 | `stream_config.rs` | 高层协议配置、旧构造和字面量兼容、normal/fast 与非对称 MTU/窗口抓包、255 分片边界、受损链路和黑洞恢复、双端 drain 超时后恢复确认、20 客户端分块传输超过 1 MiB |
 | `stream_drain.rs` | 高层 FIFO 确认等待、ACK 丢失、损伤与黑洞恢复、取消、会话生命周期、背压及多客户端隔离 |
-| `api_contract.rs` | 公开 API 契约与错误类型；载荷所有权与共享、单段接收复用及窗口恢复、Send/Sync；下游显式设置 System 全局分配器的编译兼容性 |
+| `api_contract.rs` | 公开 API 契约与错误类型；载荷独立所有权、切片推进、单段接收复用及窗口恢复、Send/Sync；下游显式设置 System 全局分配器的编译兼容性 |
+| `downstream/core/` | 独立 Cargo 项目仅直接依赖本库，以无默认 feature 验证标准库公开类型与核心收发 |
+| `downstream/stream/` | 独立 Cargo 项目固定 Tokio 1.54.1 / bytes 1.12.1，验证版本解析、标准库地址输入及真实 UDP 回环 |
 | `retransmit.rs` | 重传与死链判定、normal/fast 连续超时期限、退避上限与溢出、ACK/Karn 恢复、1 MiB 正常/成簇丢包/黑洞对照 |
 | `fuzz_transfer.rs` | 随机链路下 9 条协议不变式（字节精确、消息边界、窗口上限、断链恢复） |
 | `malformed.rs` | 畸形包与恶意输入：任意字节、截断头、长度不符、未知命令、控制帧洪水、伪造 conv、畸形分片恢复；畸形 ACK 不丢待发消息，非法首包不绑定 conv |
@@ -426,6 +439,10 @@ cargo test --test smoke
 
 # 下游分配器兼容性（默认 feature 已由全量测试覆盖）
 cargo test --no-default-features --test api_contract
+
+# 独立下游项目（根 workspace 的 cargo test 不会自动执行）
+CARGO_TARGET_DIR=target/downstream cargo test --locked --manifest-path tests/downstream/core/Cargo.toml
+CARGO_TARGET_DIR=target/downstream cargo test --locked --manifest-path tests/downstream/stream/Cargo.toml
 
 # 本机回环负载观测，不代表公网性能或最大吞吐
 cargo test --release --test udp_chaos sustained_loopback_load_is_byte_exact -- --exact --nocapture

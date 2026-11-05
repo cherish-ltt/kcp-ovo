@@ -126,7 +126,7 @@ async fn receive_file(
 async fn send_file(source: &Path, address: &str, wait: Duration) -> io::Result<()> {
     let mut input = File::open(source)?;
     let size = input.metadata()?.len();
-    let mut stream = KcpStream::connect(address).await.map_err(io::Error::other)?;
+    let mut stream = KcpStream::connect(address.to_owned()).await.map_err(io::Error::other)?;
     stream.send(&size.to_be_bytes()).await.map_err(io::Error::other)?;
     let mut buffer = [0u8; CHUNK];
     let mut sent = 0u64;
@@ -179,7 +179,6 @@ mod common;
 
 #[cfg(test)]
 mod tests {
-    use kcp_ovo::bytes::Bytes;
     use kcp_ovo::helper::KcpPacketHeader;
 
     use super::*;
@@ -264,9 +263,8 @@ mod tests {
                 common::Net::default().with_delay(1),
                 4103,
                 move |packet, from_server| {
-                    let (header, payload) =
-                        KcpPacketHeader::from_bytes(&mut Bytes::copy_from_slice(packet)).unwrap();
-                    if from_server && payload.as_ref() == b"BYE" {
+                    let (header, payload) = KcpPacketHeader::from_bytes(&mut &packet[..]).unwrap();
+                    if from_server && payload == b"BYE" {
                         let first = final_una.is_none();
                         final_una = Some(header.sn.wrapping_add(1));
                         return loss == "all BYE" || (loss == "first BYE" && first);

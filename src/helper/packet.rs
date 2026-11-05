@@ -3,7 +3,7 @@
 //! 本模块提供了类型安全的数据包解析和编码功能,
 //! 替代了 kcp.rs 中手动操作字节的代码
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut};
 
 use crate::{
     error::{IncompleteDataType, KcpError, KcpResult},
@@ -56,11 +56,11 @@ impl KcpPacketHeader {
     ///
     /// # 返回
     ///
-    /// 返回解析后的头部和剩余数据；载荷共享输入存储，可能延长原分配的生命周期。
+    /// 返回解析后的头部和借用的剩余数据；输入仅推进头部长度。
     #[inline]
-    pub fn from_bytes(data: &mut Bytes) -> KcpResult<(Self, Bytes)> {
+    pub fn from_bytes<'a>(data: &mut &'a [u8]) -> KcpResult<(Self, &'a [u8])> {
         let header = Self::read_from(data)?;
-        Ok((header, data.clone()))
+        Ok((header, *data))
     }
 
     #[inline]
@@ -94,10 +94,10 @@ impl KcpPacketHeader {
     ///
     /// # 参数
     ///
-    /// - 输出`bytes::bytes_mut::BytesMut`
+    /// - 输出拥有所有权的 `Vec<u8>`
     #[inline]
-    pub fn to_bytes(&self) -> KcpResult<BytesMut> {
-        let mut buf = BytesMut::with_capacity(IKCP_OVERHEAD + (self.len as usize));
+    pub fn to_bytes(&self) -> KcpResult<Vec<u8>> {
+        let mut buf = Vec::with_capacity(IKCP_OVERHEAD + (self.len as usize));
 
         buf.put_u32(self.conv);
         buf.put_u8(self.cmd.into());
@@ -118,17 +118,17 @@ pub struct KcpPacket {
     /// 数据头
     pub header: KcpPacketHeader,
     /// 数据载荷
-    pub data: Bytes,
+    pub data: Vec<u8>,
 }
 
 impl KcpPacket {
     #[inline]
     pub fn new_without_data(header: KcpPacketHeader) -> Self {
-        Self { header, data: Bytes::new() }
+        Self { header, data: Vec::new() }
     }
 
     #[inline]
-    pub fn new_with_data(header: KcpPacketHeader, data: Bytes) -> Self {
+    pub fn new_with_data(header: KcpPacketHeader, data: Vec<u8>) -> Self {
         Self { header, data }
     }
 
@@ -140,26 +140,21 @@ impl KcpPacket {
         }
 
         let len = header.len as usize;
-        Ok(Self { header, data: Bytes::copy_from_slice(&data[..len]) })
+        Ok(Self { header, data: data[..len].to_vec() })
     }
 
     /// 从字节数组解析完整数据包
     ///
-    /// 载荷共享输入存储，不复制字节；输入推进到载荷起点，保留原有剩余数据。
+    /// 复制声明长度的载荷取得独立所有权；输入仅推进到载荷起点。
     #[inline]
-    pub fn from_bytes(data: &mut Bytes) -> KcpResult<Self> {
+    pub fn from_bytes(data: &mut &[u8]) -> KcpResult<Self> {
         let (header, payload) = KcpPacketHeader::from_bytes(data)?;
-
-        if payload.len() < header.len as usize {
-            return Err(KcpError::IncompleteData(IncompleteDataType::Payload));
-        }
-
-        Ok(Self { header, data: payload.slice(..header.len as usize) })
+        Self::from_header_and_data(header, payload)
     }
 
     /// 编码完整数据包到字节数组
     #[inline]
-    pub fn to_bytes(&self) -> KcpResult<Bytes> {
+    pub fn to_bytes(&self) -> KcpResult<Vec<u8>> {
         // 先编码头部
         let mut buf = self.header.to_bytes()?;
 
@@ -167,7 +162,7 @@ impl KcpPacket {
             buf.extend_from_slice(&self.data);
         }
 
-        Ok(buf.copy_to_bytes(buf.len()))
+        Ok(buf)
     }
 }
 
@@ -176,7 +171,7 @@ impl KcpPacket {
 /// 提供流式API来构建KCP数据包
 pub struct PacketBuilder {
     header: KcpPacketHeader,
-    data: Bytes,
+    data: Vec<u8>,
 }
 
 impl PacketBuilder {
@@ -193,7 +188,7 @@ impl PacketBuilder {
                 una: 0,
                 len: 0,
             },
-            data: Bytes::new(),
+            data: Vec::new(),
         }
     }
 
@@ -230,7 +225,7 @@ impl PacketBuilder {
     /// 设置数据载荷
     pub fn data(mut self, data: Vec<u8>) -> Self {
         self.header.len = data.len() as u32;
-        self.data = Bytes::from(data);
+        self.data = data;
         self
     }
 
@@ -261,7 +256,7 @@ mod tests {
 
         let buf = original.to_bytes().unwrap();
         assert_eq!(buf.len(), IKCP_OVERHEAD);
-        let (parsed, data) = KcpPacketHeader::from_bytes(&mut buf.to_vec().into()).unwrap();
+        let (parsed, data) = KcpPacketHeader::from_bytes(&mut buf.as_slice()).unwrap();
         assert_eq!(original, parsed);
         assert_eq!(0, data.len());
     }
@@ -279,13 +274,13 @@ mod tests {
                 una: 0,
                 len: 0,
             },
-            data: Bytes::new(),
+            data: Vec::new(),
         };
 
-        let mut buf = packet.to_bytes().unwrap();
+        let buf = packet.to_bytes().unwrap();
         assert_eq!(buf.len(), IKCP_OVERHEAD);
 
-        let parsed = KcpPacket::from_bytes(&mut buf).unwrap();
+        let parsed = KcpPacket::from_bytes(&mut buf.as_slice()).unwrap();
         assert_eq!(parsed.header, packet.header);
         assert!(parsed.data.is_empty());
     }
@@ -311,7 +306,7 @@ mod tests {
 
     #[test]
     fn test_incomplete_data() {
-        let data = &mut Bytes::new(); // 不足24字节
+        let data = &mut &[][..]; // 不足24字节
         assert!(KcpPacketHeader::from_bytes(data).is_err());
     }
 }

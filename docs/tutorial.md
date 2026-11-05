@@ -11,9 +11,14 @@ cargo run --example echo-server
 cargo run --example echo-client
 ```
 
-客户端应输出 `收到: Hello, KCP!`。服务端用 `recv().await` 取得消息与来源地址，用 `send_to().await` 回发；客户端用 `send().await` 和 `recv().await`。这些调用返回 `KcpResult`。服务端持续运行，可通过 Ctrl-C 结束。
+客户端应输出 `收到: Hello, KCP!`。服务端用 `recv().await` 取得消息与来源地址，用 `send_to().await` 回发；客户端用 `send().await` 和 `recv().await`。这些调用返回 `KcpResult`，接收数据是拥有所有权的 `Vec<u8>`。服务端持续运行，可通过 Ctrl-C 结束。
 
 `connect` 创建并连接 UDP socket，不等待服务器握手。发送成功只表示数据进入本地队列，应用需要自己的回复、超时和重试策略来确认业务完成。示例是演示代码，没有认证或加密。
+
+v0.8.0 不再提供 `kcp_ovo::tokio` 或 `kcp_ovo::bytes`。高层接口仍运行在 Tokio 上，
+应用应在自己的 `Cargo.toml` 中声明 Tokio。地址参数使用标准库 `ToSocketAddrs + Send + 'static`：
+字符串字面量可直接使用，动态地址传入 `String`，例如 `KcpStream::connect(format!("{host}:{port}")).await?`。
+已有 `SocketAddr` 也可直接传入；具体迁移见 [API 指南](api-guide.md#v080-迁移)。
 
 ## 配置与生命周期
 
@@ -25,7 +30,7 @@ cargo run --example echo-client
 
 ## 底层接口
 
-使用 `kcp_ovo::core::kcp::Kcp` 和 `KcpConfig` 可以自行管理 UDP：配置输出回调、将收到的数据交给 `input`，按时间调用异步 `update`，再通过 `recv` 取出消息。运行 `cargo run --example low-level-api` 查看 API；该示例仅演示本地队列，未建立网络通信。
+使用 `kcp_ovo::core::kcp::Kcp` 和 `KcpConfig` 可以自行管理 UDP：配置输出回调、将收到的数据交给 `input`，按时间调用异步 `update`，再通过 `recv` 取出 `Vec<u8>` 消息。输出回调同样接收 `Vec<u8>`，可直接移动缓冲区，无需转成 bytes 类型。运行 `cargo run --example low-level-api` 查看 API；该示例仅演示本地队列，未建立网络通信。
 
 底层 `KcpConfig::stream_mode()` 使用无消息边界的字节流，两端必须一致；高层 `KcpStream` 使用消息模式，名称相似但不是同一设置。消息模式最多 255 个分片；接收窗口不足以容纳完整消息时可能无法交付。
 

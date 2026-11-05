@@ -615,7 +615,7 @@ CI 与发布校验必须覆盖全 feature 和 `--no-default-features` 两种配�
 - 新旧源码并存对照时必须使用独立 target 目录并核验二进制，防止复用错误构建产物；保留负向结果与环境漂移记录，不以单轮显著性证明跨轮稳定收益。
 - 核心实例由单个任务独占驱动，未经并发证据不添加缓存行填充；公开 `Segment` 字段不借用高位存放隐藏状态，也不以破坏公开语义换取位掩码优化。
 - `timing::dead_link_rejects_entire_data_batch_before_output` 保证死链预检发生在数据输出前；逐段输出只在 await 成功后提交状态，取消安全测试必须保留。
-- `timing::ack_deduplication_handles_gaps_unsent_and_wrapped_sequences`、`timing::reordered_receive_queue_preserves_messages_across_reuse_and_wrap` 覆盖去重、乱序插入与回绕；`api_contract` 的共享载荷测试验证复制消除和所有权生命周期。
+- `timing::ack_deduplication_handles_gaps_unsent_and_wrapped_sequences`、`timing::reordered_receive_queue_preserves_messages_across_reuse_and_wrap` 覆盖去重、乱序插入与回绕；`api_contract` 的所有权测试验证单段接收复用已有分配、包解析保留切片推进语义且载荷独立存活。
 
 ### 10.10 高层确认等待
 
@@ -630,3 +630,10 @@ CI 与发布校验必须覆盖全 feature 和 `--no-default-features` 两种配�
 - 高层接口只支持消息模式；构造时校验 UDP MTU `29..=65507` 和非零窗口，所有发送入口必须与后台控制块使用同一 MSS 的 255 分片校验。不得在后台才发现超限发送。
 - `tests/stream_config.rs` 用真实 UDP 抓包验证 MTU、窗口与旧默认行为，覆盖非对称配置、拒绝后恢复、最大消息、受损链路及 20 客户端超过 1 MiB 的分块传输；非对称 MTU 下两端 `drain` 黑洞超时后须恢复精确收发与确认。新增协议组合同步加入 `tests/common/stress.rs::config_matrix()`。
 - `tests/common/udp.rs` 统一提供固定种子网络损伤及按报文过滤的回环代理，所有网络测试使用有界超时并清理后台任务；固定种子不保证操作系统调度顺序固定。
+
+### 10.12 公开 API 与依赖兼容性
+
+- 公开数据接口使用 `Vec<u8>`、`&[u8]` 等标准库类型，不重导出 Tokio/bytes，也不在公开字段、返回值、回调或 trait 约束中暴露它们。高层地址使用 `std::net::ToSocketAddrs + Send + 'static`，解析在后台执行，配置校验必须先于解析；高层内部仍使用 Tokio 运行时。
+- Tokio 与 bytes 是精确版本锁定规范的明确例外：Cargo.toml 使用兼容范围 `1.52.3` / `1.11.1`，Cargo.lock 记录项目验证版本；不得重新使用 `=` 强制下游版本一致。其他依赖规则不变，不承诺超出声明范围的版本可用。
+- 优先移动已有 `Vec<u8>`，不得在单段接收或跨内部通道交付时复制；发送编码借用队列载荷，避免为输出克隆整段。借用输入转为独立载荷、多段组装与线格式编码保留必要复制。`Segment::get_data()` 返回借用切片，独立所有权由调用者显式复制取得。
+- `tests/downstream/core/` 与 `tests/downstream/stream/` 是独立 Cargo 项目，根 workspace 测试不会自动覆盖；CI 与发布必须分别执行它们。前者仅直接依赖本库并关闭默认 feature，后者用不同于库锁文件的兼容 Tokio/bytes 版本验证解析与真实回环收发。

@@ -86,8 +86,9 @@ fn example2_configure_kcp() -> Result<(), Box<dyn std::error::Error>> {
         let sent_clone = sent_clone.clone();
         async move {
             println!("  [output] 发送 {} 字节", data.len());
-            sent_clone.lock().unwrap().push(data.to_vec());
-            Ok(data.len())
+            let len = data.len();
+            sent_clone.lock().unwrap().push(data);
+            Ok(len)
         }
     });
 
@@ -121,8 +122,9 @@ fn example3_send_recv() -> Result<(), Box<dyn std::error::Error>> {
         let sent_clone = sent_clone.clone();
         async move {
             println!("  [output] 发送 {} 字节", data.len());
-            sent_clone.lock().unwrap().push(data.to_vec());
-            Ok(data.len())
+            let len = data.len();
+            sent_clone.lock().unwrap().push(data);
+            Ok(len)
         }
     });
 

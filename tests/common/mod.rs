@@ -234,8 +234,9 @@ impl Sim {
             a.borrow_mut().set_output(move |data| {
                 let sink = sink.clone();
                 Box::pin(async move {
-                    sink.lock().unwrap().push(data.to_vec());
-                    Ok::<usize, kcp_ovo::KcpError>(data.len())
+                    let len = data.len();
+                    sink.lock().unwrap().push(data);
+                    Ok::<usize, kcp_ovo::KcpError>(len)
                 })
             });
         }
@@ -244,8 +245,9 @@ impl Sim {
             b.borrow_mut().set_output(move |data| {
                 let sink = sink.clone();
                 Box::pin(async move {
-                    sink.lock().unwrap().push(data.to_vec());
-                    Ok::<usize, kcp_ovo::KcpError>(data.len())
+                    let len = data.len();
+                    sink.lock().unwrap().push(data);
+                    Ok::<usize, kcp_ovo::KcpError>(len)
                 })
             });
         }
@@ -462,7 +464,7 @@ impl Sim {
     pub fn b_messages(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         while let Ok(chunk) = self.b.borrow_mut().recv() {
-            out.push(chunk.to_vec());
+            out.push(chunk);
         }
         out
     }
@@ -471,7 +473,7 @@ impl Sim {
     pub fn a_messages(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         while let Ok(chunk) = self.a.borrow_mut().recv() {
-            out.push(chunk.to_vec());
+            out.push(chunk);
         }
         out
     }
@@ -497,8 +499,9 @@ impl Solo {
             kcp.borrow_mut().set_output(move |data| {
                 let sink = sink.clone();
                 Box::pin(async move {
-                    sink.lock().unwrap().push(data.to_vec());
-                    Ok::<usize, kcp_ovo::KcpError>(data.len())
+                    let len = data.len();
+                    sink.lock().unwrap().push(data);
+                    Ok::<usize, kcp_ovo::KcpError>(len)
                 })
             });
         }
