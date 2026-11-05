@@ -19,7 +19,7 @@ cargo run --example echo-client
 
 `KcpStream::connect_with_config` 和 `KcpListener::bind_with_config` 接受 `StreamConfig`；`update_interval` 必须非零。监听器默认最多保留 1024 个会话，300 秒未收到有效报文后回收；可用 `max_sessions` 和 `session_idle_timeout` 修改，均须非零。会话回收可能丢弃尚未交付的数据，客户端需要重新连接。
 
-`close()` 或丢弃对象会停止后台任务，丢弃待发送和未读取的数据，不等待对端确认。等待应用层回复后再关闭。`try_send` 和 `try_recv` 是客户端的非阻塞接口，队列满或无数据时返回错误。
+`close()` 或丢弃对象会停止后台任务，丢弃待发送和未读取的数据，不等待对端确认。可在应用层回复后调用 `drain(timeout).await`，服务端对应 `drain_to(peer, timeout).await`，再关闭。等待成功只证明 KCP 确认及当前待发 ACK 与窗口通告 已输出，不证明业务完成；取消或超时不撤回数据，超时也不代表未送达。`try_send` 和 `try_recv` 是客户端的非阻塞接口，队列满或无数据时返回错误。
 
 ## 底层接口
 
