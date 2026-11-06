@@ -1,33 +1,42 @@
 use std::time::Duration;
 
-use tokio::sync::{mpsc::Sender, oneshot};
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::core::kcp::Kcp;
 use crate::{KcpError, KcpResult};
+
+use super::lifecycle::Lifecycle;
+use super::sender::KcpSender;
 
 pub(super) enum SendCommand {
     Data(Vec<u8>),
     Drain(oneshot::Sender<()>),
 }
 
-pub(super) async fn drain(sender: KcpResult<Sender<SendCommand>>, wait: Duration) -> KcpResult<()> {
+pub(super) async fn drain(sender: KcpResult<KcpSender>, wait: Duration) -> KcpResult<()> {
     let sender = sender?;
-    let (reply, completed) = oneshot::channel();
+    let (reply, mut completed) = oneshot::channel();
     timeout(wait, async {
-        sender
-            .send(SendCommand::Drain(reply))
-            .await
-            .map_err(|_| KcpError::IoError("send worker stopped".to_string()))?;
-        completed.await.map_err(|_| KcpError::IoError("send worker stopped".to_string()))
+        sender.enqueue(SendCommand::Drain(reply)).await?;
+        tokio::select! {
+            biased;
+            result = &mut completed => result.map_err(|_| KcpError::IoError("send worker stopped".to_string())),
+            () = sender.lifecycle.closed() => completed.try_recv().map_err(|_| KcpError::IoError("send worker stopped".to_string())),
+        }
     })
     .await
     .map_err(|_| KcpError::TimedOut)?
 }
 
-pub(super) fn finish_drain(kcp: &Kcp, pending: &mut Option<oneshot::Sender<()>>) {
+pub(super) fn finish_drain(
+    kcp: &Kcp,
+    pending: &mut Option<oneshot::Sender<()>>,
+    lifecycle: &Lifecycle,
+) {
     if pending.as_ref().is_some_and(|reply| reply.is_closed() || kcp.is_drained()) {
-        let _ = pending.take().unwrap().send(());
+        let reply = pending.take().unwrap();
+        let _ = lifecycle.with_open(|| reply.send(()));
     }
 }
 
@@ -42,11 +51,15 @@ mod tests {
     async fn deadline_includes_full_command_queue_and_cancellation_leaves_no_request() {
         let (tx, mut rx) = mpsc::channel(1);
         tx.send(SendCommand::Data(vec![1])).await.unwrap();
-        assert_eq!(drain(Ok(tx.clone()), Duration::from_secs(1)).await, Err(KcpError::TimedOut));
+        let sender = KcpSender { channel: tx.clone(), lifecycle: Lifecycle::new(), mss: 1372 };
+        assert_eq!(
+            drain(Ok(sender.clone()), Duration::from_secs(1)).await,
+            Err(KcpError::TimedOut)
+        );
         assert!(matches!(rx.recv().await, Some(SendCommand::Data(_))));
         assert!(rx.try_recv().is_err());
 
-        let waiting = tokio::spawn(drain(Ok(tx), Duration::from_secs(1)));
+        let waiting = tokio::spawn(drain(Ok(sender), Duration::from_secs(1)));
         let mut reply = match rx.recv().await {
             Some(SendCommand::Drain(reply)) => reply,
             _ => panic!("expected a drain request"),
@@ -58,7 +71,8 @@ mod tests {
     #[tokio::test]
     async fn stopping_worker_wakes_pending_drain() {
         let (tx, mut rx) = mpsc::channel(1);
-        let waiting = tokio::spawn(drain(Ok(tx), Duration::from_secs(60)));
+        let sender = KcpSender { channel: tx, lifecycle: Lifecycle::new(), mss: 1372 };
+        let waiting = tokio::spawn(drain(Ok(sender), Duration::from_secs(60)));
         let request = rx.recv().await.unwrap();
         drop(request);
         assert!(matches!(waiting.await.unwrap(), Err(KcpError::IoError(_))));
@@ -92,7 +106,8 @@ mod tests {
         sender.send(b"wrapped").unwrap();
         let (reply, mut done) = oneshot::channel();
         let mut pending = Some(reply);
-        finish_drain(&sender, &mut pending);
+        let lifecycle = Lifecycle::new();
+        finish_drain(&sender, &mut pending, &lifecycle);
         assert!(done.try_recv().is_err());
         sender.update(0).await.unwrap();
         while let Ok(packet) = packets.try_recv() {
@@ -105,7 +120,7 @@ mod tests {
             sender.input(&packet).unwrap();
         }
         assert_eq!(sender.snd_una, 0);
-        finish_drain(&sender, &mut pending);
+        finish_drain(&sender, &mut pending, &lifecycle);
         done.await.unwrap();
         assert!(peer.is_drained());
     }
@@ -144,7 +159,8 @@ mod tests {
         assert_eq!(receiver.rcv_nxt, 2);
         let (reply, mut completed) = oneshot::channel();
         let mut pending = Some(reply);
-        finish_drain(&receiver, &mut pending);
+        let lifecycle = Lifecycle::new();
+        finish_drain(&receiver, &mut pending, &lifecycle);
         assert!(
             matches!(completed.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
             "latest cumulative confirmation has not been output"
@@ -155,7 +171,7 @@ mod tests {
             KcpPacketHeader::from_bytes(&mut packets.try_recv().unwrap().as_slice()).unwrap();
         assert_eq!(header.cmd, KcpCmd::Wins);
         assert_eq!(header.una, 2);
-        finish_drain(&receiver, &mut pending);
+        finish_drain(&receiver, &mut pending, &lifecycle);
         completed.await.unwrap();
     }
 }

@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kcp_ovo::KcpError;
-use kcp_ovo::stream::{KcpDiagnostics, KcpListener, KcpStream, StreamConfig};
+use kcp_ovo::stream::{
+    KcpDiagnostics, KcpListener, KcpListenerSender, KcpSender, KcpStream, StreamConfig,
+};
 use tokio::time::timeout;
 
 struct Addresses(Vec<SocketAddr>);
@@ -122,8 +124,21 @@ async fn selected_dependencies_and_standard_addresses_support_loopback() {
             }
         };
         assert_eq!(received, b"next message");
+
+        let sender: KcpSender = client.sender();
+        let listener_sender: KcpListenerSender = listener.sender();
+        let request = tokio::spawn(sender.send(b"independent"));
+        let (received, peer) = listener.recv().await.unwrap();
+        request.await.unwrap().unwrap();
+        let response = tokio::spawn(listener_sender.send_to(&received, peer));
+        assert_eq!(client.recv().await.unwrap(), b"independent");
+        response.await.unwrap().unwrap();
+        sender.drain(Duration::from_secs(2)).await.unwrap();
+        listener_sender.drain_to(peer, Duration::from_secs(2)).await.unwrap();
         client.close().unwrap();
+        assert!(sender.try_send(b"closed").is_err());
         listener.close().unwrap();
+        assert!(listener_sender.send_to(b"closed", peer).await.is_err());
     })
     .await
     .expect("loopback transfer timed out");

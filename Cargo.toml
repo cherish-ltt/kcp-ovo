@@ -66,6 +66,10 @@ name = "stream_diagnostics"
 path = "tests/stream_diagnostics.rs"
 
 [[test]]
+name = "stream_sender"
+path = "tests/stream_sender.rs"
+
+[[test]]
 name = "api_contract"
 path = "tests/api_contract.rs"
 
@@ -153,6 +157,10 @@ path = "examples/low-level-api.rs"
 [[example]]
 name = "stream-easy-api"
 path = "examples/stream-easy-api.rs"
+
+[[example]]
+name = "sender-handles"
+path = "examples/sender-handles.rs"
 
 [dependencies]
 # 内部字节编解码与异步运行时：保留最低版本，允许下游统一兼容版本。

@@ -643,3 +643,11 @@ CI 与发布校验必须覆盖全 feature 和 `--no-default-features` 两种配�
 - `diagnostics()` / `diagnostics_for(addr)` 只返回同一实例最近的完整 `KcpDiagnostics`；查询与更新均不等待缓存锁，竞争时查询报错、采样保留旧值。监听器查询也不得等待会话映射锁。
 - `sampled_at` 使用标准库单调时钟并如实保留缓存年龄。RTT 未采样和远端窗口未知使用 `None`，有效零值使用 `Some(0)`；段计数不包含高层发送通道，RTO 不解释为实测 RTT。
 - 不改变协议发送、确认、消息消费或生命周期；关闭、后台退出及会话消失时不可用，同地址新实例使用新缓存。黑盒场景见 `tests/stream_diagnostics.rs`，缓存竞争、挂起输出与零 RTT 见 `src/stream/diagnostics.rs`。
+
+### 10.14 独立发送句柄
+
+- `KcpSender` / `KcpListenerSender` 仅共享原有有界 FIFO，原对象保留唯一接收和生命周期所有权；句柄 Drop 不关闭，owner close/Drop 后遗留句柄不能延续任务。
+- 发送入队与确认完成提交须和实例终止共用同步门；关闭前已提交的成功保留，仍待入队及未提交成功的等待必须报错，不能因任务 abort 尚未执行而返回成功。
+- 诊断查询的生命周期检查只允许尝试加锁，锁竞争立即报错；不得等待发送提交门或会话插入门。
+- 监听器发送和 drain 在调用时捕获目标实例，不创建会话，不迁移到同地址重建实例。每生产者顺序按依次等待的调用保证，多生产者只保证实际入队顺序。
+- `tests/stream_sender.rs` 覆盖真实 UDP 并发、黑洞/背压、关闭和会话隔离；`src/stream/sender.rs` 单测覆盖取消与成功提交边界。`examples/sender-handles.rs` 展示双端独立任务用法，独立下游项目验证公共类型兼容。
