@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kcp_ovo::KcpError;
-use kcp_ovo::stream::{KcpListener, KcpStream, StreamConfig};
+use kcp_ovo::stream::{KcpDiagnostics, KcpListener, KcpStream, StreamConfig};
 use tokio::time::timeout;
 
 struct Addresses(Vec<SocketAddr>);
@@ -80,11 +80,26 @@ async fn selected_dependencies_and_standard_addresses_support_loopback() {
         .unwrap()
         .unwrap();
         assert_eq!(client.remote_addr(), address);
+        let initial: KcpDiagnostics = loop {
+            if let Ok(snapshot) = client.diagnostics() {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        };
+        let _: std::time::Instant = initial.sampled_at;
+        assert_eq!(initial.smoothed_rtt_ms, None);
 
         let payload = Bytes::from(vec![0xA5; 4096]);
         client.send(payload.as_ref()).await.unwrap();
         let (received, peer): (Vec<u8>, SocketAddr) = listener.recv().await.unwrap();
         assert_eq!(received.as_slice(), payload.as_ref());
+        let snapshot: KcpDiagnostics = loop {
+            if let Ok(snapshot) = listener.diagnostics_for(peer) {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(snapshot.remote_window_segments.is_some());
         listener.send_to(&received, peer).await.unwrap();
         let echoed: Vec<u8> = client.recv().await.unwrap();
         assert_eq!(echoed.as_slice(), payload.as_ref());

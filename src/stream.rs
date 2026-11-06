@@ -28,8 +28,11 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod diagnostics;
 mod drain;
 
+use diagnostics::Diagnostics;
+pub use diagnostics::KcpDiagnostics;
 use drain::{SendCommand, drain, finish_drain};
 
 pub const CHANNEL_SIZE: usize = 64;
@@ -101,6 +104,7 @@ pub struct KcpStream {
     /// 是否已连接
     connected: bool,
     mss: usize,
+    diagnostics: Diagnostics,
 }
 
 impl KcpStream {
@@ -190,11 +194,14 @@ impl KcpStream {
 
         let (data_tx, mut data_rx) = mpsc::channel::<SendCommand>(CHANNEL_SIZE);
         let (recv_tx, recv_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+        let diagnostics = Diagnostics::new(&kcp);
+        let worker_diagnostics = diagnostics.clone();
         let main_handle = tokio::spawn(async move {
             let mut interval = interval(config.update_interval);
             let mut buf = vec![0; BUFFER_SIZE];
             let mut pending = None;
             loop {
+                worker_diagnostics.update(&kcp);
                 finish_drain(&kcp, &mut pending);
                 let readable = match kcp.peeksize() {
                     Ok(_) => true,
@@ -259,6 +266,7 @@ impl KcpStream {
             remote,
             connected: true,
             mss,
+            diagnostics,
         })
     }
 
@@ -346,6 +354,16 @@ impl KcpStream {
         self.connected && !self.main_handle.is_finished()
     }
 
+    /// 立即读取最近的完整协议采样；关闭、后台退出或缓存竞争时返回错误。
+    ///
+    /// 不等待发送队列、确认屏障或 UDP 输出；时效及字段单位见 [`KcpDiagnostics`]。
+    pub fn diagnostics(&self) -> KcpResult<KcpDiagnostics> {
+        if !self.is_connected() {
+            return Err(KcpError::IoError("stream closed".to_string()));
+        }
+        self.diagnostics.get()
+    }
+
     /// 获取远程地址
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote
@@ -379,6 +397,7 @@ pub struct Clinet {
     conv: u32,
     id: u64,
     last_active: Instant,
+    diagnostics: Diagnostics,
 }
 
 impl Drop for Clinet {
@@ -549,6 +568,8 @@ impl KcpListener {
                                         };
                                         let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
                                         let (send_tx, mut send_rx) = mpsc::channel::<SendCommand>(CHANNEL_SIZE);
+                                        let diagnostics = Diagnostics::new(&kcp);
+                                        let worker_diagnostics = diagnostics.clone();
 
                                         kcp.set_output(move |data| {
                                             let udp_tx_clone = udp_tx_clone.clone();
@@ -566,6 +587,7 @@ impl KcpListener {
                                             let mut interval = interval(config.update_interval);
                                             let mut pending = None;
                                             loop{
+                                                worker_diagnostics.update(&kcp);
                                                 finish_drain(&kcp, &mut pending);
                                                 let readable = match kcp.peeksize() {
                                                     Ok(_) => true,
@@ -637,6 +659,7 @@ impl KcpListener {
                                                 conv: header.conv,
                                                 id,
                                                 last_active: Instant::now(),
+                                                diagnostics,
                                             },
                                         );
                                     }
@@ -658,6 +681,24 @@ impl KcpListener {
     /// 获取监听器实际绑定的本地地址
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// 立即读取指定地址当前会话的完整采样。
+    ///
+    /// 监听器关闭、会话不存在、后台退出或查询竞争时返回错误；不创建会话。
+    /// 缓存时效及字段单位见 [`KcpDiagnostics`]。
+    pub fn diagnostics_for(&self, addr: SocketAddr) -> KcpResult<KcpDiagnostics> {
+        if self.closed || self.main_handle.is_finished() {
+            return Err(KcpError::IoError("listener closed".to_string()));
+        }
+        match self.clients.try_get(&addr) {
+            dashmap::try_result::TryResult::Present(client)
+                if !client.main_handle.is_finished() =>
+            {
+                client.diagnostics.get()
+            },
+            _ => Err(KcpError::IoError("session diagnostics unavailable".to_string())),
+        }
     }
 
     /// 关闭监听器和所有会话，丢弃待发送及未读取数据；不会等待对端确认。
@@ -773,6 +814,7 @@ mod test {
         .await
         .unwrap();
         assert!(!stream.is_connected());
+        assert!(stream.diagnostics().is_err());
         assert!(stream.recv().await.is_err());
         assert!(stream.send(b"x").await.is_err());
     }

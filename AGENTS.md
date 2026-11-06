@@ -637,3 +637,9 @@ CI 与发布校验必须覆盖全 feature 和 `--no-default-features` 两种配�
 - Tokio 与 bytes 是精确版本锁定规范的明确例外：Cargo.toml 使用兼容范围 `1.52.3` / `1.11.1`，Cargo.lock 记录项目验证版本；不得重新使用 `=` 强制下游版本一致。其他依赖规则不变，不承诺超出声明范围的版本可用。
 - 优先移动已有 `Vec<u8>`，不得在单段接收或跨内部通道交付时复制；发送编码借用队列载荷，避免为输出克隆整段。借用输入转为独立载荷、多段组装与线格式编码保留必要复制。`Segment::get_data()` 返回借用切片，独立所有权由调用者显式复制取得。
 - `tests/downstream/core/` 与 `tests/downstream/stream/` 是独立 Cargo 项目，根 workspace 测试不会自动覆盖；CI 与发布必须分别执行它们。前者仅直接依赖本库并关闭默认 feature，后者用不同于库锁文件的兼容 Tokio/bytes 版本验证解析与真实回环收发。
+
+### 10.13 高层诊断采样契约
+
+- `diagnostics()` / `diagnostics_for(addr)` 只返回同一实例最近的完整 `KcpDiagnostics`；查询与更新均不等待缓存锁，竞争时查询报错、采样保留旧值。监听器查询也不得等待会话映射锁。
+- `sampled_at` 使用标准库单调时钟并如实保留缓存年龄。RTT 未采样和远端窗口未知使用 `None`，有效零值使用 `Some(0)`；段计数不包含高层发送通道，RTO 不解释为实测 RTT。
+- 不改变协议发送、确认、消息消费或生命周期；关闭、后台退出及会话消失时不可用，同地址新实例使用新缓存。黑盒场景见 `tests/stream_diagnostics.rs`，缓存竞争、挂起输出与零 RTT 见 `src/stream/diagnostics.rs`。

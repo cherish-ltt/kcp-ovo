@@ -310,6 +310,14 @@ async fn main() -> kcp_ovo::KcpResult<()> {
 后台 `StreamConfig.update_interval` 与协议 `KcpConfig.interval` 各自控制更新驱动和刷新周期；
 调参不能替代实际链路测量。完整约束见 [API 指南](docs/api-guide.md#高层协议配置)。
 
+通过 `stream.diagnostics()` 或 `listener.diagnostics_for(peer_addr)` 可以立即读取
+`KcpDiagnostics`：平滑 RTT/RTO（毫秒）、远端/拥塞窗口、KCP 待发/在途段数。
+`None` 表示尚无 RTT 样本或尚未见对端，`Some(0)` 才表示有效零值。
+`sampled_at.elapsed()` 表示缓存年龄；后台等待 UDP 输出时可能保留旧采样。
+查询遇到关闭、会话不存在或锁竞争会报错，不排队等待 `drain`，不消费业务消息。
+段数不包含高层发送通道里的数据，快照也不证明对端在线。
+完整排障示例见 [高层诊断](docs/troubleshooting.md#高层协议诊断)。
+
 ### 底层API（推荐高级用户）
 
 | 维度 | 说明 |
@@ -408,6 +416,7 @@ cargo test test_stream_mode
 | `stream_api.rs` | `KcpStream` / `KcpListener` 接口、乱序交付、队列满后的非阻塞恢复、取消接收、跨会话背压隔离、满额活跃会话保留、外来 conv 隔离、地址族与关闭回收 |
 | `stream_config.rs` | 高层协议配置、旧构造和字面量兼容、normal/fast 与非对称 MTU/窗口抓包、255 分片边界、受损链路和黑洞恢复、双端 drain 超时后恢复确认、20 客户端分块传输超过 1 MiB |
 | `stream_drain.rs` | 高层 FIFO 确认等待、ACK 丢失、损伤与黑洞恢复、取消、会话生命周期、背压及多客户端隔离 |
+| `stream_diagnostics.rs` | 高层未知/零窗口与 RTT、段计数、drain 与通道背压、损伤/黑洞后恢复、消息边界、会话回收重建隔离 |
 | `api_contract.rs` | 公开 API 契约与错误类型；载荷独立所有权、切片推进、单段接收复用及窗口恢复、Send/Sync；下游显式设置 System 全局分配器的编译兼容性 |
 | `downstream/core/` | 独立 Cargo 项目仅直接依赖本库，以无默认 feature 验证标准库公开类型与核心收发 |
 | `downstream/stream/` | 独立 Cargo 项目固定 Tokio 1.54.1 / bytes 1.12.1，验证版本解析、标准库地址输入及真实 UDP 回环 |

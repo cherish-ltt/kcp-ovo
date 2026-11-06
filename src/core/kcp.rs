@@ -66,6 +66,7 @@ pub struct Kcp {
     pub rx_rttval: i64,
     /// 平滑 RTT 估计值
     pub rx_srtt: i64,
+    pub(crate) rtt_sampled: bool,
     /// 重传超时时间（毫秒）
     pub rx_rto: u64,
     /// 最小 RTO（毫秒）
@@ -199,6 +200,7 @@ impl Kcp {
             ssthresh: IKCP_THRESH_INIT_WND,
             rx_rttval: 0,
             rx_srtt: 0,
+            rtt_sampled: false,
             rx_rto: IKCP_RTO_DEF,
             // nodelay 模式用更小的 RTO 下限，否则低延迟配置毫无意义
             rx_minrto: if config.nodelay { IKCP_RTO_NDL } else { IKCP_RTO_MIN },
@@ -632,6 +634,7 @@ impl Kcp {
             }
         }
         if let Some((srtt, rttval)) = rtt_update {
+            self.rtt_sampled = true;
             self.rx_srtt = srtt;
             self.rx_rttval = rttval;
             self.rx_rto = ((srtt as u64) + self.interval.max(4 * rttval as u64))

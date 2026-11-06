@@ -284,6 +284,35 @@ assert_eq!(msg2, b"Msg2");
 
 ### 问题1: 高延迟
 
+#### 高层协议诊断
+
+使用自动驱动接口时，无须自行持有底层 `Kcp`：
+
+```rust
+fn diagnose(stream: &kcp_ovo::stream::KcpStream) -> kcp_ovo::KcpResult<()> {
+    let snapshot = stream.diagnostics()?;
+    println!("采样年龄: {} ms", snapshot.sampled_at.elapsed().as_millis());
+    println!("平滑 RTT: {:?} ms", snapshot.smoothed_rtt_ms);
+    println!("重传超时估计: {} ms", snapshot.retransmission_timeout_ms);
+    println!("远端窗口: {:?} 段", snapshot.remote_window_segments);
+    println!("拥塞窗口: {} 段", snapshot.congestion_window_segments);
+    println!("KCP 待发/在途: {}/{} 段", snapshot.queued_send_segments, snapshot.in_flight_segments);
+    Ok(())
+}
+```
+
+监听器使用 `listener.diagnostics_for(peer_addr)` 查询该地址当前实例。
+查询只复制最近的一次完整采样，不读取消息、不输出报文，也不等待 `drain`。
+关闭、任务退出、会话不存在或缓存竞争时返回错误；调用方可在自己的采样周期重试。
+后台处理每轮事件后尝试刷新缓存，但 UDP 输出挂起时缓存年龄会持续增加，
+因此排障必须先看 `sampled_at`，不能把旧状态视为即时状态。
+
+`smoothed_rtt_ms = None` 表示从未取得有效 RTT 样本，重传段不参加 RTT 采样；
+有效的零毫秒样本为 `Some(0)`。`remote_window_segments = None` 表示尚未收到对端报文，
+`Some(0)` 才表示对端通告零窗口。RTO 是本地估计；窗口和队列单位都是段，
+两种发送段数之和等于底层 `waitsnd()`，不包含尚在高层发送通道中的数据。
+禁用拥塞控制时拥塞窗口不限制发送。这些状态不能单独证明对端在线、应用已读或故障根因。
+
 **症状**:
 延迟 > 200ms
 
