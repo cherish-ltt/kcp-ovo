@@ -30,10 +30,14 @@ use std::time::Duration;
 
 mod diagnostics;
 mod drain;
+mod lifecycle;
+mod sender;
 
 use diagnostics::Diagnostics;
 pub use diagnostics::KcpDiagnostics;
-use drain::{SendCommand, drain, finish_drain};
+use drain::{SendCommand, finish_drain};
+use lifecycle::{Lifecycle, StopGuard};
+pub use sender::{KcpListenerSender, KcpSender};
 
 pub const CHANNEL_SIZE: usize = 64;
 pub const BUFFER_SIZE: usize = u16::MAX as usize;
@@ -96,14 +100,11 @@ pub struct KcpStream {
     /// 主线程
     main_handle: JoinHandle<()>,
     /// 发送数据channel-sender
-    data_sender: Sender<SendCommand>,
+    data_sender: KcpSender,
     /// 接收数据channel-receiver
     data_receiver: Receiver<Vec<u8>>,
     /// 远程地址
     remote: SocketAddr,
-    /// 是否已连接
-    connected: bool,
-    mss: usize,
     diagnostics: Diagnostics,
 }
 
@@ -196,13 +197,16 @@ impl KcpStream {
         let (recv_tx, recv_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
         let diagnostics = Diagnostics::new(&kcp);
         let worker_diagnostics = diagnostics.clone();
+        let lifecycle = Lifecycle::new();
+        let stopped = StopGuard(lifecycle.clone());
         let main_handle = tokio::spawn(async move {
+            let _stopped = stopped;
             let mut interval = interval(config.update_interval);
             let mut buf = vec![0; BUFFER_SIZE];
             let mut pending = None;
             loop {
                 worker_diagnostics.update(&kcp);
-                finish_drain(&kcp, &mut pending);
+                finish_drain(&kcp, &mut pending, &_stopped.0);
                 let readable = match kcp.peeksize() {
                     Ok(_) => true,
                     Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr)) => {
@@ -261,11 +265,9 @@ impl KcpStream {
 
         Ok(Self {
             main_handle,
-            data_sender: data_tx,
+            data_sender: KcpSender { channel: data_tx, lifecycle, mss },
             data_receiver: recv_rx,
             remote,
-            connected: true,
-            mss,
             diagnostics,
         })
     }
@@ -285,15 +287,8 @@ impl KcpStream {
         if !self.is_connected() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
-        Kcp::validate_send_size(data.len(), self.mss, false)?;
-
         // 发送数据（放入队列）
-        if let Err(e) = self.data_sender.send(SendCommand::Data(data.into())).await {
-            error!("stream send err: {}", e);
-            return Err(KcpError::IoError(format!("stream send err: {}", e)));
-        }
-
-        Ok(())
+        self.data_sender.send(data).await
     }
 
     /// 等待此前成功入队的数据获得 KCP 确认，并输出当前待发 ACK 与窗口通告。
@@ -302,13 +297,11 @@ impl KcpStream {
     /// 成功不代表对端应用已读取或持久化；超时不代表数据未到达。
     /// 取消或超时不撤回已接收的数据，close/Drop 仍立即终止后台任务。
     /// future 绑定当前连接，可在等待期间继续 recv 或显式 close。
-    pub fn drain(&self, wait: Duration) -> impl Future<Output = KcpResult<()>> + Send + 'static {
-        let sender = if self.is_connected() {
-            Ok(self.data_sender.clone())
-        } else {
-            Err(KcpError::IoError("stream closed".to_string()))
-        };
-        drain(sender, wait)
+    pub fn drain(
+        &self,
+        wait: Duration,
+    ) -> impl Future<Output = KcpResult<()>> + Send + 'static + use<> {
+        self.data_sender.drain(wait)
     }
 
     /// 异步等待并接收一条消息。
@@ -333,10 +326,7 @@ impl KcpStream {
         if !self.is_connected() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Not connected").into());
         }
-        Kcp::validate_send_size(data.len(), self.mss, false)?;
-        self.data_sender
-            .try_send(SendCommand::Data(data.into()))
-            .map_err(|e| KcpError::IoError(format!("stream try send err:{}", e)))
+        self.data_sender.try_send(data)
     }
 
     /// 尝试接收数据（非阻塞）
@@ -351,14 +341,19 @@ impl KcpStream {
 
     /// 检查连接状态
     pub fn is_connected(&self) -> bool {
-        self.connected && !self.main_handle.is_finished()
+        self.data_sender.lifecycle.is_open() && !self.main_handle.is_finished()
     }
 
-    /// 立即读取最近的完整协议采样；关闭、后台退出或缓存竞争时返回错误。
+    /// 获取可克隆、可移入独立任务的发送句柄；本对象仍负责接收和生命周期。
+    pub fn sender(&self) -> KcpSender {
+        self.data_sender.clone()
+    }
+
+    /// 立即读取最近的完整协议采样；关闭、后台退出或查询竞争时返回错误。
     ///
     /// 不等待发送队列、确认屏障或 UDP 输出；时效及字段单位见 [`KcpDiagnostics`]。
     pub fn diagnostics(&self) -> KcpResult<KcpDiagnostics> {
-        if !self.is_connected() {
+        if !self.data_sender.lifecycle.try_is_open()? || self.main_handle.is_finished() {
             return Err(KcpError::IoError("stream closed".to_string()));
         }
         self.diagnostics.get()
@@ -371,7 +366,7 @@ impl KcpStream {
 
     /// 关闭连接，丢弃待发送及未读取数据；不会等待对端确认。
     pub fn close(&mut self) -> KcpResult<()> {
-        self.connected = false;
+        self.data_sender.lifecycle.close();
         self.main_handle.abort();
         self.data_receiver.close();
         Ok(())
@@ -380,6 +375,7 @@ impl KcpStream {
 
 impl Drop for KcpStream {
     fn drop(&mut self) {
+        self.data_sender.lifecycle.close();
         self.main_handle.abort();
     }
 }
@@ -393,7 +389,7 @@ pub struct Clinet {
     /// listener-msg
     data_tx: Sender<Vec<u8>>,
     /// send-msg
-    send_tx: Sender<SendCommand>,
+    sender: KcpSender,
     conv: u32,
     id: u64,
     last_active: Instant,
@@ -402,6 +398,7 @@ pub struct Clinet {
 
 impl Drop for Clinet {
     fn drop(&mut self) {
+        self.sender.lifecycle.close();
         self.main_handle.abort();
     }
 }
@@ -430,8 +427,7 @@ pub struct KcpListener {
     recv_rx: Receiver<(Vec<u8>, SocketAddr)>,
     /// 实际绑定的本地地址（绑定 0 端口时用于获取系统分配的端口）
     local_addr: SocketAddr,
-    closed: bool,
-    mss: usize,
+    lifecycle: Arc<Lifecycle>,
 }
 
 impl KcpListener {
@@ -499,6 +495,8 @@ impl KcpListener {
         let clients: Arc<DashMap<SocketAddr, Clinet>> = Arc::new(DashMap::new());
         let clients_clone = clients.clone();
         let cleanup = ClientCleanup(clients.clone());
+        let lifecycle = Lifecycle::new();
+        let stopped = StopGuard(lifecycle.clone());
         // 设置output回调
         let socket = Arc::new(socket);
         let (udp_tx, mut udp_rx) =
@@ -508,6 +506,7 @@ impl KcpListener {
         let max_sessions = config.max_sessions;
         let idle_timeout = config.session_idle_timeout;
         let main_handle: JoinHandle<()> = tokio::spawn(async move {
+            let _stopped = stopped;
             let _cleanup = cleanup;
             let mut buf = vec![0; BUFFER_SIZE];
             let mut next_id = 0u64;
@@ -570,6 +569,8 @@ impl KcpListener {
                                         let (send_tx, mut send_rx) = mpsc::channel::<SendCommand>(CHANNEL_SIZE);
                                         let diagnostics = Diagnostics::new(&kcp);
                                         let worker_diagnostics = diagnostics.clone();
+                                        let session = Lifecycle::new();
+                                        let stopped = StopGuard(session.clone());
 
                                         kcp.set_output(move |data| {
                                             let udp_tx_clone = udp_tx_clone.clone();
@@ -584,11 +585,12 @@ impl KcpListener {
                                             }
                                         });
                                         let main_handle = tokio::spawn(async move {
+                                            let _stopped = stopped;
                                             let mut interval = interval(config.update_interval);
                                             let mut pending = None;
                                             loop{
                                                 worker_diagnostics.update(&kcp);
-                                                finish_drain(&kcp, &mut pending);
+                                                finish_drain(&kcp, &mut pending, &_stopped.0);
                                                 let readable = match kcp.peeksize() {
                                                     Ok(_) => true,
                                                     Err(KcpError::IncompleteData(IncompleteDataType::PayloadErr)) => {
@@ -649,19 +651,17 @@ impl KcpListener {
                                             warn!("listener packet queue: {}", e);
                                         }
 
-                                        clients_clone.insert(
+                                        let client = Clinet {
                                             addr,
-                                            Clinet {
-                                                addr,
-                                                main_handle,
-                                                data_tx,
-                                                send_tx,
-                                                conv: header.conv,
-                                                id,
-                                                last_active: Instant::now(),
-                                                diagnostics,
-                                            },
-                                        );
+                                            main_handle,
+                                            data_tx,
+                                            sender: KcpSender { channel: send_tx, lifecycle: session, mss },
+                                            conv: header.conv,
+                                            id,
+                                            last_active: Instant::now(),
+                                            diagnostics,
+                                        };
+                                        let _ = _stopped.0.with_open(|| clients_clone.insert(addr, client));
                                     }
                                 }
                             }
@@ -675,7 +675,7 @@ impl KcpListener {
             }
         });
 
-        Ok(Self { clients, main_handle, recv_rx, config, local_addr, closed: false, mss })
+        Ok(Self { clients, main_handle, recv_rx, config, local_addr, lifecycle })
     }
 
     /// 获取监听器实际绑定的本地地址
@@ -688,12 +688,12 @@ impl KcpListener {
     /// 监听器关闭、会话不存在、后台退出或查询竞争时返回错误；不创建会话。
     /// 缓存时效及字段单位见 [`KcpDiagnostics`]。
     pub fn diagnostics_for(&self, addr: SocketAddr) -> KcpResult<KcpDiagnostics> {
-        if self.closed || self.main_handle.is_finished() {
+        if !self.lifecycle.try_is_open()? || self.main_handle.is_finished() {
             return Err(KcpError::IoError("listener closed".to_string()));
         }
         match self.clients.try_get(&addr) {
             dashmap::try_result::TryResult::Present(client)
-                if !client.main_handle.is_finished() =>
+                if client.sender.lifecycle.try_is_open()? && !client.main_handle.is_finished() =>
             {
                 client.diagnostics.get()
             },
@@ -703,7 +703,7 @@ impl KcpListener {
 
     /// 关闭监听器和所有会话，丢弃待发送及未读取数据；不会等待对端确认。
     pub fn close(&mut self) -> KcpResult<()> {
-        self.closed = true;
+        self.lifecycle.close();
         self.main_handle.abort();
         self.clients.clear();
         self.recv_rx.close();
@@ -712,20 +712,10 @@ impl KcpListener {
 
     /// send
     pub async fn send_to(&mut self, data: &[u8], addr: SocketAddr) -> KcpResult<()> {
-        if self.closed {
+        if !self.lifecycle.is_open() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Listener closed").into());
         }
-        let sender = self
-            .clients
-            .get(&addr)
-            .map(|client| client.send_tx.clone())
-            .ok_or_else(|| KcpError::IoError("listener send_to err: None".to_string()))?;
-        Kcp::validate_send_size(data.len(), self.mss, false)?;
-        sender
-            .send(SendCommand::Data(data.to_vec()))
-            .await
-            .map_err(|e| KcpError::IoError(format!("listener send_to err: {}", e)))?;
-        Ok(())
+        self.sender().send_to(data, addr).await
     }
 
     /// 等待指定会话此前入队的数据获得 KCP 确认，并输出当前待发 ACK 与窗口通告。
@@ -736,18 +726,18 @@ impl KcpListener {
         &self,
         addr: SocketAddr,
         wait: Duration,
-    ) -> impl Future<Output = KcpResult<()>> + Send + 'static {
-        let sender = if self.closed || self.main_handle.is_finished() {
-            None
-        } else {
-            self.clients.get(&addr).map(|client| client.send_tx.clone())
-        };
-        drain(sender.ok_or_else(|| KcpError::IoError("session unavailable".to_string())), wait)
+    ) -> impl Future<Output = KcpResult<()>> + Send + 'static + use<> {
+        self.sender().drain_to(addr, wait)
+    }
+
+    /// 获取可克隆的已有会话发送句柄；本对象仍负责唯一接收和关闭。
+    pub fn sender(&self) -> KcpListenerSender {
+        KcpListenerSender { clients: self.clients.clone(), lifecycle: self.lifecycle.clone() }
     }
 
     /// recv
     pub async fn recv(&mut self) -> KcpResult<(Vec<u8>, SocketAddr)> {
-        if self.closed {
+        if !self.lifecycle.is_open() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Listener closed").into());
         }
         match self.recv_rx.recv().await {
@@ -759,6 +749,7 @@ impl KcpListener {
 
 impl Drop for KcpListener {
     fn drop(&mut self) {
+        self.lifecycle.close();
         self.main_handle.abort();
         self.clients.clear();
     }

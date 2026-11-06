@@ -63,6 +63,19 @@ Stream 的发送接口成功表示数据已进入本地队列，并非对端已�
 
 监听器默认最多保留 1024 个会话，并在 300 秒未收到有效报文后回收会话；可通过 `StreamConfig` 的 `max_sessions` 和 `session_idle_timeout` 调整，两者必须大于零，`update_interval` 也必须大于零。会话被回收后，空闲客户端需要重新连接。客户端按解析出的第一个地址选择 IPv4 或 IPv6，不会自动尝试后续地址。使用 `StreamConfig` 结构体字面量时，请通过 `..Default::default()` 填充未指定的字段。
 
+### 独立任务发送
+
+`stream.sender()` 返回可克隆的 `KcpSender`，提供 `send`、`try_send` 和 `drain`；
+`listener.sender()` 返回 `KcpListenerSender`，提供 `send_to` 与 `drain_to`，只发送到已有会话。
+接收与关闭仍由原对象负责，发送句柄可独立移入任务，不需要应用增加命令转发队列。
+运行 `cargo run --example sender-handles` 可验证客户端和服务端的独立收发任务。
+
+所有发送入口共用原有有界 FIFO。同一生产者依次等待完成的发送保持顺序，多生产者按
+实际成功入队次序排序。`drain` 只覆盖屏障前已经入队的数据，尚未入队和屏障后的发送
+不延长该等待。监听器句柄在调用时捕获会话，旧操作不会作用于同地址新会话。
+丢弃句柄不关闭连接；owner close/Drop 会终止任务并使遗留句柄失效。关闭前已入队的
+发送可能仍报告成功，但立即关闭可丢弃数据；已经提交成功的确认结果不追溯改写。
+
 ### v0.8.0 升级
 
 公开数据接口使用 `Vec<u8>` / `&[u8]`，不再重导出 `kcp_ovo::bytes` 或 `kcp_ovo::tokio`。
@@ -417,6 +430,7 @@ cargo test test_stream_mode
 | `stream_config.rs` | 高层协议配置、旧构造和字面量兼容、normal/fast 与非对称 MTU/窗口抓包、255 分片边界、受损链路和黑洞恢复、双端 drain 超时后恢复确认、20 客户端分块传输超过 1 MiB |
 | `stream_drain.rs` | 高层 FIFO 确认等待、ACK 丢失、损伤与黑洞恢复、取消、会话生命周期、背压及多客户端隔离 |
 | `stream_diagnostics.rs` | 高层未知/零窗口与 RTT、段计数、drain 与通道背压、损伤/黑洞后恢复、消息边界、会话回收重建隔离 |
+| `stream_sender.rs` | 独立任务句柄、20 客户端/双生产者超过 1 MiB、FIFO 屏障、发送取消、接收背压、黑洞恢复、owner 关闭与 socket 释放、同地址实例隔离 |
 | `api_contract.rs` | 公开 API 契约与错误类型；载荷独立所有权、切片推进、单段接收复用及窗口恢复、Send/Sync；下游显式设置 System 全局分配器的编译兼容性 |
 | `downstream/core/` | 独立 Cargo 项目仅直接依赖本库，以无默认 feature 验证标准库公开类型与核心收发 |
 | `downstream/stream/` | 独立 Cargo 项目固定 Tokio 1.54.1 / bytes 1.12.1，验证版本解析、标准库地址输入及真实 UDP 回环 |

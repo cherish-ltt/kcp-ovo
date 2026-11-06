@@ -79,6 +79,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_commit_never_blocks_diagnostic_queries() {
+        use super::super::{KcpListener, KcpStream};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut listener = KcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut stream = KcpStream::connect(listener.local_addr()).await.unwrap();
+            stream.send(b"diagnostics").await.unwrap();
+            let (_, peer) = listener.recv().await.unwrap();
+            let session = listener.clients.get(&peer).unwrap().sender.lifecycle.clone();
+            let gates = [stream.data_sender.lifecycle.clone(), listener.lifecycle.clone(), session];
+            for (index, lifecycle) in gates.into_iter().enumerate() {
+                let (ready_tx, ready_rx) = mpsc::channel();
+                let (release_tx, release_rx) = mpsc::channel();
+                let holder = std::thread::spawn(move || {
+                    lifecycle
+                        .with_open(|| {
+                            ready_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(2)).is_ok()
+                        })
+                        .unwrap()
+                });
+                ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let result =
+                    if index == 0 { stream.diagnostics() } else { listener.diagnostics_for(peer) };
+                let release = release_tx.send(());
+                assert!(holder.join().unwrap(), "diagnostic query waited for lifecycle gate");
+                release.unwrap();
+                assert!(result.is_err());
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn valid_zero_rtt_is_known_but_retransmitted_rtt_stays_unknown() {
         for retransmit in [false, true] {
             let mut kcp = Kcp::new(1, KcpConfig::fast_mode()).unwrap();
