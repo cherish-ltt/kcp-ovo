@@ -3,6 +3,8 @@
 ## 模块与类型
 
 - `kcp_ovo::stream::{KcpStream, KcpListener, StreamConfig}`：默认 `stream` feature 提供的异步消息 API。
+- `kcp_ovo::stream::{KcpSender, KcpListenerSender}`：供独立任务使用的可克隆发送句柄。
+- `kcp_ovo::stream::KcpDiagnostics`：带采样时刻的完整协议诊断快照。
 - `kcp_ovo::core::kcp::Kcp`：底层协议控制块。
 - `kcp_ovo::{KcpConfig, KcpError, KcpResult}`：协议配置和错误类型。
 
@@ -21,6 +23,32 @@ Stream API 不实现 `std::io::Read` / `Write`，监听器不提供 `accept` 或
 高层操作需要 Tokio 运行时，但公开签名不包含 Tokio 类型或 trait。
 
 发送成功表示消息进入本地队列，而不是对端收到。消息模式单次发送最多 255 个分片，接收窗口必须足以容纳完整消息。UDP 和 KCP 不提供应用层身份认证、加密或业务交付确认。
+
+## 诊断最近一次协议采样
+
+`stream.diagnostics()` 和 `listener.diagnostics_for(peer)` 返回库自有的 `KcpDiagnostics`。
+公开字段使用标准库类型：平滑 RTT 与远端窗口的未知状态为 `None`，有效零值为 `Some(0)`；
+RTO 使用毫秒，窗口与发送队列使用段数。两种发送段数之和是底层 `waitsnd()`，不包含高层
+通道中尚未交给 KCP 的消息。`sampled_at.elapsed()` 表示实际缓存年龄。
+
+查询不等待缓存、生命周期或会话表锁；竞争、关闭、后台退出或目标不存在时返回错误。
+诊断不会读取消息或触发网络输出，输出挂起时旧快照仍可能返回。完整字段用法与解释见
+[高层协议诊断](troubleshooting.md#高层协议诊断)。
+
+## 独立任务发送
+
+`stream.sender()` 返回可克隆的 `KcpSender`，提供 `send`、`try_send`、`drain`；
+`listener.sender()` 返回 `KcpListenerSender`，提供已有会话的 `send_to`、`drain_to`。
+句柄可移入独立任务，原对象继续负责唯一接收和 close/Drop。发送和屏障复用容量为 64 的
+原有通道，消息大小、总期限、取消和确认语义沿用现有入口。
+
+单个生产者依次等待完成的调用保持顺序，多生产者按实际成功入队次序排列；尚未入队的
+发送不包含在并发 drain 的范围内。监听器调用时捕获目标实例，不会创建会话或转投同地址
+重建实例。句柄 Drop 不关闭连接，owner close/Drop 后所有遗留句柄失效；关闭前已经入队
+的发送和已提交的确认成功结果不追溯改写，但立即关闭仍可能丢弃数据。
+
+运行 `cargo run --example sender-handles` 查看客户端、监听器分别在独立任务中并发收发
+并完成确认的示例，公共类型不暴露内部通道或锁。
 
 ## 有期限的协议确认等待
 
