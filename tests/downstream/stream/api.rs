@@ -137,6 +137,9 @@ async fn selected_dependencies_and_standard_addresses_support_loopback() {
         listener_sender.drain_to(peer, Duration::from_secs(2)).await.unwrap();
         client.close().unwrap();
         assert!(sender.try_send(b"closed").is_err());
+        let removed: bool = tokio::spawn(listener.close_session(peer)).await.unwrap().unwrap();
+        assert!(removed);
+        assert!(!listener.close_session(peer).await.unwrap());
         listener.close().unwrap();
         assert!(listener_sender.send_to(b"closed", peer).await.is_err());
     })

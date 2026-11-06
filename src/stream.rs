@@ -32,12 +32,14 @@ mod diagnostics;
 mod drain;
 mod lifecycle;
 mod sender;
+mod session;
 
 use diagnostics::Diagnostics;
 pub use diagnostics::KcpDiagnostics;
 use drain::{SendCommand, finish_drain};
 use lifecycle::{Lifecycle, StopGuard};
 pub use sender::{KcpListenerSender, KcpSender};
+use session::{CloseRequest, ReceivedMessage, UdpOutput, close_session, finish_close, send_output};
 
 pub const CHANNEL_SIZE: usize = 64;
 pub const BUFFER_SIZE: usize = u16::MAX as usize;
@@ -390,6 +392,7 @@ pub struct Clinet {
     data_tx: Sender<Vec<u8>>,
     /// send-msg
     sender: KcpSender,
+    received: Arc<Lifecycle>,
     conv: u32,
     id: u64,
     last_active: Instant,
@@ -424,7 +427,8 @@ pub struct KcpListener {
     /// 配置
     config: StreamConfig,
     /// recv-msg
-    recv_rx: Receiver<(Vec<u8>, SocketAddr)>,
+    recv_rx: Receiver<ReceivedMessage>,
+    close_tx: Sender<CloseRequest>,
     /// 实际绑定的本地地址（绑定 0 端口时用于获取系统分配的端口）
     local_addr: SocketAddr,
     lifecycle: Arc<Lifecycle>,
@@ -499,10 +503,9 @@ impl KcpListener {
         let stopped = StopGuard(lifecycle.clone());
         // 设置output回调
         let socket = Arc::new(socket);
-        let (udp_tx, mut udp_rx) =
-            mpsc::channel::<(Vec<u8>, SocketAddr, u64, oneshot::Sender<()>)>(CHANNEL_SIZE);
-        let (recv_tx, recv_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(CHANNEL_SIZE);
-        let timeout_druation = Duration::from_millis(100);
+        let (udp_tx, mut udp_rx) = mpsc::channel::<UdpOutput>(CHANNEL_SIZE);
+        let (recv_tx, recv_rx) = mpsc::channel::<ReceivedMessage>(CHANNEL_SIZE);
+        let (close_tx, mut close_rx) = mpsc::channel::<CloseRequest>(CHANNEL_SIZE);
         let max_sessions = config.max_sessions;
         let idle_timeout = config.session_idle_timeout;
         let main_handle: JoinHandle<()> = tokio::spawn(async move {
@@ -518,6 +521,9 @@ impl KcpListener {
                 let udp_tx_clone = udp_tx_clone.clone();
                 let recv_tx_clone = recv_tx_clone.clone();
                 tokio::select! {
+                    Some(request) = close_rx.recv() => {
+                        finish_close(&clients_clone, &_stopped.0, request);
+                    }
                     _ = cleanup_interval.tick() => {
                         clients_clone.retain(|_, client| {
                             !client.main_handle.is_finished() && client.last_active.elapsed() < idle_timeout
@@ -525,18 +531,7 @@ impl KcpListener {
                     }
                     result = udp_rx.recv() => {
                         match result {
-                            Some((data, addr, id, sent)) => {
-                                if !clients_clone.get(&addr).is_some_and(|client| client.id == id) {
-                                    continue;
-                                }
-                                match timeout(timeout_druation, socket.send_to(&data, addr)).await {
-                                    Ok(Ok(_)) => { let _ = sent.send(()); },
-                                    result => {
-                                        error!("socket.send_to err: {:?}", result);
-                                        clients_clone.remove_if(&addr, |_, client| client.id == id);
-                                    },
-                                }
-                            }
+                            Some(output) => send_output(&clients_clone, &socket, output).await,
                             None => warn!("udp_rx.recv none"),
                         }
                     }
@@ -571,6 +566,8 @@ impl KcpListener {
                                         let worker_diagnostics = diagnostics.clone();
                                         let session = Lifecycle::new();
                                         let stopped = StopGuard(session.clone());
+                                        let received = Lifecycle::new();
+                                        let receiver_validity = received.clone();
 
                                         kcp.set_output(move |data| {
                                             let udp_tx_clone = udp_tx_clone.clone();
@@ -605,7 +602,11 @@ impl KcpListener {
                                                     permit = recv_tx_clone.reserve(), if readable => {
                                                         let Ok(permit) = permit else { break };
                                                         match kcp.recv() {
-                                                            Ok(data) => { permit.send((data, addr)); }
+                                                            Ok(data) => {
+                                                                permit.send(ReceivedMessage {
+                                                                    data, addr, valid: receiver_validity.clone(),
+                                                                });
+                                                            }
                                                             Err(e) => error!("listener kcp recv err:{}", e),
                                                         }
                                                     }
@@ -656,6 +657,7 @@ impl KcpListener {
                                             main_handle,
                                             data_tx,
                                             sender: KcpSender { channel: send_tx, lifecycle: session, mss },
+                                            received,
                                             conv: header.conv,
                                             id,
                                             last_active: Instant::now(),
@@ -675,7 +677,7 @@ impl KcpListener {
             }
         });
 
-        Ok(Self { clients, main_handle, recv_rx, config, local_addr, lifecycle })
+        Ok(Self { clients, main_handle, recv_rx, close_tx, config, local_addr, lifecycle })
     }
 
     /// 获取监听器实际绑定的本地地址
@@ -710,6 +712,23 @@ impl KcpListener {
         Ok(())
     }
 
+    /// 立即回收调用时选中的当前会话，保留监听 socket 和其他会话。
+    ///
+    /// 返回 true 表示已移除目标并释放名额，false 表示该实例已不存在。
+    /// future 在创建时固定实例，稍后执行不会关闭同地址的新会话。
+    /// 关闭丢弃该实例尚未交付的接收积压和待发送数据，并终止未完成的发送/确认等待；
+    /// 已提交的成功结果及已交给内核或网络的 UDP 包不会撤回。
+    /// 该操作不通知或封禁对端；后续合法入站包仍可重新创建会话。
+    /// 需要确认此前发送时先有界调用 [`Self::drain_to`]，再显式决定是否回收。
+    /// 监听器关闭或后台退出时返回错误；取消未入队的请求没有副作用，已入队请求仍会执行。
+    pub fn close_session(
+        &self,
+        addr: SocketAddr,
+    ) -> impl Future<Output = KcpResult<bool>> + Send + 'static + use<> {
+        let target = self.clients.get(&addr).map(|client| client.id);
+        close_session(self.close_tx.clone(), self.lifecycle.clone(), addr, target)
+    }
+
     /// send
     pub async fn send_to(&mut self, data: &[u8], addr: SocketAddr) -> KcpResult<()> {
         if !self.lifecycle.is_open() {
@@ -740,10 +759,12 @@ impl KcpListener {
         if !self.lifecycle.is_open() {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "Listener closed").into());
         }
-        match self.recv_rx.recv().await {
-            Some(result) => Ok(result),
-            None => Err(KcpError::IoError("listener send_to err: None".to_string())),
+        while let Some(message) = self.recv_rx.recv().await {
+            if let Ok(result) = message.valid.with_open(|| (message.data, message.addr)) {
+                return Ok(result);
+            }
         }
+        Err(KcpError::IoError("listener worker stopped".to_string()))
     }
 }
 

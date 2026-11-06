@@ -70,6 +70,10 @@ name = "stream_sender"
 path = "tests/stream_sender.rs"
 
 [[test]]
+name = "stream_close"
+path = "tests/stream_close.rs"
+
+[[test]]
 name = "api_contract"
 path = "tests/api_contract.rs"
 
@@ -161,6 +165,10 @@ path = "examples/stream-easy-api.rs"
 [[example]]
 name = "sender-handles"
 path = "examples/sender-handles.rs"
+
+[[example]]
+name = "session-close"
+path = "examples/session-close.rs"
 
 [dependencies]
 # 内部字节编解码与异步运行时：保留最低版本，允许下游统一兼容版本。
