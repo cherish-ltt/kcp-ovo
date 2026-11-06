@@ -331,6 +331,12 @@ async fn main() -> kcp_ovo::KcpResult<()> {
 段数不包含高层发送通道里的数据，快照也不证明对端在线。
 完整排障示例见 [高层诊断](docs/troubleshooting.md#高层协议诊断)。
 
+业务结束时可用 `listener.close_session(peer).await?` 立即回收单个当前会话，释放名额并保持
+其他会话服务。请求创建时固定实例；返回 `true` 表示已回收，`false` 表示目标已不存在。
+旧实例尚未交付的接收积压和排队输出失效，已完成结果不撤回。该操作不封禁来源，后续合法
+入站包仍可重新创建会话。需要确认时先有界 `drain_to`，再决定超时后是否回收；见
+[单会话关闭示例](examples/session-close.rs) 与 [API 契约](docs/api-guide.md#主动回收单个会话)。
+
 ### 底层API（推荐高级用户）
 
 | 维度 | 说明 |
@@ -431,6 +437,7 @@ cargo test test_stream_mode
 | `stream_drain.rs` | 高层 FIFO 确认等待、ACK 丢失、损伤与黑洞恢复、取消、会话生命周期、背压及多客户端隔离 |
 | `stream_diagnostics.rs` | 高层未知/零窗口与 RTT、段计数、drain 与通道背压、损伤/黑洞后恢复、消息边界、会话回收重建隔离 |
 | `stream_sender.rs` | 独立任务句柄、20 客户端/双生产者超过 1 MiB、FIFO 屏障、发送取消、接收背压、黑洞恢复、owner 关闭与 socket 释放、同地址实例隔离 |
+| `stream_close.rs` | 单会话主动回收、满额准入、旧操作与接收积压隔离、同地址重建、背压/零窗口关闭、20 客户端超过 1 MiB 精确收发 |
 | `api_contract.rs` | 公开 API 契约与错误类型；载荷独立所有权、切片推进、单段接收复用及窗口恢复、Send/Sync；下游显式设置 System 全局分配器的编译兼容性 |
 | `downstream/core/` | 独立 Cargo 项目仅直接依赖本库，以无默认 feature 验证标准库公开类型与核心收发 |
 | `downstream/stream/` | 独立 Cargo 项目固定 Tokio 1.54.1 / bytes 1.12.1，验证版本解析、标准库地址输入及真实 UDP 回环 |
